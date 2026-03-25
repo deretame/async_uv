@@ -13,7 +13,7 @@ if(NOT TARGET async_simple_headers)
         async_simple_src
         GIT_REPOSITORY https://github.com/alibaba/async_simple.git
         GIT_TAG be69039baea62ef376a396aa8224d1ab353685f8
-        GIT_SHALLOW TRUE
+        GIT_SHALLOW FALSE
         UPDATE_DISCONNECTED TRUE
     )
 
