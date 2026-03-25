@@ -37,6 +37,12 @@ Task<std::shared_ptr<async_simple::Signal>> get_current_signal();
 Task<bool> cancellation_requested();
 Task<void> throw_if_cancelled(std::string message = "async_uv operation canceled");
 
+template <typename TimeoutTag, typename Duration>
+Task<TimeoutTag> timeout_after(Duration delay) {
+    co_await sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(delay));
+    co_return TimeoutTag{};
+}
+
 template <typename Lazy>
 Future<TaskValue<Lazy>> spawn(Runtime &runtime, Lazy &&lazy, CancellationSource &source) {
     return runtime.spawn(std::forward<Lazy>(lazy).setLazyLocal(source.signal()));
@@ -59,15 +65,10 @@ Task<TaskValue<Lazy>> with_timeout(std::chrono::duration<Rep, Period> timeout, L
     using DurationType = std::chrono::duration<Rep, Period>;
 
     struct TimeoutTag {};
-
-    auto timeout_task = [delay = timeout < DurationType::zero() ? DurationType::zero()
-                                                                : timeout]() -> Task<TimeoutTag> {
-        co_await sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(delay));
-        co_return TimeoutTag{};
-    };
+    const auto delay = timeout < DurationType::zero() ? DurationType::zero() : timeout;
 
     auto result = co_await async_simple::coro::collectAny<async_simple::Terminate>(
-        std::forward<Lazy>(lazy), timeout_task());
+        std::forward<Lazy>(lazy), timeout_after<TimeoutTag>(delay));
 
     if (result.index() == 0) {
         auto &value = std::get<0>(result);
