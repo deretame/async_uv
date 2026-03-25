@@ -1,0 +1,31 @@
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/async_uv_dependencies.cmake)
+
+add_library(async_uv
+    cancel.cpp
+    runtime.cpp
+    scope.cpp
+    fs.cpp
+    tcp.cpp
+    timer.cpp
+    udp.cpp
+    watch.cpp
+)
+
+add_library(async_uv::async_uv ALIAS async_uv)
+
+target_include_directories(async_uv
+    PUBLIC
+        ${CMAKE_CURRENT_LIST_DIR}/../include
+)
+
+target_link_libraries(async_uv
+    PUBLIC
+        async_simple_headers
+        libuv::libuv
+)
+
+target_compile_features(async_uv PUBLIC cxx_std_23)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(async_uv PRIVATE -Wall -Wextra -Wpedantic)
+endif()

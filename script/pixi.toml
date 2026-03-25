@@ -1,0 +1,11 @@
+[workspace]
+authors = ["蔡思凯 <windy-78@foxmail.com>"]
+channels = ["conda-forge"]
+name = "script"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python="3.11.*"

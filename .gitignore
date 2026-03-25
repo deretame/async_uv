@@ -1,0 +1,55 @@
+# Build directories
+/build/
+/build_asan/
+/cmake-build-*/
+
+# CMake / Ninja generated files
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Testing/
+/cmake_install.cmake
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/install_manifest.txt
+
+# Generated compilation database
+/compile_commands.json
+
+# Compiled binaries and objects
+*.a
+*.dll
+*.dll.a
+*.dylib
+*.exe
+*.exp
+*.ilk
+*.lib
+*.obj
+*.o
+*.out
+*.pdb
+*.so
+
+# Runtime-generated files from demos / tests
+/async_uv_smoke.txt
+/demo.txt
+/demo_fs/
+/async_uv_fs_tree
+/async_uv_fs_tree_*/
+/async_uv_fs_tree_copy
+/async_uv_fs_tree_copy_*/
+/async_uv_temp_*
+/async_uv_tmp_*
+
+# Script environment cache
+/script/.pixi/
+
+# Logs and editor / OS noise
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vs/
+/.vscode/
