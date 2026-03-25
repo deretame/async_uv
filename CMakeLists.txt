@@ -12,6 +12,7 @@ include(CTest)
 
 option(ASYNC_UV_BUILD_EXAMPLES "Build async_uv examples" ${PROJECT_IS_TOP_LEVEL})
 option(ASYNC_UV_BUILD_TESTS "Build async_uv tests" ${PROJECT_IS_TOP_LEVEL})
+option(ASYNC_UV_USE_MIMALLOC "Link mimalloc into async_uv targets" OFF)
 
 add_subdirectory(src)
 

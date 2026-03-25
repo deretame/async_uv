@@ -1,0 +1,101 @@
+name: alpine-clang
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-sanitized:
+    name: Alpine Clang ASAN UBSAN
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    defaults:
+      run:
+        shell: sh
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache \
+            bash \
+            build-base \
+            clang \
+            cmake \
+            compiler-rt \
+            git \
+            linux-headers \
+            lld \
+            ninja-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DASYNC_UV_BUILD_EXAMPLES=ON \
+            -DASYNC_UV_BUILD_TESTS=ON \
+            -DASYNC_UV_USE_MIMALLOC=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0:strict_string_checks=1:check_initialization_order=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+
+  build-static:
+    name: Alpine Clang Static
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    defaults:
+      run:
+        shell: sh
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache \
+            bash \
+            build-base \
+            clang \
+            cmake \
+            git \
+            linux-headers \
+            lld \
+            ninja-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DASYNC_UV_BUILD_EXAMPLES=ON \
+            -DASYNC_UV_BUILD_TESTS=ON \
+            -DASYNC_UV_USE_MIMALLOC=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Inspect linked binaries
+        run: |
+          file build/tests/async_uv_smoke_test
+          file build/tests/async_uv_scope_test
+          file build/examples/async_uv_demo

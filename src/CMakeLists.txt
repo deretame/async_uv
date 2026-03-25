@@ -24,6 +24,16 @@ target_link_libraries(async_uv
         libuv::libuv
 )
 
+if(ASYNC_UV_USE_MIMALLOC)
+    if(TARGET mimalloc-static)
+        target_link_libraries(async_uv PUBLIC mimalloc-static)
+    elseif(TARGET mimalloc)
+        target_link_libraries(async_uv PUBLIC mimalloc)
+    else()
+        message(FATAL_ERROR "ASYNC_UV_USE_MIMALLOC=ON but mimalloc target was not created")
+    endif()
+endif()
+
 target_compile_features(async_uv PUBLIC cxx_std_23)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

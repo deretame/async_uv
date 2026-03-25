@@ -41,6 +41,7 @@ If you add the repository root instead, examples and tests are controlled by:
 
 - `ASYNC_UV_BUILD_EXAMPLES`
 - `ASYNC_UV_BUILD_TESTS`
+- `ASYNC_UV_USE_MIMALLOC`
 
 ## Core Pieces
 

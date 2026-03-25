@@ -43,3 +43,26 @@ if(NOT TARGET libuv::libuv)
 
     FetchContent_MakeAvailable(libuv)
 endif()
+
+if(ASYNC_UV_USE_MIMALLOC)
+    if(NOT TARGET mimalloc-static AND NOT TARGET mimalloc)
+        message(STATUS "Fetching mimalloc")
+        set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+        set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+        set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+        set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+
+        FetchContent_Declare(
+            mimalloc
+            GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+            GIT_TAG v3.1.5
+            GIT_SHALLOW TRUE
+            UPDATE_DISCONNECTED TRUE
+        )
+
+        FetchContent_MakeAvailable(mimalloc)
+    endif()
+endif()
