@@ -44,8 +44,130 @@ If you add the repository root instead, examples and tests are controlled by:
 - `ASYNC_UV_BUILD_EXAMPLES`
 - `ASYNC_UV_BUILD_TESTS`
 - `ASYNC_UV_USE_MIMALLOC`
+- `ASYNC_UV_ENABLE_LAYER2` (build layer2 HTTP wrapper target `async_uv_http`)
+- `ASYNC_UV_ENABLE_LAYER3` (build layer3 target; automatically enables layer2)
+
+Layer relationship:
+
+- layer1: `async_uv` (base IO runtime)
+- layer2: `async_uv_http` (depends on layer1)
+- layer3: `async_uv_layer3` (depends on layer2, and transitively layer1)
+
+Example:
+
+```bash
+cmake -S . -B build -G Ninja -DASYNC_UV_ENABLE_LAYER2=ON
+cmake --build build
+```
+
+Then link:
+
+```cmake
+target_link_libraries(my_app PRIVATE async_uv_http)
+```
+
+`async_uv_http` uses libcurl. OpenSSL backend is preferred. On Windows, if OpenSSL is
+unavailable, the build falls back to Schannel when building curl from source.
 
 ## Core Pieces
+
+### Layer2 HTTP
+
+`async_uv_http` provides a minimal async API similar to reqwest-style ergonomics:
+
+```cpp
+auto runtime = co_await async_uv::get_current_runtime();
+
+auto client = async_uv::http::Client::build()
+    .runtime(*runtime) // 可选；不传时使用当前运行时 / optional; fallback to current runtime
+    .default_header("Accept", "application/json")
+    .timeout(std::chrono::seconds(20))
+    .build();
+
+std::map<std::string, std::string> payload{{"hello", "world"}};
+DemoPayload request_data{"world", "cpp"};
+HttpBinPostJsonEcho response_json = co_await client.post("https://httpbin.org/post")
+    .json(request_data)
+    .request_format(async_uv::http::RequestFormat::json)   // 也支持 .request_format("json")
+    .response_format(async_uv::http::ResponseFormat::json) // 也支持 .response_format("json")
+    .send()
+    .json<HttpBinPostJsonEcho>();
+
+auto upload_json = co_await client.post("https://httpbin.org/post")
+    .multipart({
+        async_uv::http::field("kind", "demo"),
+        async_uv::http::field("lang", "cpp"),
+        async_uv::http::file("file", "/tmp/demo.txt")
+            .filename("demo.txt")
+            .content_type("text/plain"),
+    })
+    .send()
+    .json<nlohmann::json>();
+
+std::unordered_map<std::string, int> pager{{"page", 2}, {"size", 20}};
+auto query_json = co_await client.get("https://httpbin.org/get")
+    .query({{"lang", "cpp"}, {"sort", "desc"}})
+    .query(pager)
+    .send()
+    .json<nlohmann::json>();
+
+auto image_json = co_await client.post("https://httpbin.org/post")
+    .form_binary("image", png_bytes, "demo.png", "image/png")
+    .send()
+    .json<nlohmann::json>();
+
+// 或者文件来源（由 curl 从文件读取上传）
+auto file_json = co_await client.post("https://httpbin.org/post")
+    .multipart({
+        async_uv::http::file("image", "/tmp/demo.png")
+            .filename("demo.png")
+            .content_type("image/png"),
+    })
+    .send()
+    .json<nlohmann::json>();
+```
+
+`Client` uses reqwest-like chained request builders (`get/post/put/del -> query/json/xml/urlencoded/multipart -> send`).
+By default, non-2xx responses throw `async_uv::http::HttpError` with structured error fields.
+Response format defaults to JSON if not set explicitly.
+You can also set request format explicitly via `request_format(...)`.
+`query(...)` supports map/unordered_map-style containers and values that are string-like,
+compatible with `std::to_string`, or provide `to_string()/toString()` members.
+`query(...)` also supports initializer-list pairs such as `.query({{"lang", "cpp"}, {"sort", "desc"}})`.
+`urlencoded(container)` now applies percent-encoding for keys and values.
+
+The layer2 library itself does not depend on any JSON library. You can inject your own codec.
+For example, with modern JSON (`nlohmann::json`) in application code:
+
+```cpp
+#include <nlohmann/json.hpp>
+
+class NlohmannJsonCodec : public async_uv::http::JsonCodec {
+public:
+    std::string serialize(const void* value, const std::type_info& type) const override {
+        if (type == typeid(std::map<std::string, std::string>)) {
+            const auto& map = *static_cast<const std::map<std::string, std::string>*>(value);
+            return nlohmann::json(map).dump();
+        }
+        throw std::runtime_error("unsupported json serialize type");
+    }
+
+    void deserialize(std::string_view text, void* output, const std::type_info& type) const override {
+        if (type == typeid(nlohmann::json)) {
+            *static_cast<nlohmann::json*>(output) = nlohmann::json::parse(text);
+            return;
+        }
+        throw std::runtime_error("unsupported json deserialize type");
+    }
+};
+
+auto runtime = co_await async_uv::get_current_runtime();
+auto client = async_uv::http::Client::build()
+    .runtime(*runtime)
+    .json_codec(std::make_shared<NlohmannJsonCodec>())
+    .user_agent("my-app/1.0")
+    .build();
+```
 
 ### Runtime
 

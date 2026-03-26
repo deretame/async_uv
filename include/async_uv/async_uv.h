@@ -5,6 +5,7 @@
 #include "async_uv/fd.h"
 #include "async_uv/fs.h"
 #include "async_uv/message.h"
+#include "async_uv/once_cell.h"
 #include "async_uv/runtime.h"
 #include "async_uv/scope.h"
 #include "async_uv/stream.h"
