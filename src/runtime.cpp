@@ -14,6 +14,10 @@ namespace async_uv {
 namespace {
 
 thread_local Runtime *tls_current_runtime = nullptr;
+std::mutex g_uv_threadpool_size_mutex;
+std::optional<unsigned int> g_uv_threadpool_size;
+std::mutex g_trace_hook_mutex;
+TraceHook g_trace_hook;
 
 struct TimerOp {
     Runtime::Func func;
@@ -25,9 +29,66 @@ void release_timer_holder(uv_handle_t *handle) {
     delete static_cast<std::shared_ptr<TimerOp> *>(handle->data);
 }
 
+void configure_uv_threadpool_size(std::optional<unsigned int> uv_threadpool_size) {
+    if (!uv_threadpool_size.has_value()) {
+        return;
+    }
+
+    const unsigned int size = *uv_threadpool_size;
+    if (size == 0) {
+        throw std::invalid_argument("uv threadpool size must be greater than zero");
+    }
+
+    std::lock_guard<std::mutex> lock(g_uv_threadpool_size_mutex);
+    if (g_uv_threadpool_size.has_value()) {
+        if (*g_uv_threadpool_size != size) {
+            throw std::runtime_error(
+                "uv threadpool size is process-wide and has already been configured");
+        }
+        return;
+    }
+
+    const std::string value = std::to_string(size);
+    const int rc = uv_os_setenv("UV_THREADPOOL_SIZE", value.c_str());
+    if (rc < 0) {
+        throw_uv_error("uv_os_setenv(UV_THREADPOOL_SIZE)", rc);
+    }
+
+    g_uv_threadpool_size = size;
+}
+
 } // namespace
 
-Runtime::Runtime(std::string name) : async_simple::Executor(std::move(name)) {
+void set_trace_hook(TraceHook hook) {
+    std::lock_guard<std::mutex> lock(g_trace_hook_mutex);
+    g_trace_hook = std::move(hook);
+}
+
+void reset_trace_hook() {
+    std::lock_guard<std::mutex> lock(g_trace_hook_mutex);
+    g_trace_hook = nullptr;
+}
+
+void emit_trace_event(TraceEvent event) noexcept {
+    TraceHook hook;
+    {
+        std::lock_guard<std::mutex> lock(g_trace_hook_mutex);
+        hook = g_trace_hook;
+    }
+
+    if (!hook) {
+        return;
+    }
+
+    try {
+        hook(event);
+    } catch (...) {
+    }
+}
+
+Runtime::Runtime(RuntimeOptions options) : async_simple::Executor(std::move(options.name)) {
+    configure_uv_threadpool_size(options.uv_threadpool_size);
+
     throw_if_uv_error(uv_loop_init(&loop_), "uv_loop_init");
 
     async_.data = this;

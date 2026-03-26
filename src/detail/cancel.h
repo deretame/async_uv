@@ -40,10 +40,6 @@ struct CancellableOperation {
         }
 
         completed = true;
-        if (slot != nullptr) {
-            (void)slot->clear(async_simple::Terminate);
-        }
-
         auto done = std::move(complete);
         done(std::move(outcome));
     }

@@ -52,6 +52,7 @@ void finish_close(State *state) {
 void complete_pending_wait(SteadyTimer::State *state, bool fired) {
     auto pending = std::move(state->pending_wait);
     if (pending) {
+        emit_trace_event({"timer", fired ? "wait_fired" : "wait_canceled", 0, state->due_ms});
         pending->finish_value(fired);
     }
 }
@@ -199,7 +200,11 @@ Task<bool> SteadyTimer::wait() {
             if (rc < 0) {
                 auto pending = std::move(state->pending_wait);
                 pending->finish_uv_error("uv_timer_start", rc);
+                emit_trace_event({"timer", "wait_error", rc, state->due_ms});
+                return;
             }
+
+            emit_trace_event({"timer", "wait_start", 0, state->due_ms});
         });
 }
 
@@ -250,6 +255,7 @@ Task<void> SteadyTimer::close() {
         state->pending_close = std::make_shared<PendingClose>(PendingClose{std::move(complete)});
         uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
             finish_close(static_cast<SteadyTimer::State *>(handle->data));
+            emit_trace_event({"timer", "close", 0, 0});
         });
     });
 }

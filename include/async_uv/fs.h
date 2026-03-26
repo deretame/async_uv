@@ -17,11 +17,11 @@
 #include <utility>
 #include <vector>
 
-#include <async_simple/coro/Generator.h>
 #include <uv.h>
 
 #include "async_uv/cancel.h"
 #include "async_uv/runtime.h"
+#include "async_uv/stream.h"
 
 namespace async_uv {
 
@@ -212,7 +212,7 @@ class Directory {
 public:
     using next_type = std::optional<DirectoryEntry>;
     using task_type = Task<next_type>;
-    using stream_type = async_simple::coro::Generator<task_type>;
+    using stream_type = Stream<DirectoryEntry>;
 
     Directory() = default;
     ~Directory();

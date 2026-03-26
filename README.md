@@ -8,6 +8,8 @@ It aims for:
 - a `libuv`-backed `async_simple::Executor`
 - unified cancellation and timeout handling
 - structured concurrency with RAII cleanup
+- pluggable TLS BIO abstraction (engine provided by external SSL library)
+- fd/socket readiness watcher based on `uv_poll_t`
 
 ## Build
 
@@ -53,6 +55,68 @@ If you add the repository root instead, examples and tests are controlled by:
 async_uv::Runtime runtime;
 runtime.block_on(my_task());
 ```
+
+You can optionally set the `libuv` worker threadpool size when creating a runtime:
+
+```cpp
+async_uv::Runtime runtime(async_uv::Runtime::build().uv_threadpool_size(8));
+```
+
+`UV_THREADPOOL_SIZE` is process-wide in `libuv`, so the configured value must stay consistent
+across runtimes in the same process.
+
+`Runtime` also exposes executor stats through `runtime.stat()`, which can be used to sample
+pending task count.
+
+### Trace Hook
+
+You can register a process-wide trace hook for lightweight runtime signals:
+
+```cpp
+#include <atomic>
+#include <memory>
+#include <string_view>
+
+auto mailbox_events = std::make_shared<std::atomic_int>(0);
+
+async_uv::set_trace_hook([mailbox_events](const async_uv::TraceEvent& event) {
+    if (std::string_view(event.category) == "mailbox") {
+        mailbox_events->fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // event.name: send / send_rejected_full / send_timeout / recv / recv_closed ...
+    // event.code: error code (0 means no error)
+    // event.value: extra numeric value (for mailbox, typically queue size snapshot)
+});
+
+// ... run async work ...
+
+async_uv::reset_trace_hook();
+```
+
+Use `async_uv::reset_trace_hook()` to clear it. Hook callbacks should stay lightweight and
+non-blocking.
+
+### Stable Event Names
+
+Current built-in trace events (stable names in current version):
+
+| category | name | meaning | value |
+| --- | --- | --- | --- |
+| `mailbox` | `send` | message queued and notify sent | queue size snapshot after enqueue |
+| `mailbox` | `send_rejected_closed` | send rejected because mailbox is closing/closed | queue size snapshot |
+| `mailbox` | `send_rejected_full` | send rejected because bounded queue is full | queue size snapshot |
+| `mailbox` | `send_async_error` | `uv_async_send` failed | queue size snapshot |
+| `mailbox` | `send_timeout` | `send_for/send_until` timed out waiting for capacity | queue size snapshot |
+| `mailbox` | `send_drop_oldest` | queue full and overflow policy dropped oldest message | queue size snapshot before drop |
+| `mailbox` | `recv` | `recv()` got a message | currently `0` |
+| `mailbox` | `recv_closed` | `recv()` reached end-of-stream after close+drain | currently `0` |
+| `tcp` | `connect` / `connect_error` / `read` / `read_eof` / `read_error` / `write` / `write_error` | TCP key I/O lifecycle | bytes or `0` |
+| `udp` | `send` / `send_error` / `recv` / `recv_error` | UDP send/receive lifecycle | bytes or `0` |
+| `timer` | `wait_start` / `wait_fired` / `wait_canceled` / `wait_error` / `close` | timer lifecycle | due ms or `0` |
+| `watch` | `fs_event_start` / `fs_event` / `fs_event_stop` / `fs_poll_start` / `fs_poll` / `fs_poll_stop` (+ `_error`) | watcher lifecycle | event flags or `0` |
+| `fd` | `poll_start` / `poll_event` / `poll_stop` (+ `_error`) | fd/socket readiness watcher lifecycle | polled event flags |
+| `fs` | `<uv_fs_* api name>` | fs request finished (success/error) | `uv_fs_t.result` snapshot |
 
 ### Cancellation
 
@@ -139,6 +203,107 @@ Examples:
 
 These wrappers all forward to the same `with_timeout(...)` and `with_deadline(...)` behavior.
 
+## Streaming APIs
+
+Streaming APIs now use `Stream<T>` and expose a single async pull method:
+
+- `co_await stream.next()` returns `std::optional<T>`
+- `std::nullopt` means end-of-stream
+- only one `next()` call may be in flight per stream instance
+
+Available stream sources include:
+
+- `Directory::entries()`
+- `Mailbox<T>::messages()`
+- `TcpClient::receive_chunks()`
+- `UdpSocket::receive_packets()`
+- `FsEventWatcher::events()`
+- `FsPollWatcher::events()`
+
+## Mailbox Backpressure
+
+`Mailbox<T>` is move-only-message only, and it can optionally be bounded:
+
+```cpp
+async_uv::MailboxOptions options;
+options.max_buffered_messages = 1024;
+options.overflow_policy = async_uv::MailboxOptions::OverflowPolicy::reject_new;
+auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<MyMessage>>::create(options);
+```
+
+Overflow policy:
+
+- `reject_new`: queue full means reject new message (`send`/`try_send` return `false`)
+- `drop_oldest`: queue full means drop oldest buffered message, then enqueue new one
+
+`MessageSender<T>` also exposes:
+
+- `try_send(...)`: explicit non-blocking send
+- `send_for(...)` / `send_until(...)`: async wait for capacity when bounded
+- `sync_send_for(...)` / `sync_send_until(...)`: blocking wait for external threads
+
+Example split:
+
+```cpp
+// coroutine context
+bool queued = co_await sender.send_for(std::make_unique<MyMessage>(), 50ms);
+
+// external thread context
+bool queued_sync = sender.sync_send_for(std::make_unique<MyMessage>(), 50ms);
+```
+
+`Mailbox<T>` runtime metrics:
+
+- `buffered_size()`
+- `is_bounded()`
+- `max_buffered_messages()`
+
+## TLS BIO Interface
+
+`async_uv` does not implement TLS protocol internals. It exposes a BIO-style interface so
+you can plug an external TLS engine:
+
+- `async_uv::TlsBio`
+- `async_uv::TlsBioResult`
+- `async_uv::TlsBioStatus`
+
+Typical usage:
+
+1. provide an adapter around your SSL library context (for example mbedTLS/OpenSSL)
+2. feed encrypted bytes with `write_encrypted(...)`
+3. pull encrypted bytes with `read_encrypted(...)`
+4. feed plain bytes with `write_plain(...)`
+5. pull plain bytes with `read_plain(...)`
+
+`tests/async_uv_tls_bio_test` uses mbedTLS as a lightweight reference implementation.
+
+## FD Watcher
+
+`FdWatcher` wraps `uv_poll_t` and provides readiness events as task/stream APIs.
+
+```cpp
+auto watcher = co_await async_uv::FdWatcher::watch(fd,
+    async_uv::FdEventFlags::readable | async_uv::FdEventFlags::writable);
+
+auto event = co_await watcher.next_for(std::chrono::milliseconds(500));
+if (event && event->ok() && event->readable()) {
+    // fd becomes readable
+}
+```
+
+`tests/async_uv_fd_curl_test` uses libcurl (`CURLOPT_CONNECT_ONLY`) to obtain an active socket
+and validates `FdWatcher` behavior.
+
+## Behavior Contracts
+
+- `Mailbox<T>::recv()` returns `std::nullopt` only after close and queue drain.
+- `MessageSender<T>::send/try_send` return `false` on closed mailbox, full bounded queue, or notify failure.
+- When overflow policy is `drop_oldest`, full queue keeps newest message by dropping oldest buffered message.
+- `MessageSender<T>::send_for/send_until` are coroutine APIs and do not block the runtime thread.
+- `MessageSender<T>::sync_send_for/sync_send_until` are blocking APIs for non-coroutine external threads.
+- `MessageSender<T>::send_for/send_until` use adaptive async retry while waiting for capacity.
+- `Stream<T>::next()` returns `std::nullopt` for end-of-stream and allows only one in-flight `next()` call per stream instance.
+
 ## Usage Samples
 
 ### File IO
@@ -154,7 +319,12 @@ auto text = co_await async_uv::Fs::read_file_for("demo.txt", std::chrono::millis
 auto client = co_await async_uv::TcpSocket::connect_for(
     "127.0.0.1", 8080, std::chrono::seconds(1));
 co_await client.send_all("ping");
-auto reply = co_await client.receive_exactly_for(4, std::chrono::seconds(1));
+
+std::string reply;
+auto chunks = client.receive_chunks(4);
+while (auto chunk = co_await chunks.next()) {
+    reply += *chunk;
+}
 ```
 
 ### UDP
@@ -183,13 +353,19 @@ auto result = co_await async_uv::with_task_scope(
 
 ### Mailbox
 
-```cpp
-auto mailbox = co_await async_uv::Mailbox<int>::create();
-auto sender = mailbox.sender();
-sender.send(42);
+`Mailbox<T>` requires move-only `T` (non-copyable), so sending always transfers ownership.
 
-auto value = co_await mailbox.recv_until(
-    std::chrono::steady_clock::now() + std::chrono::seconds(1));
+```cpp
+auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create();
+auto sender = mailbox.sender();
+sender.send(std::make_unique<int>(42));
+sender.close();
+
+std::vector<int> values;
+auto stream = mailbox.messages();
+while (auto value = co_await stream.next()) {
+    values.push_back(**value);
+}
 ```
 
 ## Demo
@@ -217,6 +393,9 @@ Main test binaries:
 ```bash
 build/async_uv_smoke_test
 build/async_uv_scope_test
+build/async_uv_constraints_test
+build/async_uv_tls_bio_test
+build/async_uv_fd_curl_test   # built on non-Windows when libcurl is available
 ```
 
 `async_uv_smoke_test` focuses on:
@@ -234,3 +413,26 @@ build/async_uv_scope_test
 - `all`, `race`, and `any_success`
 - timeout behavior inside scopes
 - RAII cleanup
+
+`async_uv_constraints_test` focuses on:
+
+- move-only mailbox concept constraints
+- compile-time guardrails (including `try_compile` rejection for `Mailbox<int>`)
+
+`async_uv_tls_bio_test` focuses on:
+
+- TLS BIO interface contract
+- mbedTLS-based in-memory client/server handshake and encrypted payload exchange
+
+`async_uv_fd_curl_test` focuses on:
+
+- `FdWatcher` readiness events
+- libcurl socket integration (`CURLINFO_ACTIVESOCKET`)
+- real-network HTTPS connectivity with fallback URLs (`https://example.com/`, `https://www.cloudflare.com/`, `https://www.wikipedia.org/`)
+- `ASYNC_UV_CURL_TEST_URL` can override candidates (single URL or comma-separated URL list)
+- when DNS/egress is unavailable, the test prints a skip diagnostic and exits without failing
+
+Watcher note:
+
+- on WSL, watcher tests are recommended on Linux filesystem paths (for example `/tmp` or `/home/...`)
+- avoid running watcher-sensitive tests on DrvFS mount paths such as `/mnt/c/...` or `/mnt/d/...`

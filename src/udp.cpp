@@ -164,6 +164,7 @@ void recv_cb(
     uv_udp_recv_stop(handle);
 
     if (nread < 0) {
+        emit_trace_event({"udp", "recv_error", static_cast<int>(nread), 0});
         pending->finish_uv_error("uv_udp_recv_start", static_cast<int>(nread));
         return;
     }
@@ -178,6 +179,7 @@ void recv_cb(
         datagram.remote_endpoint = state->connected_endpoint;
     }
 
+    emit_trace_event({"udp", "recv", 0, static_cast<std::size_t>(nread)});
     pending->finish_value(std::move(datagram));
 }
 
@@ -472,15 +474,18 @@ Task<std::size_t> UdpSocket::send(std::string_view data) {
                     }
 
                     if (status < 0) {
+                        emit_trace_event({"udp", "send_error", status, 0});
                         op->finish_uv_error("uv_udp_send", status);
                         return;
                     }
 
+                    emit_trace_event({"udp", "send", 0, op->payload.size()});
                     op->finish_value(op->payload.size());
                 });
 
             if (rc < 0) {
                 auto active = detail::detach_shared<SendOp>(&op->req);
+                emit_trace_event({"udp", "send_error", rc, 0});
                 active->finish_uv_error("uv_udp_send", rc);
             }
         });
@@ -556,15 +561,18 @@ Task<std::size_t> UdpSocket::send_to(std::string_view data, SocketAddress endpoi
                                            }
 
                                            if (status < 0) {
+                                               emit_trace_event({"udp", "send_error", status, 0});
                                                op->finish_uv_error("uv_udp_send", status);
                                                return;
                                            }
 
+                                           emit_trace_event({"udp", "send", 0, op->payload.size()});
                                            op->finish_value(op->payload.size());
                                        });
 
             if (rc < 0) {
                 auto active = detail::detach_shared<SendOp>(&op->req);
+                emit_trace_event({"udp", "send_error", rc, 0});
                 active->finish_uv_error("uv_udp_send", rc);
             }
         });
@@ -634,10 +642,14 @@ UdpSocket::task_type UdpSocket::next(std::size_t max_bytes) {
 }
 
 UdpSocket::stream_type UdpSocket::packets(std::size_t max_bytes) {
-    auto state = state_;
-    while (state && !state->closed && !state->closing) {
-        co_yield next_impl(state, max_bytes);
+    if (!state_) {
+        return {};
     }
+
+    auto state = state_;
+    return stream_type([state = std::move(state), max_bytes]() -> task_type {
+        co_return co_await next_impl(state, max_bytes);
+    });
 }
 
 UdpSocket::task_type UdpSocket::next_impl(const std::shared_ptr<State> &state,

@@ -4,8 +4,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
-#include <async_simple/coro/Generator.h>
 #include <uv.h>
 
 #include "async_uv/fs.h"
@@ -29,6 +29,15 @@ struct FsEvent {
     int events = 0;
     int status = 0;
 
+    FsEvent() = default;
+    FsEvent(std::string path_in, std::string name_in, int events_in, int status_in)
+        : path(std::move(path_in)), name(std::move(name_in)), events(events_in), status(status_in) {
+    }
+    FsEvent(const FsEvent &) = delete;
+    FsEvent &operator=(const FsEvent &) = delete;
+    FsEvent(FsEvent &&) noexcept = default;
+    FsEvent &operator=(FsEvent &&) noexcept = default;
+
     bool ok() const noexcept;
     bool renamed() const noexcept;
     bool changed() const noexcept;
@@ -40,14 +49,25 @@ struct FsPollEvent {
     std::optional<FileInfo> previous;
     std::optional<FileInfo> current;
 
+    FsPollEvent() = default;
+    FsPollEvent(const FsPollEvent &) = delete;
+    FsPollEvent &operator=(const FsPollEvent &) = delete;
+    FsPollEvent(FsPollEvent &&) noexcept = default;
+    FsPollEvent &operator=(FsPollEvent &&) noexcept = default;
+
     bool ok() const noexcept;
 };
 
 class FsEventWatcher {
 public:
+    // 注意：在 WSL 中不要用该 watcher 监听 Windows 挂载目录（如 /mnt/c、/mnt/d）。
+    // 这类路径的事件语义不稳定，可能丢事件或超时，请改用 Linux 文件系统路径（如 /tmp、/home）。
+    //
+    // Note: in WSL, do not use this watcher on Windows-mounted paths (for example /mnt/c, /mnt/d).
+    // Event semantics on these paths are not stable and may cause missed events or timeouts, so use Linux paths such as /tmp or /home.
     using next_type = std::optional<FsEvent>;
     using task_type = Task<next_type>;
-    using stream_type = async_simple::coro::Generator<task_type>;
+    using stream_type = Stream<FsEvent>;
 
     FsEventWatcher() = default;
     ~FsEventWatcher();
@@ -95,9 +115,14 @@ private:
 
 class FsPollWatcher {
 public:
+    // 注意：在 WSL 中不要用该 watcher 轮询 Windows 挂载目录（如 /mnt/c、/mnt/d）。
+    // 这类路径在 DrvFS 上行为可能与原生 Linux 不一致，建议只监控 /tmp、/home 等 Linux 路径。
+    //
+    // Note: in WSL, do not use this watcher to poll Windows-mounted paths (for example /mnt/c, /mnt/d).
+    // On DrvFS these paths may behave differently from native Linux, so prefer Linux paths such as /tmp or /home.
     using next_type = std::optional<FsPollEvent>;
     using task_type = Task<next_type>;
-    using stream_type = async_simple::coro::Generator<task_type>;
+    using stream_type = Stream<FsPollEvent>;
 
     FsPollWatcher() = default;
     ~FsPollWatcher();

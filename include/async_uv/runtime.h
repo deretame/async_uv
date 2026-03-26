@@ -1,10 +1,12 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -23,6 +25,25 @@ namespace async_uv {
 
 class Runtime;
 
+struct RuntimeOptions {
+    std::string name = "async_uv";
+    // libuv 线程池是进程级配置；同进程内多个 Runtime 必须保持一致。
+    std::optional<unsigned int> uv_threadpool_size = std::nullopt;
+};
+
+struct TraceEvent {
+    const char *category = "";
+    const char *name = "";
+    int code = 0;
+    std::size_t value = 0;
+};
+
+using TraceHook = std::function<void(const TraceEvent &)>;
+
+void set_trace_hook(TraceHook hook);
+void reset_trace_hook();
+void emit_trace_event(TraceEvent event) noexcept;
+
 template <typename Func>
 using BlockingValue =
     std::conditional_t<std::is_void_v<std::invoke_result_t<std::decay_t<Func> &>>,
@@ -37,11 +58,45 @@ Future<BlockingValue<Func>> spawn_blocking(Func &&func);
 
 class Runtime final : public async_simple::Executor {
 public:
+    class Builder {
+    public:
+        Builder &name(std::string value) {
+            options_.name = std::move(value);
+            return *this;
+        }
+
+        Builder &uv_threadpool_size(unsigned int value) {
+            options_.uv_threadpool_size = value;
+            return *this;
+        }
+
+        Builder &uv_threadpool_size(std::optional<unsigned int> value) {
+            options_.uv_threadpool_size = value;
+            return *this;
+        }
+
+        operator RuntimeOptions() const & {
+            return options_;
+        }
+
+        operator RuntimeOptions() && {
+            return std::move(options_);
+        }
+
+    private:
+        RuntimeOptions options_;
+    };
+
     using Func = async_simple::Executor::Func;
     using Context = async_simple::Executor::Context;
     using Duration = async_simple::Executor::Duration;
 
-    explicit Runtime(std::string name = "async_uv");
+    // Builder 风格入口：默认值可演进，便于保持 API 稳定。
+    static Builder build() {
+        return Builder{};
+    }
+
+    explicit Runtime(RuntimeOptions options = {});
     ~Runtime() override;
 
     Runtime(const Runtime &) = delete;

@@ -4,6 +4,7 @@ add_library(async_uv
     cancel.cpp
     runtime.cpp
     scope.cpp
+    fd.cpp
     fs.cpp
     tcp.cpp
     timer.cpp

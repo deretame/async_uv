@@ -161,6 +161,7 @@ Task<FsEventWatcher> FsEventWatcher::watch(std::string path, unsigned flags) {
                                       ? path::join(state->watched_path, name)
                                       : state->watched_path;
                 state->sender.send(FsEvent{std::move(event_path), std::move(name), events, status});
+                emit_trace_event({"watch", "fs_event", status, static_cast<std::size_t>(events)});
             },
             state->watched_path.c_str(),
             state->watch_flags);
@@ -184,6 +185,7 @@ Task<FsEventWatcher> FsEventWatcher::watch(std::string path, unsigned flags) {
             });
 
             promise->setException(std::make_exception_ptr(Error("uv_fs_event_start", start_rc)));
+            emit_trace_event({"watch", "fs_event_start_error", start_rc, 0});
             return;
         }
 
@@ -191,6 +193,7 @@ Task<FsEventWatcher> FsEventWatcher::watch(std::string path, unsigned flags) {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->initialized = true;
         }
+        emit_trace_event({"watch", "fs_event_start", 0, 0});
         promise->setValue();
     });
 
@@ -224,12 +227,10 @@ FsEventWatcher::task_type FsEventWatcher::next() const {
 
 FsEventWatcher::stream_type FsEventWatcher::events() const {
     if (!state_) {
-        co_return;
+        return {};
     }
 
-    for (auto next : state_->mailbox.messages()) {
-        co_yield std::move(next);
-    }
+    return state_->mailbox.messages();
 }
 
 Task<void> FsEventWatcher::stop() {
@@ -274,6 +275,7 @@ Task<void> FsEventWatcher::stop() {
         }
 
         uv_fs_event_stop(&state->handle);
+        emit_trace_event({"watch", "fs_event_stop", 0, 0});
         uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
             auto *state = static_cast<State *>(handle->data);
             std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
@@ -416,6 +418,7 @@ Task<FsPollWatcher> FsPollWatcher::watch(std::string path, std::chrono::millisec
                     event.current = make_file_info(*curr);
                 }
                 state->sender.send(std::move(event));
+                emit_trace_event({"watch", "fs_poll", status, 0});
             },
             state->watched_path.c_str(),
             static_cast<unsigned int>(std::max<std::int64_t>(state->poll_interval.count(), 1)));
@@ -439,6 +442,7 @@ Task<FsPollWatcher> FsPollWatcher::watch(std::string path, std::chrono::millisec
             });
 
             promise->setException(std::make_exception_ptr(Error("uv_fs_poll_start", start_rc)));
+            emit_trace_event({"watch", "fs_poll_start_error", start_rc, 0});
             return;
         }
 
@@ -446,6 +450,7 @@ Task<FsPollWatcher> FsPollWatcher::watch(std::string path, std::chrono::millisec
             std::lock_guard<std::mutex> lock(state->mutex);
             state->initialized = true;
         }
+        emit_trace_event({"watch", "fs_poll_start", 0, 0});
         promise->setValue();
     });
 
@@ -475,12 +480,10 @@ FsPollWatcher::task_type FsPollWatcher::next() const {
 
 FsPollWatcher::stream_type FsPollWatcher::events() const {
     if (!state_) {
-        co_return;
+        return {};
     }
 
-    for (auto next : state_->mailbox.messages()) {
-        co_yield std::move(next);
-    }
+    return state_->mailbox.messages();
 }
 
 Task<void> FsPollWatcher::stop() {
@@ -525,6 +528,7 @@ Task<void> FsPollWatcher::stop() {
         }
 
         uv_fs_poll_stop(&state->handle);
+        emit_trace_event({"watch", "fs_poll_stop", 0, 0});
         uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
             auto *state = static_cast<State *>(handle->data);
             std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;

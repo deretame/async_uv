@@ -303,7 +303,7 @@ async_uv::Task<void> scope_test_body() {
 
 int main() {
     try {
-        async_uv::Runtime runtime;
+        async_uv::Runtime runtime(async_uv::Runtime::build().uv_threadpool_size(4));
         runtime.block_on(scope_test_body());
         return 0;
     } catch (const std::exception &ex) {

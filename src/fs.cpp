@@ -134,6 +134,7 @@ run_fs_request(Runtime &runtime, const char *where, State state, Starter starter
                 if (req->result < 0) {
                     const int code = static_cast<int>(req->result);
                     uv_fs_req_cleanup(req);
+                    emit_trace_event({"fs", op->where, code, 0});
                     op->finish_uv_error(op->where, code);
                     return;
                 }
@@ -141,15 +142,22 @@ run_fs_request(Runtime &runtime, const char *where, State state, Starter starter
                 try {
                     if constexpr (std::is_void_v<Result>) {
                         op->finish(*req, op->state);
+                        const auto value =
+                            static_cast<std::size_t>(req->result < 0 ? 0 : req->result);
                         uv_fs_req_cleanup(req);
+                        emit_trace_event({"fs", op->where, 0, value});
                         op->finish_value();
                     } else {
                         auto value = op->finish(*req, op->state);
+                        const auto result_size =
+                            static_cast<std::size_t>(req->result < 0 ? 0 : req->result);
                         uv_fs_req_cleanup(req);
+                        emit_trace_event({"fs", op->where, 0, result_size});
                         op->finish_value(std::move(value));
                     }
                 } catch (...) {
                     uv_fs_req_cleanup(req);
+                    emit_trace_event({"fs", op->where, UV_ECANCELED, 0});
                     op->finish_exception(std::current_exception());
                 }
             });
@@ -157,6 +165,7 @@ run_fs_request(Runtime &runtime, const char *where, State state, Starter starter
             if (rc < 0) {
                 auto active = detail::detach_shared<Op>(&op->req);
                 uv_fs_req_cleanup(&active->req);
+                emit_trace_event({"fs", where, rc, 0});
                 active->finish_uv_error(where, rc);
             }
         });
@@ -313,9 +322,16 @@ Directory::task_type Directory::read() {
 }
 
 Directory::stream_type Directory::entries() {
-    while (is_open() && !eof_) {
-        co_yield read();
+    if (!is_open() || eof_) {
+        return {};
     }
+
+    return stream_type([this]() -> task_type {
+        if (!is_open() || eof_) {
+            co_return std::nullopt;
+        }
+        co_return co_await read();
+    });
 }
 
 Task<void> Directory::close() {

@@ -7,10 +7,10 @@
 #include <string>
 #include <string_view>
 
-#include <async_simple/coro/Generator.h>
 #include <uv.h>
 
 #include "async_uv/cancel.h"
+#include "async_uv/stream.h"
 #include "async_uv/tcp.h"
 
 namespace async_uv {
@@ -43,7 +43,7 @@ public:
     using message_type = UdpDatagram;
     using next_type = std::optional<message_type>;
     using task_type = Task<next_type>;
-    using stream_type = async_simple::coro::Generator<task_type>;
+    using stream_type = Stream<message_type>;
 
     UdpSocket() = default;
     explicit UdpSocket(std::shared_ptr<State> state) noexcept;

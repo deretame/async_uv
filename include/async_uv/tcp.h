@@ -8,11 +8,11 @@
 #include <string_view>
 #include <vector>
 
-#include <async_simple/coro/Generator.h>
 #include <uv.h>
 
 #include "async_uv/cancel.h"
 #include "async_uv/runtime.h"
+#include "async_uv/stream.h"
 
 namespace async_uv {
 
@@ -111,7 +111,7 @@ public:
     using endpoint_type = SocketAddress;
     using next_type = std::optional<std::string>;
     using task_type = Task<next_type>;
-    using stream_type = async_simple::coro::Generator<task_type>;
+    using stream_type = Stream<std::string>;
 
     TcpClient() = default;
     explicit TcpClient(std::shared_ptr<State> state) noexcept;

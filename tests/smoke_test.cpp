@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -67,11 +68,8 @@ async_uv::Task<std::string> run_tcp_client(int port) {
     co_await client.shutdown();
 
     std::string reply;
-    for (auto next : client.receive_chunks(2)) {
-        auto chunk = co_await std::move(next);
-        if (!chunk) {
-            break;
-        }
+    auto chunks = client.receive_chunks(2);
+    while (auto chunk = co_await chunks.next()) {
         reply += *chunk;
     }
 
@@ -86,8 +84,8 @@ async_uv::Task<void> run_udp_server(async_uv::UdpSocket socket) {
     assert(local_endpoint.valid());
     assert(local_endpoint.port() != 0);
 
-    auto next = socket.receive_next(64);
-    auto datagram = co_await std::move(next);
+    auto packets = socket.receive_packets(64);
+    auto datagram = co_await packets.next();
     assert(datagram.has_value());
     assert(datagram->payload == "ping");
     assert(datagram->remote_endpoint.valid());
@@ -138,7 +136,7 @@ async_uv::Task<std::string> run_udp_client(int port) {
     co_return reply;
 }
 
-async_uv::Task<std::vector<int>> consume_mailbox(async_uv::Mailbox<int> mailbox);
+async_uv::Task<std::vector<int>> consume_mailbox(async_uv::Mailbox<std::unique_ptr<int>> mailbox);
 
 async_uv::Task<void> fail_after(std::chrono::milliseconds delay, std::string message) {
     co_await async_uv::sleep_for(delay);
@@ -253,11 +251,8 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
     {
         auto directory = co_await async_uv::Fs::open_directory(leaf_dir);
         std::vector<std::string> streamed_entries;
-        for (auto next : directory.entries()) {
-            auto entry = co_await std::move(next);
-            if (!entry) {
-                break;
-            }
+        auto stream = directory.entries();
+        while (auto entry = co_await stream.next()) {
             streamed_entries.push_back(entry->name);
         }
         assert(streamed_entries.size() == entries.size());
@@ -339,7 +334,7 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
         auto watcher =
             co_await async_uv::FsEventWatcher::watch(leaf_dir, async_uv::FsEventFlags::none);
 
-        auto next_event = async_uv::spawn(watcher.next());
+        auto stream = watcher.events();
         auto producer = async_uv::spawn_blocking([path = moved_file] {
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
@@ -355,8 +350,7 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
         });
 
         assert(co_await std::move(producer));
-        co_await async_uv::sleep_for(250ms);
-        auto event = co_await std::move(next_event);
+        auto event = co_await stream.next();
         co_await watcher.stop_for(500ms);
 
         assert(event.has_value());
@@ -381,7 +375,7 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
 
     {
         auto watcher = co_await async_uv::FsPollWatcher::watch(moved_file, 50ms);
-        auto next_event = async_uv::spawn(watcher.next());
+        auto stream = watcher.events();
         auto producer = async_uv::spawn_blocking([path = moved_file] {
             std::this_thread::sleep_for(std::chrono::milliseconds(120));
 
@@ -397,8 +391,7 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
         });
 
         assert(co_await std::move(producer));
-        co_await async_uv::sleep_for(300ms);
-        auto event = co_await std::move(next_event);
+        auto event = co_await stream.next();
         co_await watcher.stop_for(500ms);
 
         assert(event.has_value());
@@ -576,27 +569,101 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
     }
 
     {
-        auto mailbox = co_await async_uv::Mailbox<int>::create();
+        auto mailbox_trace_events = std::make_shared<std::atomic_int>(0);
+        async_uv::set_trace_hook([mailbox_trace_events](const async_uv::TraceEvent &event) {
+            if (std::string_view(event.category) == "mailbox") {
+                mailbox_trace_events->fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create();
         auto sender = mailbox.sender();
-        sender.send(1);
-        sender.send(2);
+        sender.send(std::make_unique<int>(1));
+        sender.send(std::make_unique<int>(2));
         sender.close();
 
         std::vector<int> same_thread_messages;
-        for (auto next : mailbox.messages()) {
-            auto message = co_await std::move(next);
-            if (!message) {
-                break;
-            }
-            same_thread_messages.push_back(*message);
+        auto stream = mailbox.messages();
+        while (auto message = co_await stream.next()) {
+            same_thread_messages.push_back(**message);
         }
 
         assert((same_thread_messages == std::vector<int>{1, 2}));
         co_await mailbox.close();
+
+        async_uv::reset_trace_hook();
+        assert(mailbox_trace_events->load(std::memory_order_relaxed) > 0);
     }
 
     {
-        auto mailbox = co_await async_uv::Mailbox<int>::create();
+        async_uv::MailboxOptions options;
+        options.max_buffered_messages = 1;
+        auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create(options);
+        assert(mailbox.max_buffered_messages().has_value());
+        assert(*mailbox.max_buffered_messages() == 1);
+        assert(mailbox.is_bounded());
+        assert(mailbox.buffered_size() == 0);
+
+        auto sender = mailbox.sender();
+        assert(sender.send(std::make_unique<int>(10)));
+        assert(mailbox.buffered_size() == 1);
+        assert(!sender.try_send(std::make_unique<int>(11)));
+        assert(!(co_await sender.send_for(std::make_unique<int>(111), 10ms)));
+
+        std::atomic_bool waited_send_ok = false;
+        std::thread waited_sender([sender, &waited_send_ok]() mutable {
+            waited_send_ok.store(sender.sync_send_for(std::make_unique<int>(13), 200ms),
+                                 std::memory_order_release);
+        });
+
+        co_await async_uv::sleep_for(20ms);
+
+        auto first = co_await mailbox.recv();
+        assert(first.has_value());
+        assert(**first == 10);
+
+        waited_sender.join();
+        assert(waited_send_ok.load(std::memory_order_acquire));
+
+        auto waited = co_await mailbox.recv();
+        assert(waited.has_value());
+        assert(**waited == 13);
+        assert(mailbox.buffered_size() == 0);
+
+        assert((co_await sender.send_for(std::make_unique<int>(12), 50ms)));
+        sender.close();
+
+        auto second = co_await mailbox.recv();
+        assert(second.has_value());
+        assert(**second == 12);
+
+        auto end = co_await mailbox.recv();
+        assert(!end.has_value());
+        co_await mailbox.close();
+    }
+
+    {
+        async_uv::MailboxOptions options;
+        options.max_buffered_messages = 1;
+        options.overflow_policy = async_uv::MailboxOptions::OverflowPolicy::drop_oldest;
+        auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create(options);
+
+        auto sender = mailbox.sender();
+        assert(sender.send(std::make_unique<int>(21)));
+        assert(sender.send(std::make_unique<int>(22)));
+        sender.close();
+
+        auto latest = co_await mailbox.recv();
+        assert(latest.has_value());
+        assert(**latest == 22);
+
+        auto end = co_await mailbox.recv();
+        assert(!end.has_value());
+        co_await mailbox.close();
+    }
+
+    {
+        auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create();
 
         bool timed_out = false;
         try {
@@ -607,26 +674,26 @@ async_uv::Task<void> smoke_test_body(const std::string &temp_file) {
         assert(timed_out);
 
         auto sender = mailbox.sender();
-        sender.send(42);
+        sender.send(std::make_unique<int>(42));
         sender.close();
 
         auto message = co_await mailbox.recv_until(std::chrono::steady_clock::now() +
                                                    std::chrono::milliseconds(100));
         assert(message.has_value());
-        assert(*message == 42);
+        assert(**message == 42);
         co_await mailbox.close_for(100ms);
     }
 
     {
-        auto mailbox = co_await async_uv::Mailbox<int>::create();
+        auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create();
         auto sender = mailbox.sender();
         const auto mailbox_started = std::chrono::steady_clock::now();
 
         std::thread producer([sender]() mutable {
             std::this_thread::sleep_for(std::chrono::milliseconds(70));
-            sender.send(7);
+            sender.send(std::make_unique<int>(7));
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            sender.send(8);
+            sender.send(std::make_unique<int>(8));
             sender.close();
         });
 
@@ -670,14 +737,11 @@ async_uv::Task<int> trivial_spawn_value() {
     co_return 7;
 }
 
-async_uv::Task<std::vector<int>> consume_mailbox(async_uv::Mailbox<int> mailbox) {
+async_uv::Task<std::vector<int>> consume_mailbox(async_uv::Mailbox<std::unique_ptr<int>> mailbox) {
     std::vector<int> values;
-    for (auto next : mailbox.messages()) {
-        auto message = co_await std::move(next);
-        if (!message) {
-            break;
-        }
-        values.push_back(*message);
+    auto stream = mailbox.messages();
+    while (auto message = co_await stream.next()) {
+        values.push_back(**message);
     }
     co_await mailbox.close();
     co_return values;
@@ -689,7 +753,7 @@ int main() {
     const std::string temp_file = "async_uv_smoke.txt";
 
     try {
-        async_uv::Runtime runtime;
+        async_uv::Runtime runtime(async_uv::Runtime::build().uv_threadpool_size(4));
         auto spawned = async_uv::spawn(runtime, trivial_spawn_value());
         assert(std::move(spawned).get() == 7);
         auto blocking_spawned = runtime.spawn_blocking([] {

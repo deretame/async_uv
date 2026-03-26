@@ -1,7 +1,10 @@
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "async_uv/async_uv.h"
@@ -34,11 +37,8 @@ async_uv::Task<std::string> run_tcp_client(int port) {
     co_await client.shutdown();
 
     std::string reply;
-    for (auto next : client.receive_chunks(8)) {
-        auto chunk = co_await std::move(next);
-        if (!chunk) {
-            break;
-        }
+    auto chunks = client.receive_chunks(8);
+    while (auto chunk = co_await chunks.next()) {
         reply += *chunk;
     }
 
@@ -133,21 +133,26 @@ async_uv::Task<void> demo() {
             co_return std::tuple<int, int, int>{first, second, fastest};
         });
 
-    auto mailbox = co_await async_uv::Mailbox<std::string>::create();
+    auto mailbox_trace_events = std::make_shared<std::atomic_int>(0);
+    async_uv::set_trace_hook([mailbox_trace_events](const async_uv::TraceEvent &event) {
+        if (std::string_view(event.category) == "mailbox") {
+            mailbox_trace_events->fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<std::string>>::create();
     auto sender = mailbox.sender();
-    sender.send("alpha");
-    sender.send("beta");
+    sender.send(std::make_unique<std::string>("alpha"));
+    sender.send(std::make_unique<std::string>("beta"));
     sender.close();
 
     std::vector<std::string> messages;
-    for (auto next : mailbox.messages()) {
-        auto message = co_await std::move(next);
-        if (!message) {
-            break;
-        }
-        messages.push_back(std::move(*message));
+    auto message_stream = mailbox.messages();
+    while (auto message = co_await message_stream.next()) {
+        messages.push_back(std::move(**message));
     }
     co_await mailbox.close();
+    async_uv::reset_trace_hook();
 
     std::cout << "file => " << text;
     std::cout << "size => " << text_size << '\n';
@@ -168,6 +173,8 @@ async_uv::Task<void> demo() {
         std::cout << messages[i];
     }
     std::cout << '\n';
+    std::cout << "trace=> mailbox events=" << mailbox_trace_events->load(std::memory_order_relaxed)
+              << '\n';
 
     co_await async_uv::Fs::remove_all(demo_dir);
 }
@@ -176,7 +183,7 @@ async_uv::Task<void> demo() {
 
 int main() {
     try {
-        async_uv::Runtime runtime;
+        async_uv::Runtime runtime(async_uv::Runtime::build().name("async_uv_demo"));
         runtime.block_on(demo());
         return 0;
     } catch (const std::exception &ex) {

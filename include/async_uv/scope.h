@@ -369,6 +369,13 @@ private:
         struct Completion {
             using value_type = ValueType;
             async_simple::Try<ValueType> result;
+
+            explicit Completion(async_simple::Try<ValueType> result_in)
+                : result(std::move(result_in)) {}
+            Completion(const Completion &) = delete;
+            Completion &operator=(const Completion &) = delete;
+            Completion(Completion &&) noexcept = default;
+            Completion &operator=(Completion &&) noexcept = default;
         };
 
         CancellationSource source;
@@ -460,6 +467,13 @@ private:
         struct Completion {
             using value_type = ValueType;
             async_simple::Try<ValueType> result;
+
+            explicit Completion(async_simple::Try<ValueType> result_in)
+                : result(std::move(result_in)) {}
+            Completion(const Completion &) = delete;
+            Completion &operator=(const Completion &) = delete;
+            Completion(Completion &&) noexcept = default;
+            Completion &operator=(Completion &&) noexcept = default;
         };
 
         CancellationSource source;

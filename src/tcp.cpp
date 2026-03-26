@@ -215,15 +215,18 @@ void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 
     if (nread == UV_EOF) {
         state->read_eof = true;
+        emit_trace_event({"tcp", "read_eof", 0, 0});
         pending->finish_value(std::string{});
         return;
     }
 
     if (nread < 0) {
+        emit_trace_event({"tcp", "read_error", static_cast<int>(nread), 0});
         pending->finish_uv_error("uv_read_start", static_cast<int>(nread));
         return;
     }
 
+    emit_trace_event({"tcp", "read", 0, static_cast<std::size_t>(nread)});
     pending->finish_value(std::string(buf->base, static_cast<std::size_t>(nread)));
 }
 
@@ -493,6 +496,7 @@ Task<TcpClient> connect_endpoint(Runtime &runtime, SocketAddress endpoint) {
 
                     if (status < 0) {
                         close_client_handle_keep_alive(op->state);
+                        emit_trace_event({"tcp", "connect_error", status, 0});
                         op->finish_uv_error("uv_tcp_connect", status);
                         return;
                     }
@@ -500,12 +504,14 @@ Task<TcpClient> connect_endpoint(Runtime &runtime, SocketAddress endpoint) {
                     op->state->closing = false;
                     op->state->closed = false;
                     op->state->read_eof = false;
+                    emit_trace_event({"tcp", "connect", 0, 0});
                     op->finish_value();
                 });
 
             if (rc < 0) {
                 auto active = detail::detach_shared<ConnectOp>(&op->req);
                 close_client_handle_keep_alive(state);
+                emit_trace_event({"tcp", "connect_error", rc, 0});
                 active->finish_uv_error("uv_tcp_connect", rc);
             }
         });
@@ -899,15 +905,18 @@ Task<std::size_t> TcpClient::write(std::string_view data) {
                                         }
 
                                         if (status < 0) {
+                                            emit_trace_event({"tcp", "write_error", status, 0});
                                             op->finish_uv_error("uv_write", status);
                                             return;
                                         }
 
+                                        emit_trace_event({"tcp", "write", 0, op->payload.size()});
                                         op->finish_value(op->payload.size());
                                     });
 
             if (rc < 0) {
                 auto active = detail::detach_shared<WriteOp>(&op->req);
+                emit_trace_event({"tcp", "write_error", rc, 0});
                 active->finish_uv_error("uv_write", rc);
             }
         });
@@ -1018,10 +1027,14 @@ TcpClient::task_type TcpClient::next(std::size_t max_bytes) {
 }
 
 TcpClient::stream_type TcpClient::chunks(std::size_t max_bytes) {
-    auto state = state_;
-    while (state && !state->closed && !state->closing && !state->read_eof) {
-        co_yield next_impl(state, max_bytes);
+    if (!state_) {
+        return {};
     }
+
+    auto state = state_;
+    return stream_type([state = std::move(state), max_bytes]() -> task_type {
+        co_return co_await next_impl(state, max_bytes);
+    });
 }
 
 TcpClient::task_type TcpClient::next_impl(const std::shared_ptr<State> &state,
@@ -1030,12 +1043,23 @@ TcpClient::task_type TcpClient::next_impl(const std::shared_ptr<State> &state,
         throw std::runtime_error("tcp chunk size must be greater than zero");
     }
 
-    TcpClient client(state);
-    auto chunk = co_await client.read_some(max_bytes);
-    if (chunk.empty() && state->read_eof) {
+    if (!state || state->closed || state->closing) {
         co_return std::nullopt;
     }
-    co_return chunk;
+
+    TcpClient client(state);
+    try {
+        auto chunk = co_await client.read_some(max_bytes);
+        if (chunk.empty() && state->read_eof) {
+            co_return std::nullopt;
+        }
+        co_return chunk;
+    } catch (...) {
+        if (state->closed || state->closing) {
+            co_return std::nullopt;
+        }
+        throw;
+    }
 }
 
 Task<SocketAddress> TcpClient::local_address() {
