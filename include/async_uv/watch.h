@@ -60,11 +60,11 @@ struct FsPollEvent {
 
 class FsEventWatcher {
 public:
-    // 注意：在 WSL 中不要用该 watcher 监听 Windows 挂载目录（如 /mnt/c、/mnt/d）。
-    // 这类路径的事件语义不稳定，可能丢事件或超时，请改用 Linux 文件系统路径（如 /tmp、/home）。
+    // 注意：不要在虚拟挂载路径上使用该 watcher（例如 /mnt/*）。
+    // 这类路径的事件语义可能不稳定，建议使用原生 Linux 文件系统路径（如 /tmp、/home）。
     //
-    // Note: in WSL, do not use this watcher on Windows-mounted paths (for example /mnt/c, /mnt/d).
-    // Event semantics on these paths are not stable and may cause missed events or timeouts, so use Linux paths such as /tmp or /home.
+    // Note: avoid using this watcher on virtual mounted paths (for example /mnt/*).
+    // Event semantics on these paths may be unstable, so prefer native Linux paths such as /tmp or /home.
     using next_type = std::optional<FsEvent>;
     using task_type = Task<next_type>;
     using stream_type = Stream<FsEvent>;
@@ -115,11 +115,11 @@ private:
 
 class FsPollWatcher {
 public:
-    // 注意：在 WSL 中不要用该 watcher 轮询 Windows 挂载目录（如 /mnt/c、/mnt/d）。
-    // 这类路径在 DrvFS 上行为可能与原生 Linux 不一致，建议只监控 /tmp、/home 等 Linux 路径。
+    // 注意：不要在虚拟挂载路径上轮询（例如 /mnt/*）。
+    // 这类路径行为可能与原生 Linux 不一致，建议优先监控 /tmp、/home 等路径。
     //
-    // Note: in WSL, do not use this watcher to poll Windows-mounted paths (for example /mnt/c, /mnt/d).
-    // On DrvFS these paths may behave differently from native Linux, so prefer Linux paths such as /tmp or /home.
+    // Note: avoid polling virtual mounted paths (for example /mnt/*).
+    // These paths may behave differently from native Linux filesystems; prefer /tmp or /home.
     using next_type = std::optional<FsPollEvent>;
     using task_type = Task<next_type>;
     using stream_type = Stream<FsPollEvent>;

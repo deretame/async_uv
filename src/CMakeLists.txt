@@ -4,6 +4,7 @@ add_library(async_uv
     cancel.cpp
     runtime.cpp
     scope.cpp
+    tls.cpp
     fd.cpp
     fs.cpp
     tcp.cpp
@@ -24,6 +25,9 @@ target_link_libraries(async_uv
         async_simple_headers
         libuv::libuv
 )
+
+find_package(OpenSSL REQUIRED)
+target_link_libraries(async_uv PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 if(ASYNC_UV_USE_MIMALLOC)
     if(TARGET mimalloc-static)

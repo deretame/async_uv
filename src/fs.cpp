@@ -1025,16 +1025,7 @@ Task<void> Fs::copy(std::string from, std::string to, int copy_file_flags) {
 
     if (source_info.is_symlink()) {
         auto target = co_await read_link(from);
-        int flags = 0;
-#if defined(_WIN32)
-        try {
-            if ((co_await stat(from)).is_directory()) {
-                flags |= UV_FS_SYMLINK_DIR;
-            }
-        } catch (...) {
-        }
-#endif
-        co_await symlink(std::move(target), std::move(to), flags);
+        co_await symlink(std::move(target), std::move(to), 0);
         co_return;
     }
 

@@ -26,7 +26,32 @@ target_link_libraries(async_uv_http_test PRIVATE tinyxml2::tinyxml2)
 add_executable(async_uv_http_parser_test parser_test.cpp)
 target_link_libraries(async_uv_http_parser_test PRIVATE async_uv_http)
 
+add_executable(async_uv_http_server_test http_server_test.cpp)
+target_link_libraries(async_uv_http_server_test PRIVATE async_uv_http)
+
+add_executable(async_uv_sql_test sql_test.cpp)
+target_link_libraries(async_uv_sql_test PRIVATE async_uv_sql)
+
+add_executable(async_uv_redis_test redis_test.cpp)
+target_link_libraries(async_uv_redis_test PRIVATE async_uv_redis)
+
+add_executable(async_uv_ws_test ws_test.cpp)
+target_link_libraries(async_uv_ws_test PRIVATE async_uv_ws)
+
+if(ASYNC_UV_WS_HAS_IXWEBSOCKET)
+    target_compile_definitions(async_uv_ws_test PRIVATE
+        ASYNC_UV_WS_TEST_CERT_DIR="${ixwebsocket_SOURCE_DIR}/test/.certs"
+        ASYNC_UV_WS_TEST_TRUSTED_CA="${ixwebsocket_SOURCE_DIR}/test/.certs/trusted-ca-crt.pem"
+        ASYNC_UV_WS_TEST_SERVER_CERT="${ixwebsocket_SOURCE_DIR}/test/.certs/trusted-server-crt.pem"
+        ASYNC_UV_WS_TEST_SERVER_KEY="${ixwebsocket_SOURCE_DIR}/test/.certs/trusted-server-key.pem"
+    )
+endif()
+
 if(BUILD_TESTING)
     add_test(NAME async_uv_http_test COMMAND async_uv_http_test)
     add_test(NAME async_uv_http_parser_test COMMAND async_uv_http_parser_test)
+    add_test(NAME async_uv_http_server_test COMMAND async_uv_http_server_test)
+    add_test(NAME async_uv_sql_test COMMAND async_uv_sql_test)
+    add_test(NAME async_uv_redis_test COMMAND async_uv_redis_test)
+    add_test(NAME async_uv_ws_test COMMAND async_uv_ws_test)
 endif()

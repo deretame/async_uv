@@ -54,7 +54,7 @@ target_link_libraries(async_uv_tls_bio_test
         mbedx509
         mbedcrypto)
 
-if(TARGET CURL::libcurl AND NOT WIN32)
+if(TARGET CURL::libcurl)
     add_executable(async_uv_fd_curl_test fd_curl_test.cpp)
     target_link_libraries(async_uv_fd_curl_test PRIVATE async_uv CURL::libcurl)
 endif()
@@ -64,7 +64,7 @@ if(BUILD_TESTING)
     add_test(NAME async_uv_scope_test COMMAND async_uv_scope_test)
     add_test(NAME async_uv_constraints_test COMMAND async_uv_constraints_test)
     add_test(NAME async_uv_tls_bio_test COMMAND async_uv_tls_bio_test)
-    if(TARGET CURL::libcurl AND NOT WIN32)
+    if(TARGET CURL::libcurl)
         add_test(NAME async_uv_fd_curl_test COMMAND async_uv_fd_curl_test)
     endif()
 endif()

@@ -44,14 +44,46 @@ If you add the repository root instead, examples and tests are controlled by:
 - `ASYNC_UV_BUILD_EXAMPLES`
 - `ASYNC_UV_BUILD_TESTS`
 - `ASYNC_UV_USE_MIMALLOC`
-- `ASYNC_UV_ENABLE_LAYER2` (build layer2 HTTP wrapper target `async_uv_http`)
+- `ASYNC_UV_ENABLE_LAYER2` (build layer2 targets: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws`)
 - `ASYNC_UV_ENABLE_LAYER3` (build layer3 target; automatically enables layer2)
 
 Layer relationship:
 
 - layer1: `async_uv` (base IO runtime)
-- layer2: `async_uv_http` (depends on layer1)
+- layer2: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws` (depend on layer1)
 - layer3: `async_uv_layer3` (depends on layer2, and transitively layer1)
+
+Layer2 boundary (scope):
+
+- layer2 only provides reusable primitives: connection/IO, parser/serialization, pool, timeout, TLS, error mapping, trace events
+- routing, endpoint composition, auth, business middleware orchestration belong to layer3
+
+Layer2 stable API checklist:
+
+- `async_uv::http`: HTTP client + parser + server primitives only (no router)
+- `async_uv::sql`: connection/query/transaction/pool primitives
+- `async_uv::redis`: connection/command/pool primitives
+- `async_uv::ws`: open/close/send/recv/messages stream primitives (`ws`/`wss`)
+- `async_uv::layer2::ErrorKind`: cross-module error mapping contract
+- `trace hook` categories: `layer2_http`, `layer2_sql`, `layer2_redis`, `layer2_ws`
+
+Layer2 header index (for layer3 integration):
+
+- HTTP client/parser: `layer2/include/async_uv_http/http.h`, `layer2/include/async_uv_http/parser.h`
+- HTTP server primitives: `layer2/include/async_uv_http/server.h`
+- SQL: `layer2/include/async_uv_sql/sql.h`
+- Redis: `layer2/include/async_uv_redis/redis.h`
+- WebSocket: `layer2/include/async_uv_ws/ws.h`
+- unified error mapping: `layer2/include/async_uv_layer2/error.h`
+- logging helper (`to_string`): `layer2/include/async_uv_layer2/to_string.h`
+
+Layer2 integration reading order (recommended):
+
+1. boundary/scope (`Layer2 boundary`)
+2. header entry points (`Layer2 header index`)
+3. module primitives (`Layer2 SQL`, `Layer2 Redis`, `Layer2 WebSocket`, `Layer2 HTTP server primitives`)
+4. unified error mapping (`async_uv::layer2::ErrorKind` + `to_error_kind(...)`)
+5. trace hooks (`layer2_http`, `layer2_sql`, `layer2_redis`, `layer2_ws`)
 
 Example:
 
@@ -64,10 +96,11 @@ Then link:
 
 ```cmake
 target_link_libraries(my_app PRIVATE async_uv_http)
+# optionally add: async_uv_sql async_uv_redis async_uv_ws
 ```
 
-`async_uv_http` uses libcurl. OpenSSL backend is preferred. On Windows, if OpenSSL is
-unavailable, the build falls back to Schannel when building curl from source.
+`async_uv_http` uses libcurl. OpenSSL backend is preferred. If OpenSSL is unavailable,
+the build falls back to mbedTLS when building curl from source.
 
 ## Core Pieces
 
@@ -153,6 +186,233 @@ Additional HTTP features:
 - streaming response chunks via `stream_response(...)` / `on_response_chunk(...)`
 - transport error kind (`TransportErrorKind`) for finer error handling
 - llhttp parser (`HttpParser` + `HttpMessage`) for incremental raw HTTP parsing
+
+Layer2 SQL abstraction (`async_uv::sql`) currently provides:
+
+- unified async API for SQLite / MySQL / PostgreSQL (driver availability depends on source dependency build)
+- `Connection::open/query/execute/close/cancel` coroutine interfaces
+- parameterized query API (`query/execute` overloads with `std::vector<SqlParam>`, supports string/int/double/bool/null)
+- basic transaction helpers (`begin/commit/rollback`)
+- query timeout options (`ConnectionOptions::query_timeout_ms`, `QueryOptions::timeout_ms`)
+- connection pool (`ConnectionPool`) with configurable pool size / acquire timeout / max lifetime / health check SQL
+- builder-style options for backward-compatible extension (`ConnectionOptions::builder()`, `QueryOptions::builder()`, `ConnectionPoolOptions::builder()`)
+- PostgreSQL SSL options in connection config (`postgres_ssl_mode` and cert/key/root cert fields)
+- row/column normalized result model (`QueryResult`, `Row`, nullable `Cell`)
+
+```cpp
+auto db_opts = async_uv::sql::ConnectionOptions::builder()
+    .driver(async_uv::sql::Driver::sqlite)
+    .file(":memory:")
+    .query_timeout_ms(2000)
+    .build();
+
+async_uv::sql::Connection db;
+co_await db.open(db_opts);
+co_await db.execute("CREATE TABLE demo(id INTEGER PRIMARY KEY, name TEXT)");
+co_await db.begin();
+co_await db.execute("INSERT INTO demo(name) VALUES(?)", {"alice"});
+co_await db.commit();
+
+auto rows = co_await db.query("SELECT id, name FROM demo ORDER BY id");
+
+// 参数化查询（? 占位符，支持多种类型）
+auto filtered = co_await db.query(
+    "SELECT id, name FROM demo WHERE name = ? AND id > ?",
+    {"alice", 0},
+    async_uv::sql::QueryOptions::builder().timeout_ms(1000).build()
+);
+
+auto pool = co_await async_uv::sql::ConnectionPool::create(
+    async_uv::sql::ConnectionPoolOptions::builder()
+        .connection(db_opts)
+        .max_connections(4)
+        .preconnect(true)
+        .acquire_timeout_ms(3000)
+        .build()
+);
+
+auto pooled = co_await pool.query("SELECT COUNT(*) FROM demo");
+co_await pool.close();
+
+co_await db.close();
+```
+
+SQL test toggles:
+
+- `ASYNC_UV_SQL_TEST_POSTGRES=1` enables postgres integration checks
+- `ASYNC_UV_SQL_TEST_MYSQL=1` enables mysql integration checks
+- `ASYNC_UV_SQL_PG_*` / `ASYNC_UV_SQL_MY_*` can override default host/port/user/password/database
+
+Layer2 Redis abstraction (`async_uv::redis`) currently provides:
+
+- coroutine-based `Client::open/command/execute/close` API
+- Redis command parameter replacement using `?` placeholders with `std::vector<RedisParam>`
+- official hiredis source dependency with fd watcher driven nonblocking socket flow
+- TLS/SSL support via hiredis SSL (`tls_enabled`, CA/cert/key/server_name, verify mode)
+- optional auth/select on connect (`user`/`password`/`db`)
+- connection pool (`ConnectionPool`) with configurable pool size / acquire timeout / max lifetime / health check command
+
+```cpp
+auto redis_opts = async_uv::redis::ConnectionOptions::builder()
+    .host("127.0.0.1")
+    .port(6379)
+    // .tls_enabled(true)
+    // .tls_server_name("redis.example.com")
+    .build();
+
+async_uv::redis::Client redis;
+co_await redis.open(redis_opts);
+co_await redis.command("SET ? ?", {"demo:key", "value"});
+auto reply = co_await redis.command("GET ?", {"demo:key"});
+co_await redis.close();
+
+auto redis_pool = co_await async_uv::redis::ConnectionPool::create(
+    async_uv::redis::ConnectionPoolOptions::builder()
+        .connection(redis_opts)
+        .max_connections(4)
+        .preconnect(true)
+        .build()
+);
+
+auto pooled_reply = co_await redis_pool.command("GET ?", {"demo:key"});
+co_await redis_pool.close();
+```
+
+Redis test toggles:
+
+- `ASYNC_UV_TEST_REDIS=1` enables redis integration checks
+- `ASYNC_UV_REDIS_HOST` / `ASYNC_UV_REDIS_PORT` / `ASYNC_UV_REDIS_USER` / `ASYNC_UV_REDIS_PASSWORD` / `ASYNC_UV_REDIS_DB`
+- TLS env (optional): `ASYNC_UV_REDIS_TLS=1`, `ASYNC_UV_REDIS_TLS_VERIFY_PEER=0|1`, `ASYNC_UV_REDIS_TLS_CA_CERT`, `ASYNC_UV_REDIS_TLS_CA_DIR`, `ASYNC_UV_REDIS_TLS_CERT`, `ASYNC_UV_REDIS_TLS_KEY`, `ASYNC_UV_REDIS_TLS_SERVER_NAME`
+
+Layer2 WebSocket abstraction (`async_uv::ws`) currently provides:
+
+- coroutine-style `Client::open/close/send_text/send_binary/next_message/next_message_for/messages`
+- ws and wss URL support (TLS handled by IXWebSocket + OpenSSL backend)
+- callback-to-coroutine bridging via mailbox stream (`next_message` and `messages().next()` awaitable pull model)
+- builder-style options (`ClientOptions::builder()`) for timeout/ping/reconnect/TLS fields
+- built-in trace events: `layer2_ws/open_*`, `layer2_ws/send_*`, `layer2_ws/recv_*`, `layer2_ws/close_*`
+
+```cpp
+auto ws_opts = async_uv::ws::ClientOptions::builder()
+    .url("wss://echo.websocket.events")
+    .connect_timeout_ms(5000)
+    .disable_automatic_reconnection(true)
+    .tls_verify_peer(true)
+    .build();
+
+async_uv::ws::Client ws;
+co_await ws.open(ws_opts);
+co_await ws.send_text("hello ws");
+
+auto msg = co_await ws.next_message();
+if (msg.type == async_uv::ws::MessageType::text) {
+    // msg.data
+}
+
+co_await ws.close();
+```
+
+Stream-style receive example (recommended for continuous consume):
+
+```cpp
+auto stream = ws.messages();
+while (auto message = co_await stream.next()) {
+    if (message->type == async_uv::ws::MessageType::text) {
+        // process text
+    }
+}
+```
+
+If you only want the first N text messages, prefer "stream loop + break":
+
+```cpp
+std::vector<std::string> got;
+auto stream = ws.messages();
+while (auto message = co_await stream.next()) {
+    if (message->type != async_uv::ws::MessageType::text) {
+        continue;
+    }
+    got.push_back(message->data);
+    if (got.size() == 2) {
+        break;
+    }
+}
+```
+
+WebSocket dependency toggle:
+
+- `ASYNC_UV_LAYER2_FETCH_IXWEBSOCKET=ON|OFF` (default ON)
+
+Layer2 unified error mapping (`async_uv::layer2::ErrorKind`):
+
+- map SQL errors by `async_uv::layer2::to_error_kind(async_uv::sql::SqlErrorKind)`
+- map Redis errors by `async_uv::layer2::to_error_kind(async_uv::redis::RedisErrorKind)`
+- map HTTP errors by `async_uv::layer2::to_error_kind(async_uv::http::HttpErrorCode, async_uv::http::TransportErrorKind)`
+- map WebSocket errors by `async_uv::layer2::to_error_kind(async_uv::ws::WsErrorKind)`
+
+```cpp
+#include "async_uv_layer2/error.h"
+
+try {
+    co_await redis.command("GET ?", {"demo:key"});
+} catch (const async_uv::redis::RedisError& e) {
+    auto kind = async_uv::layer2::to_error_kind(e.kind());
+    if (kind == async_uv::layer2::ErrorKind::not_connected) {
+        // reconnect or fallback
+    }
+}
+```
+
+Common `to_string` helpers for logging (`async_uv::layer2::to_string`):
+
+```cpp
+#include "async_uv_layer2/to_string.h"
+
+try {
+    co_await ws.send_text("hello");
+} catch (const async_uv::ws::WsError& e) {
+    auto kind_text = async_uv::layer2::to_string(e.kind());
+    // e.g. "not_connected"
+}
+
+auto mapped = async_uv::layer2::to_error_kind(async_uv::ws::WsErrorKind::send_failed);
+auto mapped_text = async_uv::layer2::to_string(mapped); // "operation_failed"
+```
+
+Layer2 HTTP server primitives (`async_uv::http`) currently provides:
+
+- request-target parser (`parse_request_target`) for path/query/fragment split
+- server request model (`ServerRequest`) converted from `HttpMessage`
+- response serializer (`serialize_response`) with content-length/chunked helpers
+- request safety validation (`validate_request`) by header/body limits
+- connection lifecycle helpers (`ServerConnectionPolicy`, `should_keep_alive`, socket read/write timeout wrappers)
+- middleware chain primitive (`MiddlewareChain`) for request/response wrapping
+- stream primitives (`BodyReader`/`BodyWriter`) with in-memory and socket implementations
+
+```cpp
+auto target = async_uv::http::parse_request_target("/v1/items?id=1&name=foo");
+
+async_uv::http::ServerResponse res;
+res.status_code = 200;
+res.headers.push_back({"Content-Type", "application/json"});
+res.body = R"({"ok":true})";
+
+std::string wire = async_uv::http::serialize_response(res);
+
+async_uv::http::MiddlewareChain chain;
+chain.use([](async_uv::http::ServerRequest req,
+             async_uv::http::ServerHandler next) -> async_uv::Task<async_uv::http::ServerResponse> {
+    req.headers.push_back({"X-Trace", "1"});
+    co_return co_await next(std::move(req));
+});
+
+chain.endpoint([](async_uv::http::ServerRequest req) -> async_uv::Task<async_uv::http::ServerResponse> {
+    async_uv::http::ServerResponse out;
+    out.status_code = 200;
+    out.body = req.header("X-Trace").value_or("0");
+    co_return out;
+});
+```
 
 Behavior contracts (important defaults):
 
@@ -636,7 +896,7 @@ build/async_uv_smoke_test
 build/async_uv_scope_test
 build/async_uv_constraints_test
 build/async_uv_tls_bio_test
-build/async_uv_fd_curl_test   # built on non-Windows when libcurl is available
+build/async_uv_fd_curl_test   # built when libcurl is available
 ```
 
 `async_uv_smoke_test` focuses on:
@@ -675,5 +935,5 @@ build/async_uv_fd_curl_test   # built on non-Windows when libcurl is available
 
 Watcher note:
 
-- on WSL, watcher tests are recommended on Linux filesystem paths (for example `/tmp` or `/home/...`)
-- avoid running watcher-sensitive tests on DrvFS mount paths such as `/mnt/c/...` or `/mnt/d/...`
+- watcher tests are recommended on native Linux filesystem paths (for example `/tmp` or `/home/...`)
+- avoid running watcher-sensitive tests on virtual mount paths such as `/mnt/*`

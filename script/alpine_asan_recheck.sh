@@ -44,7 +44,7 @@ ensure_container() {
 }
 
 if ! command -v podman >/dev/null 2>&1; then
-  echo "[alpine-asan] 未找到 podman，请在 Linux/WSL 环境安装后再执行。" >&2
+  echo "[alpine-asan] 未找到 podman，请在 Linux 环境安装后再执行。" >&2
   exit 1
 fi
 

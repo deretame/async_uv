@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -58,5 +60,22 @@ public:
     // Pull decrypted plaintext bytes for the application layer.
     virtual TlsBioResult read_plain(std::string &out) = 0;
 };
+
+enum class TlsRole {
+    client,
+    server,
+};
+
+struct OpenSslTlsOptions {
+    TlsRole role = TlsRole::client;
+    bool verify_peer = true;
+    std::string ca_file;
+    std::string cert_file;
+    std::string key_file;
+    std::string server_name;
+    std::optional<std::string> alpn;
+};
+
+std::unique_ptr<TlsBio> make_openssl_tls_bio(const OpenSslTlsOptions &options);
 
 } // namespace async_uv

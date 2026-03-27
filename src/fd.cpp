@@ -137,12 +137,7 @@ Task<FdWatcher> FdWatcher::watch(uv_os_sock_t fd, int events) {
     auto future = promise->getFuture().via(runtime);
 
     runtime->post([state, promise]() mutable {
-#ifdef _WIN32
-        const int init_rc =
-            uv_poll_init_socket(state->runtime->loop(), &state->handle, state->watched_fd);
-#else
         const int init_rc = uv_poll_init(state->runtime->loop(), &state->handle, state->watched_fd);
-#endif
         if (init_rc < 0) {
             promise->setException(std::make_exception_ptr(Error("uv_poll_init", init_rc)));
             emit_trace_event({"fd", "poll_start_error", init_rc, 0});
