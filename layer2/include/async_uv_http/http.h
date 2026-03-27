@@ -2,6 +2,9 @@
 
 #include <chrono>
 #include <concepts>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -157,6 +160,40 @@ enum class RequestFormat {
     multipart,
 };
 
+struct RetryPolicy {
+    bool enabled = true;
+    int max_attempts = 1;
+    bool retry_idempotent_only = true;
+    std::chrono::milliseconds base_backoff = std::chrono::milliseconds(100);
+    std::chrono::milliseconds max_backoff = std::chrono::seconds(2);
+    bool retry_on_http_5xx = true;
+};
+
+struct ProxyOptions {
+    std::string url;
+    std::optional<std::string> username;
+    std::optional<std::string> password;
+};
+
+struct CookieJarOptions {
+    bool enabled = false;
+    std::optional<std::string> file_path;
+};
+
+struct DownloadOptions {
+    bool resume = true;
+    bool use_temp_file = true;
+    bool overwrite = true;
+    std::optional<std::filesystem::path> temp_path;
+};
+
+struct DownloadResult {
+    std::filesystem::path output_path;
+    std::uintmax_t size = 0;
+    bool resumed = false;
+    long status_code = 0;
+};
+
 struct Request {
     struct MultipartPart {
         std::string name;
@@ -178,6 +215,10 @@ struct Request {
     std::optional<std::chrono::milliseconds> timeout;
     std::optional<std::chrono::milliseconds> connect_timeout;
     std::optional<bool> follow_redirects;
+    std::optional<RetryPolicy> retry;
+    std::optional<ProxyOptions> proxy;
+    std::optional<bool> aggregate_response_body;
+    std::function<void(std::string_view)> on_response_chunk;
 };
 
 struct MultipartItem {
@@ -244,11 +285,27 @@ enum class HttpErrorCode {
     http_status_failure,
 };
 
+enum class TransportErrorKind {
+    none,
+    timeout,
+    dns,
+    tls,
+    connect,
+    send,
+    recv,
+    reset,
+    unknown,
+};
+
 class HttpError : public std::runtime_error {
 public:
-    HttpError(std::string message, HttpErrorCode code, int transport_code = 0, long status_code = 0)
+    HttpError(std::string message,
+              HttpErrorCode code,
+              int transport_code = 0,
+              long status_code = 0,
+              TransportErrorKind transport_kind = TransportErrorKind::none)
         : std::runtime_error(std::move(message)), code_(code), transport_code_(transport_code),
-          status_code_(status_code) {}
+          status_code_(status_code), transport_kind_(transport_kind) {}
 
     HttpErrorCode code() const noexcept {
         return code_;
@@ -262,10 +319,34 @@ public:
         return status_code_;
     }
 
+    TransportErrorKind transport_kind() const noexcept {
+        return transport_kind_;
+    }
+
 private:
     HttpErrorCode code_ = HttpErrorCode::invalid_request;
     int transport_code_ = 0;
     long status_code_ = 0;
+    TransportErrorKind transport_kind_ = TransportErrorKind::none;
+};
+
+class Interceptor {
+public:
+    virtual ~Interceptor() = default;
+
+    virtual void on_request(Request &request) const {
+        (void)request;
+    }
+
+    virtual void on_response(const Request &request, Response &response) const {
+        (void)request;
+        (void)response;
+    }
+
+    virtual void on_error(const Request &request, const HttpError &error) const {
+        (void)request;
+        (void)error;
+    }
 };
 
 class JsonCodec {
@@ -298,6 +379,12 @@ public:
         bool throw_on_http_error = true;
         std::shared_ptr<const JsonCodec> json_codec;
         std::shared_ptr<const XmlCodec> xml_codec;
+        std::vector<std::shared_ptr<const Interceptor>> interceptors;
+        RetryPolicy retry;
+        std::optional<ProxyOptions> proxy;
+        CookieJarOptions cookie_jar;
+        bool aggregate_response_body = true;
+        std::function<void(std::string_view)> on_response_chunk;
     };
 
     class RequestBuilder {
@@ -416,6 +503,10 @@ public:
         RequestBuilder &response_format(std::string_view format);
         RequestBuilder &request_format(RequestFormat format);
         RequestBuilder &request_format(std::string_view format);
+        RequestBuilder &retry(RetryPolicy value);
+        RequestBuilder &proxy(ProxyOptions value);
+        RequestBuilder &stream_response(std::function<void(std::string_view)> on_chunk,
+                                        bool aggregate = false);
         RequestBuilder &timeout(std::chrono::milliseconds value);
         RequestBuilder &connect_timeout(std::chrono::milliseconds value);
         RequestBuilder &follow_redirects(bool value);
@@ -524,6 +615,41 @@ public:
             return *this;
         }
 
+        Builder &interceptor(std::shared_ptr<const Interceptor> value) {
+            config_.interceptors.push_back(std::move(value));
+            return *this;
+        }
+
+        Builder &interceptors(std::vector<std::shared_ptr<const Interceptor>> values) {
+            config_.interceptors = std::move(values);
+            return *this;
+        }
+
+        Builder &retry(RetryPolicy value) {
+            config_.retry = std::move(value);
+            return *this;
+        }
+
+        Builder &proxy(ProxyOptions value) {
+            config_.proxy = std::move(value);
+            return *this;
+        }
+
+        Builder &cookie_jar(CookieJarOptions value) {
+            config_.cookie_jar = std::move(value);
+            return *this;
+        }
+
+        Builder &aggregate_response_body(bool value) {
+            config_.aggregate_response_body = value;
+            return *this;
+        }
+
+        Builder &on_response_chunk(std::function<void(std::string_view)> value) {
+            config_.on_response_chunk = std::move(value);
+            return *this;
+        }
+
         Client build();
 
     private:
@@ -535,6 +661,9 @@ public:
     }
 
     Task<Response> execute(Request request) const;
+    Task<DownloadResult> download_to_file(std::string url,
+                                          std::filesystem::path output,
+                                          DownloadOptions options = {}) const;
 
     template <typename T>
     T parse_json(std::string_view text) const {

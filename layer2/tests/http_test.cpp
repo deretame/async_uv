@@ -50,6 +50,38 @@ struct QueryToStringCamelValue {
     }
 };
 
+class CountingInterceptor : public async_uv::http::Interceptor {
+public:
+    void on_request(async_uv::http::Request &request) const override {
+        request_count.fetch_add(1, std::memory_order_relaxed);
+        request.headers.push_back({"X-Interceptor", "on"});
+    }
+
+    void on_response(const async_uv::http::Request &,
+                     async_uv::http::Response &response) const override {
+        response_count.fetch_add(1, std::memory_order_relaxed);
+        response.headers.push_back({"X-Interceptor-Response", "on"});
+    }
+
+    void on_error(const async_uv::http::Request &,
+                  const async_uv::http::HttpError &) const override {
+        error_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    mutable std::atomic_int request_count{0};
+    mutable std::atomic_int response_count{0};
+    mutable std::atomic_int error_count{0};
+};
+
+bool has_header(const async_uv::http::Response &response, const std::string &name) {
+    for (const auto &header : response.headers) {
+        if (header.name == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct QueryTupleEntry {
     std::string key;
     std::string value;
@@ -207,11 +239,25 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                                      std::string json_url,
                                      std::string json_get_url,
                                      std::string xml_get_url,
-                                     std::string query_url) {
+                                     std::string query_url,
+                                     std::string download_url) {
     auto *runtime = co_await async_uv::get_current_runtime();
 
     auto codec = std::make_shared<SimpleMapJsonCodec>();
     auto xml_codec = std::make_shared<SimpleXmlCodec>();
+    auto interceptor = std::make_shared<CountingInterceptor>();
+    std::atomic_size_t streamed_bytes = 0;
+
+    async_uv::http::CookieJarOptions cookie_jar;
+    cookie_jar.enabled = true;
+    cookie_jar.file_path =
+        (std::filesystem::temp_directory_path() / "async_uv_http_cookie.jar").string();
+
+    async_uv::http::RetryPolicy retry;
+    retry.enabled = true;
+    retry.max_attempts = 2;
+    retry.base_backoff = std::chrono::milliseconds(20);
+    retry.max_backoff = std::chrono::milliseconds(40);
     codec->register_type<std::map<std::string, std::string>>();
     codec->register_type<nlohmann::json>();
     codec->register_type<DemoPayload>();
@@ -221,6 +267,12 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                       .runtime(*runtime)
                       .json_codec(codec)
                       .xml_codec(xml_codec)
+                      .interceptor(interceptor)
+                      .retry(retry)
+                      .cookie_jar(cookie_jar)
+                      .on_response_chunk([&](std::string_view chunk) {
+                          streamed_bytes.fetch_add(chunk.size(), std::memory_order_relaxed);
+                      })
                       .default_header("Accept", "*/*")
                       .timeout(std::chrono::seconds(15))
                       .connect_timeout(std::chrono::seconds(8))
@@ -233,6 +285,22 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
     assert(response.status_code >= 200);
     assert(response.status_code < 300);
     assert(!response.effective_url.empty());
+    assert(has_header(response, "X-Interceptor-Response"));
+    assert(streamed_bytes.load(std::memory_order_relaxed) > 0);
+
+    std::atomic_size_t stream_only_bytes = 0;
+    auto stream_only_body =
+        co_await client.get(response.effective_url)
+            .stream_response(
+                [&](std::string_view chunk) {
+                    stream_only_bytes.fetch_add(chunk.size(), std::memory_order_relaxed);
+                },
+                false)
+            .response_format(async_uv::http::ResponseFormat::text)
+            .send()
+            .text();
+    assert(stream_only_bytes.load(std::memory_order_relaxed) > 0);
+    assert(stream_only_body.empty());
 
     auto ua_response = co_await client.get(response.effective_url)
                            .user_agent("async_uv_http_test/ua")
@@ -252,6 +320,31 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
     }
 
     assert(got_http_error);
+
+    {
+        bool saw_transport_error = false;
+        try {
+            (void)co_await client.get("http://nonexistent.async-uv.invalid/")
+                .retry(async_uv::http::RetryPolicy{
+                    .enabled = true,
+                    .max_attempts = 2,
+                    .retry_idempotent_only = true,
+                    .base_backoff = std::chrono::milliseconds(5),
+                    .max_backoff = std::chrono::milliseconds(10),
+                    .retry_on_http_5xx = false,
+                })
+                .send()
+                .raw();
+        } catch (const async_uv::http::HttpError &error) {
+            if (error.code() == async_uv::http::HttpErrorCode::curl_failure) {
+                saw_transport_error =
+                    error.transport_kind() != async_uv::http::TransportErrorKind::none;
+            } else {
+                throw;
+            }
+        }
+        assert(saw_transport_error);
+    }
 
     async_uv::OnceCell<async_uv::http::Client> cell;
     std::atomic_int init_count = 0;
@@ -305,6 +398,9 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 
     assert(saw_mixed_status_error);
     assert(init_count.load(std::memory_order_relaxed) == 1);
+    assert(interceptor->request_count.load(std::memory_order_relaxed) > 0);
+    assert(interceptor->response_count.load(std::memory_order_relaxed) > 0);
+    assert(interceptor->error_count.load(std::memory_order_relaxed) > 0);
 
     {
         bool saw_invalid_request = false;
@@ -379,6 +475,97 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                           << error.transport_code() << " message=" << error.what() << '\n';
             } else {
                 throw;
+            }
+        }
+
+        {
+            const auto download_output =
+                std::filesystem::temp_directory_path() / "async_uv_http_download.bin";
+            const auto download_temp =
+                std::filesystem::temp_directory_path() / "async_uv_http_download.bin.part";
+
+            {
+                std::ofstream pre(download_temp, std::ios::binary | std::ios::trunc);
+                auto pre_resp =
+                    co_await client.get(download_url)
+                        .header("Range", "bytes=0-255")
+                        .stream_response(
+                            [&](std::string_view chunk) {
+                                pre.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+                            },
+                            false)
+                        .response_format(async_uv::http::ResponseFormat::text)
+                        .send()
+                        .raw();
+                (void)pre_resp;
+                pre.flush();
+            }
+
+            async_uv::http::DownloadOptions download_options;
+            download_options.resume = true;
+            download_options.use_temp_file = true;
+            download_options.overwrite = true;
+            download_options.temp_path = download_temp;
+
+            auto result =
+                co_await client.download_to_file(download_url, download_output, download_options);
+            assert(result.output_path == download_output);
+            assert(result.status_code == 200 || result.status_code == 206);
+            assert(result.size > 0);
+            assert(std::filesystem::exists(download_output));
+
+            std::error_code remove_ec;
+            std::filesystem::remove(download_output, remove_ec);
+            std::filesystem::remove(download_temp, remove_ec);
+        }
+
+        try {
+            auto cookie_set = co_await client.get("http://httpbin.org/cookies/set?session=async_uv")
+                                  .follow_redirects(true)
+                                  .response_format(async_uv::http::ResponseFormat::json)
+                                  .send()
+                                  .json<nlohmann::json>();
+            (void)cookie_set;
+
+            auto cookie_get = co_await client.get("http://httpbin.org/cookies")
+                                  .response_format(async_uv::http::ResponseFormat::json)
+                                  .send()
+                                  .json<nlohmann::json>();
+            if (cookie_get.contains("cookies") && cookie_get["cookies"].contains("session")) {
+                assert(cookie_get["cookies"]["session"].get<std::string>() == "async_uv");
+            }
+        } catch (const async_uv::http::HttpError &error) {
+            if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
+                is_network_error(error.transport_code())) {
+                std::cerr
+                    << "[async_uv_http_test] skip: cookie jar demo unavailable, transport_code="
+                    << error.transport_code() << " message=" << error.what() << '\n';
+            } else {
+                throw;
+            }
+        }
+
+        {
+            async_uv::http::RetryPolicy no_retry;
+            no_retry.enabled = false;
+
+            async_uv::http::ProxyOptions bad_proxy;
+            bad_proxy.url = "http://127.0.0.1:1";
+
+            try {
+                (void)co_await client.get(ok_url)
+                    .proxy(bad_proxy)
+                    .retry(no_retry)
+                    .connect_timeout(std::chrono::milliseconds(300))
+                    .timeout(std::chrono::milliseconds(1000))
+                    .send()
+                    .raw();
+            } catch (const async_uv::http::HttpError &error) {
+                if (error.code() == async_uv::http::HttpErrorCode::curl_failure) {
+                    assert(error.transport_kind() != async_uv::http::TransportErrorKind::none);
+                } else {
+                    throw;
+                }
             }
         }
 
@@ -535,10 +722,15 @@ int main() {
                                       ? std::string(query_env)
                                       : "http://httpbin.org/get";
 
+    const char *download_env = std::getenv("ASYNC_UV_HTTP_TEST_DOWNLOAD_URL");
+    const std::string download_url = (download_env != nullptr && *download_env != '\0')
+                                         ? std::string(download_env)
+                                         : "http://httpbin.org/range/4096";
+
     async_uv::Runtime runtime(async_uv::Runtime::build().name("async_uv_http_test"));
     try {
-        runtime.block_on(
-            run_http_checks(ok_url, fail_url, json_url, json_get_url, xml_get_url, query_url));
+        runtime.block_on(run_http_checks(
+            ok_url, fail_url, json_url, json_get_url, xml_get_url, query_url, download_url));
     } catch (const async_uv::http::HttpError &error) {
         if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
             is_network_error(error.transport_code())) {

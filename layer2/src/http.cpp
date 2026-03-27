@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -192,6 +194,76 @@ std::string percent_decode(std::string_view text) {
     return out;
 }
 
+TransportErrorKind map_transport_error_kind(int code) {
+    const auto curl_code = static_cast<CURLcode>(code);
+    switch (curl_code) {
+        case CURLE_OPERATION_TIMEDOUT:
+            return TransportErrorKind::timeout;
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+            return TransportErrorKind::dns;
+        case CURLE_SSL_CONNECT_ERROR:
+        case CURLE_PEER_FAILED_VERIFICATION:
+        case CURLE_SSL_CERTPROBLEM:
+        case CURLE_SSL_CIPHER:
+            return TransportErrorKind::tls;
+        case CURLE_COULDNT_CONNECT:
+            return TransportErrorKind::connect;
+        case CURLE_SEND_ERROR:
+            return TransportErrorKind::send;
+        case CURLE_RECV_ERROR:
+            return TransportErrorKind::recv;
+        case CURLE_GOT_NOTHING:
+            return TransportErrorKind::reset;
+        default:
+            return TransportErrorKind::unknown;
+    }
+}
+
+bool is_idempotent_method(std::string_view method) {
+    return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" ||
+           method == "OPTIONS";
+}
+
+bool should_retry_error(const RetryPolicy &policy,
+                        const HttpError &error,
+                        std::string_view method,
+                        int attempt_index) {
+    if (!policy.enabled || attempt_index > policy.max_attempts) {
+        return false;
+    }
+    if (policy.retry_idempotent_only && !is_idempotent_method(method)) {
+        return false;
+    }
+
+    if (error.code() == HttpErrorCode::http_status_failure) {
+        return policy.retry_on_http_5xx && error.status_code() >= 500 && error.status_code() <= 599;
+    }
+    if (error.code() == HttpErrorCode::curl_failure) {
+        const auto kind = error.transport_kind();
+        return kind == TransportErrorKind::timeout || kind == TransportErrorKind::dns ||
+               kind == TransportErrorKind::connect || kind == TransportErrorKind::recv ||
+               kind == TransportErrorKind::send || kind == TransportErrorKind::reset;
+    }
+    return false;
+}
+
+std::chrono::milliseconds retry_backoff(const RetryPolicy &policy, int attempt_index) {
+    std::uint64_t factor = 1;
+    for (int i = 1; i < attempt_index; ++i) {
+        factor *= 2;
+        if (factor > (1u << 20)) {
+            break;
+        }
+    }
+
+    auto value = policy.base_backoff * static_cast<int>(factor);
+    if (value > policy.max_backoff) {
+        value = policy.max_backoff;
+    }
+    return value;
+}
+
 std::map<std::string, std::string> parse_form_body(std::string_view text) {
     std::map<std::string, std::string> out;
     std::size_t begin = 0;
@@ -214,6 +286,61 @@ std::map<std::string, std::string> parse_form_body(std::string_view text) {
         begin = amp + 1;
     }
     return out;
+}
+
+std::optional<ProxyOptions> proxy_from_env_for_url(std::string_view url) {
+    const bool is_https = url.rfind("https://", 0) == 0;
+    const char *primary = std::getenv(is_https ? "HTTPS_PROXY" : "HTTP_PROXY");
+    const char *fallback = std::getenv(is_https ? "https_proxy" : "http_proxy");
+    const char *all_proxy = std::getenv("ALL_PROXY");
+    const char *all_proxy_lower = std::getenv("all_proxy");
+
+    const char *value = primary;
+    if (value == nullptr || *value == '\0') {
+        value = fallback;
+    }
+    if (value == nullptr || *value == '\0') {
+        value = all_proxy;
+    }
+    if (value == nullptr || *value == '\0') {
+        value = all_proxy_lower;
+    }
+
+    if (value == nullptr || *value == '\0') {
+        return std::nullopt;
+    }
+
+    ProxyOptions options;
+    options.url = value;
+    return options;
+}
+
+void apply_request_interceptors(const Client::Config &config, Request &request) {
+    for (const auto &interceptor : config.interceptors) {
+        if (interceptor) {
+            interceptor->on_request(request);
+        }
+    }
+}
+
+void apply_response_interceptors(const Client::Config &config,
+                                 const Request &request,
+                                 Response &response) {
+    for (const auto &interceptor : config.interceptors) {
+        if (interceptor) {
+            interceptor->on_response(request, response);
+        }
+    }
+}
+
+void notify_error_interceptors(const Client::Config &config,
+                               const Request &request,
+                               const HttpError &error) {
+    for (const auto &interceptor : config.interceptors) {
+        if (interceptor) {
+            interceptor->on_error(request, error);
+        }
+    }
 }
 
 bool is_unreserved_char(unsigned char ch) {
@@ -261,11 +388,22 @@ append_query_items(std::string url,
     return url;
 }
 
+struct ResponseBodySink {
+    std::string *body = nullptr;
+    bool aggregate = true;
+    const std::function<void(std::string_view)> *on_chunk = nullptr;
+};
+
 std::size_t
 write_body_callback(char *buffer, std::size_t size, std::size_t nitems, void *userdata) {
     const std::size_t total = size * nitems;
-    auto *body = static_cast<std::string *>(userdata);
-    body->append(buffer, total);
+    auto *sink = static_cast<ResponseBodySink *>(userdata);
+    if (sink->aggregate && sink->body != nullptr) {
+        sink->body->append(buffer, total);
+    }
+    if (sink->on_chunk != nullptr && *sink->on_chunk) {
+        (*sink->on_chunk)(std::string_view(buffer, total));
+    }
     return total;
 }
 
@@ -426,246 +564,308 @@ Task<void> drive_multi_until_done(CURLM *multi, MultiContext &context, int &runn
 }
 
 Task<Response> execute_async(const Client::Config &config, Request request) {
-    ensure_curl_global_init();
+    try {
+        ensure_curl_global_init();
 
-    auto *current_runtime = async_uv::Runtime::current();
-    if (current_runtime == nullptr) {
-        throw HttpError("http client requires a current runtime", HttpErrorCode::invalid_request);
-    }
-    if (config.runtime != nullptr && config.runtime != current_runtime) {
-        throw HttpError("http client runtime mismatch", HttpErrorCode::invalid_request);
-    }
-
-    if (request.url.empty()) {
-        throw HttpError("request url is empty", HttpErrorCode::invalid_request);
-    }
-
-    if (request.method.empty()) {
-        request.method = "GET";
-    }
-
-    std::vector<Header> final_headers = config.default_headers;
-    final_headers.insert(final_headers.end(), request.headers.begin(), request.headers.end());
-
-    const auto timeout = request.timeout.value_or(config.timeout);
-    const auto connect_timeout = request.connect_timeout.value_or(config.connect_timeout);
-    const bool follow_redirects = request.follow_redirects.value_or(config.follow_redirects);
-    const std::string method = to_upper(request.method);
-
-    const RequestFormat effective_request_format = request.request_format.value_or(
-        !request.multipart_parts.empty() ? RequestFormat::multipart : RequestFormat::text);
-
-    if (!request.multipart_parts.empty() && !request.body.empty()) {
-        throw HttpError("request body conflicts with multipart payload",
-                        HttpErrorCode::invalid_request);
-    }
-
-    if (effective_request_format == RequestFormat::multipart && request.multipart_parts.empty()) {
-        throw HttpError("request_format is multipart but no multipart part is provided",
-                        HttpErrorCode::invalid_request);
-    }
-
-    if (effective_request_format != RequestFormat::multipart && !request.multipart_parts.empty()) {
-        throw HttpError("multipart payload requires request_format multipart",
-                        HttpErrorCode::invalid_request);
-    }
-
-    if (const auto content_type = content_type_for_request_format(effective_request_format);
-        content_type.has_value()) {
-        set_header_if_absent(final_headers, "Content-Type", *content_type);
-    }
-
-    if (!request.multipart_parts.empty() && method != "POST" && method != "PUT") {
-        throw HttpError("multipart form-data requires POST or PUT", HttpErrorCode::invalid_request);
-    }
-
-    Response response;
-
-    CURL *raw_easy = curl_easy_init();
-    if (raw_easy == nullptr) {
-        throw HttpError("curl_easy_init failed",
-                        HttpErrorCode::curl_failure,
-                        static_cast<int>(CURLE_FAILED_INIT));
-    }
-    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> easy(raw_easy, &curl_easy_cleanup);
-
-    curl_mime *raw_mime = nullptr;
-    std::unique_ptr<curl_mime, decltype(&curl_mime_free)> mime(nullptr, &curl_mime_free);
-
-    curl_slist *header_list = nullptr;
-    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(nullptr,
-                                                                             &curl_slist_free_all);
-    for (const auto &header : final_headers) {
-        const std::string line = header.name + ": " + header.value;
-        auto *new_list = curl_slist_append(header_list, line.c_str());
-        if (new_list == nullptr) {
-            throw HttpError("curl_slist_append failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(CURLE_OUT_OF_MEMORY));
+        auto *current_runtime = async_uv::Runtime::current();
+        if (current_runtime == nullptr) {
+            throw HttpError("http client requires a current runtime",
+                            HttpErrorCode::invalid_request);
         }
-        header_list = new_list;
-    }
-    header_guard.reset(header_list);
-
-    const std::string effective_request_url = append_query_items(request.url, request.query_items);
-    curl_easy_setopt(easy.get(), CURLOPT_URL, effective_request_url.c_str());
-    curl_easy_setopt(easy.get(), CURLOPT_FOLLOWLOCATION, follow_redirects ? 1L : 0L);
-    curl_easy_setopt(easy.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(timeout.count()));
-    curl_easy_setopt(
-        easy.get(), CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(connect_timeout.count()));
-    curl_easy_setopt(easy.get(), CURLOPT_WRITEFUNCTION, &write_body_callback);
-    curl_easy_setopt(easy.get(), CURLOPT_WRITEDATA, &response.body);
-    curl_easy_setopt(easy.get(), CURLOPT_HEADERFUNCTION, &write_header_callback);
-    curl_easy_setopt(easy.get(), CURLOPT_HEADERDATA, &response.headers);
-    const std::string user_agent = request.user_agent.value_or(config.user_agent);
-    if (!user_agent.empty()) {
-        curl_easy_setopt(easy.get(), CURLOPT_USERAGENT, user_agent.c_str());
-    }
-
-    if (method != "GET") {
-        curl_easy_setopt(easy.get(), CURLOPT_CUSTOMREQUEST, method.c_str());
-    }
-
-    if (!request.multipart_parts.empty()) {
-        raw_mime = curl_mime_init(easy.get());
-        if (raw_mime == nullptr) {
-            throw HttpError("curl_mime_init failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(CURLE_OUT_OF_MEMORY));
+        if (config.runtime != nullptr && config.runtime != current_runtime) {
+            throw HttpError("http client runtime mismatch", HttpErrorCode::invalid_request);
         }
-        mime.reset(raw_mime);
 
-        for (const auto &part : request.multipart_parts) {
-            curl_mimepart *mime_part = curl_mime_addpart(mime.get());
-            if (mime_part == nullptr) {
-                throw HttpError("curl_mime_addpart failed",
+        if (request.url.empty()) {
+            throw HttpError("request url is empty", HttpErrorCode::invalid_request);
+        }
+
+        if (request.method.empty()) {
+            request.method = "GET";
+        }
+
+        apply_request_interceptors(config, request);
+
+        std::vector<Header> final_headers = config.default_headers;
+        final_headers.insert(final_headers.end(), request.headers.begin(), request.headers.end());
+
+        const auto timeout = request.timeout.value_or(config.timeout);
+        const auto connect_timeout = request.connect_timeout.value_or(config.connect_timeout);
+        const bool follow_redirects = request.follow_redirects.value_or(config.follow_redirects);
+        const std::string method = to_upper(request.method);
+
+        const RequestFormat effective_request_format = request.request_format.value_or(
+            !request.multipart_parts.empty() ? RequestFormat::multipart : RequestFormat::text);
+
+        if (!request.multipart_parts.empty() && !request.body.empty()) {
+            throw HttpError("request body conflicts with multipart payload",
+                            HttpErrorCode::invalid_request);
+        }
+
+        if (effective_request_format == RequestFormat::multipart &&
+            request.multipart_parts.empty()) {
+            throw HttpError("request_format is multipart but no multipart part is provided",
+                            HttpErrorCode::invalid_request);
+        }
+
+        if (effective_request_format != RequestFormat::multipart &&
+            !request.multipart_parts.empty()) {
+            throw HttpError("multipart payload requires request_format multipart",
+                            HttpErrorCode::invalid_request);
+        }
+
+        if (const auto content_type = content_type_for_request_format(effective_request_format);
+            content_type.has_value()) {
+            set_header_if_absent(final_headers, "Content-Type", *content_type);
+        }
+
+        if (!request.multipart_parts.empty() && method != "POST" && method != "PUT") {
+            throw HttpError("multipart form-data requires POST or PUT",
+                            HttpErrorCode::invalid_request);
+        }
+
+        Response response;
+        const bool aggregate_response_body =
+            request.aggregate_response_body.value_or(config.aggregate_response_body);
+        const auto &on_chunk_handler =
+            request.on_response_chunk ? request.on_response_chunk : config.on_response_chunk;
+        ResponseBodySink body_sink{&response.body, aggregate_response_body, &on_chunk_handler};
+
+        CURL *raw_easy = curl_easy_init();
+        if (raw_easy == nullptr) {
+            throw HttpError("curl_easy_init failed",
+                            HttpErrorCode::curl_failure,
+                            static_cast<int>(CURLE_FAILED_INIT));
+        }
+        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> easy(raw_easy, &curl_easy_cleanup);
+
+        curl_mime *raw_mime = nullptr;
+        std::unique_ptr<curl_mime, decltype(&curl_mime_free)> mime(nullptr, &curl_mime_free);
+
+        curl_slist *header_list = nullptr;
+        std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(
+            nullptr, &curl_slist_free_all);
+        for (const auto &header : final_headers) {
+            const std::string line = header.name + ": " + header.value;
+            auto *new_list = curl_slist_append(header_list, line.c_str());
+            if (new_list == nullptr) {
+                throw HttpError("curl_slist_append failed",
                                 HttpErrorCode::curl_failure,
                                 static_cast<int>(CURLE_OUT_OF_MEMORY));
             }
-
-            if (curl_mime_name(mime_part, part.name.c_str()) != CURLE_OK) {
-                throw HttpError("curl_mime_name failed", HttpErrorCode::curl_failure);
-            }
-
-            if (part.file_path.has_value()) {
-                const auto rc = curl_mime_filedata(mime_part, part.file_path->c_str());
-                if (rc != CURLE_OK) {
-                    throw HttpError("curl_mime_filedata failed",
-                                    HttpErrorCode::curl_failure,
-                                    static_cast<int>(rc));
-                }
-
-                if (part.file_name.has_value()) {
-                    const auto name_rc = curl_mime_filename(mime_part, part.file_name->c_str());
-                    if (name_rc != CURLE_OK) {
-                        throw HttpError("curl_mime_filename failed",
-                                        HttpErrorCode::curl_failure,
-                                        static_cast<int>(name_rc));
-                    }
-                }
-            } else {
-                const auto rc = curl_mime_data(
-                    mime_part, part.value.c_str(), static_cast<size_t>(part.value.size()));
-                if (rc != CURLE_OK) {
-                    throw HttpError(
-                        "curl_mime_data failed", HttpErrorCode::curl_failure, static_cast<int>(rc));
-                }
-
-                if (part.file_name.has_value()) {
-                    const auto name_rc = curl_mime_filename(mime_part, part.file_name->c_str());
-                    if (name_rc != CURLE_OK) {
-                        throw HttpError("curl_mime_filename failed",
-                                        HttpErrorCode::curl_failure,
-                                        static_cast<int>(name_rc));
-                    }
-                }
-            }
-
-            if (part.content_type.has_value()) {
-                const auto type_rc = curl_mime_type(mime_part, part.content_type->c_str());
-                if (type_rc != CURLE_OK) {
-                    throw HttpError("curl_mime_type failed",
-                                    HttpErrorCode::curl_failure,
-                                    static_cast<int>(type_rc));
-                }
-            }
+            header_list = new_list;
         }
+        header_guard.reset(header_list);
 
-        curl_easy_setopt(easy.get(), CURLOPT_MIMEPOST, mime.get());
-    } else if (!request.body.empty()) {
-        curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDS, request.body.data());
+        const std::string effective_request_url =
+            append_query_items(request.url, request.query_items);
+        curl_easy_setopt(easy.get(), CURLOPT_URL, effective_request_url.c_str());
+        curl_easy_setopt(easy.get(), CURLOPT_FOLLOWLOCATION, follow_redirects ? 1L : 0L);
+        curl_easy_setopt(easy.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(timeout.count()));
         curl_easy_setopt(
-            easy.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(request.body.size()));
-    }
-
-    if (header_list != nullptr) {
-        curl_easy_setopt(easy.get(), CURLOPT_HTTPHEADER, header_list);
-    }
-
-    CURLM *raw_multi = curl_multi_init();
-    if (raw_multi == nullptr) {
-        throw HttpError("curl_multi_init failed",
-                        HttpErrorCode::curl_failure,
-                        static_cast<int>(CURLM_INTERNAL_ERROR));
-    }
-    std::unique_ptr<CURLM, decltype(&curl_multi_cleanup)> multi(raw_multi, &curl_multi_cleanup);
-
-    MultiContext context;
-    curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &socket_callback);
-    curl_multi_setopt(multi.get(), CURLMOPT_SOCKETDATA, &context);
-    curl_multi_setopt(multi.get(), CURLMOPT_TIMERFUNCTION, &timer_callback);
-    curl_multi_setopt(multi.get(), CURLMOPT_TIMERDATA, &context);
-
-    const auto add_rc = curl_multi_add_handle(multi.get(), easy.get());
-    if (add_rc != CURLM_OK) {
-        throw HttpError(
-            "curl_multi_add_handle failed", HttpErrorCode::curl_failure, static_cast<int>(add_rc));
-    }
-
-    int running_handles = 0;
-    const auto start_rc =
-        curl_multi_socket_action(multi.get(), CURL_SOCKET_TIMEOUT, 0, &running_handles);
-    if (start_rc != CURLM_OK) {
-        curl_multi_remove_handle(multi.get(), easy.get());
-        throw HttpError("curl_multi_socket_action(start) failed",
-                        HttpErrorCode::curl_failure,
-                        static_cast<int>(start_rc));
-    }
-
-    co_await drive_multi_until_done(multi.get(), context, running_handles);
-
-    CURLMsg *message = nullptr;
-    int remaining = 0;
-    CURLcode done_code = CURLE_OK;
-    while ((message = curl_multi_info_read(multi.get(), &remaining)) != nullptr) {
-        if (message->msg == CURLMSG_DONE && message->easy_handle == easy.get()) {
-            done_code = message->data.result;
-            break;
+            easy.get(), CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(connect_timeout.count()));
+        curl_easy_setopt(easy.get(), CURLOPT_WRITEFUNCTION, &write_body_callback);
+        curl_easy_setopt(easy.get(), CURLOPT_WRITEDATA, &body_sink);
+        curl_easy_setopt(easy.get(), CURLOPT_HEADERFUNCTION, &write_header_callback);
+        curl_easy_setopt(easy.get(), CURLOPT_HEADERDATA, &response.headers);
+        const std::string user_agent = request.user_agent.value_or(config.user_agent);
+        if (!user_agent.empty()) {
+            curl_easy_setopt(easy.get(), CURLOPT_USERAGENT, user_agent.c_str());
         }
+
+        auto proxy_options = request.proxy ? request.proxy : config.proxy;
+        if (!proxy_options.has_value()) {
+            proxy_options = proxy_from_env_for_url(request.url);
+        }
+        if (proxy_options.has_value() && !proxy_options->url.empty()) {
+            curl_easy_setopt(easy.get(), CURLOPT_PROXY, proxy_options->url.c_str());
+            if (proxy_options->username.has_value()) {
+                curl_easy_setopt(
+                    easy.get(), CURLOPT_PROXYUSERNAME, proxy_options->username->c_str());
+            }
+            if (proxy_options->password.has_value()) {
+                curl_easy_setopt(
+                    easy.get(), CURLOPT_PROXYPASSWORD, proxy_options->password->c_str());
+            }
+        }
+
+        if (config.cookie_jar.enabled) {
+            curl_easy_setopt(easy.get(), CURLOPT_COOKIEFILE, "");
+            if (config.cookie_jar.file_path.has_value()) {
+                curl_easy_setopt(
+                    easy.get(), CURLOPT_COOKIEJAR, config.cookie_jar.file_path->c_str());
+                curl_easy_setopt(
+                    easy.get(), CURLOPT_COOKIEFILE, config.cookie_jar.file_path->c_str());
+            }
+        }
+
+        if (method != "GET") {
+            curl_easy_setopt(easy.get(), CURLOPT_CUSTOMREQUEST, method.c_str());
+        }
+
+        if (!request.multipart_parts.empty()) {
+            raw_mime = curl_mime_init(easy.get());
+            if (raw_mime == nullptr) {
+                throw HttpError("curl_mime_init failed",
+                                HttpErrorCode::curl_failure,
+                                static_cast<int>(CURLE_OUT_OF_MEMORY));
+            }
+            mime.reset(raw_mime);
+
+            for (const auto &part : request.multipart_parts) {
+                curl_mimepart *mime_part = curl_mime_addpart(mime.get());
+                if (mime_part == nullptr) {
+                    throw HttpError("curl_mime_addpart failed",
+                                    HttpErrorCode::curl_failure,
+                                    static_cast<int>(CURLE_OUT_OF_MEMORY));
+                }
+
+                if (curl_mime_name(mime_part, part.name.c_str()) != CURLE_OK) {
+                    throw HttpError("curl_mime_name failed", HttpErrorCode::curl_failure);
+                }
+
+                if (part.file_path.has_value()) {
+                    const auto rc = curl_mime_filedata(mime_part, part.file_path->c_str());
+                    if (rc != CURLE_OK) {
+                        throw HttpError("curl_mime_filedata failed",
+                                        HttpErrorCode::curl_failure,
+                                        static_cast<int>(rc),
+                                        0,
+                                        map_transport_error_kind(static_cast<int>(rc)));
+                    }
+
+                    if (part.file_name.has_value()) {
+                        const auto name_rc = curl_mime_filename(mime_part, part.file_name->c_str());
+                        if (name_rc != CURLE_OK) {
+                            throw HttpError("curl_mime_filename failed",
+                                            HttpErrorCode::curl_failure,
+                                            static_cast<int>(name_rc),
+                                            0,
+                                            map_transport_error_kind(static_cast<int>(name_rc)));
+                        }
+                    }
+                } else {
+                    const auto rc = curl_mime_data(
+                        mime_part, part.value.c_str(), static_cast<size_t>(part.value.size()));
+                    if (rc != CURLE_OK) {
+                        throw HttpError("curl_mime_data failed",
+                                        HttpErrorCode::curl_failure,
+                                        static_cast<int>(rc),
+                                        0,
+                                        map_transport_error_kind(static_cast<int>(rc)));
+                    }
+
+                    if (part.file_name.has_value()) {
+                        const auto name_rc = curl_mime_filename(mime_part, part.file_name->c_str());
+                        if (name_rc != CURLE_OK) {
+                            throw HttpError("curl_mime_filename failed",
+                                            HttpErrorCode::curl_failure,
+                                            static_cast<int>(name_rc),
+                                            0,
+                                            map_transport_error_kind(static_cast<int>(name_rc)));
+                        }
+                    }
+                }
+
+                if (part.content_type.has_value()) {
+                    const auto type_rc = curl_mime_type(mime_part, part.content_type->c_str());
+                    if (type_rc != CURLE_OK) {
+                        throw HttpError("curl_mime_type failed",
+                                        HttpErrorCode::curl_failure,
+                                        static_cast<int>(type_rc),
+                                        0,
+                                        map_transport_error_kind(static_cast<int>(type_rc)));
+                    }
+                }
+            }
+
+            curl_easy_setopt(easy.get(), CURLOPT_MIMEPOST, mime.get());
+        } else if (!request.body.empty()) {
+            curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDS, request.body.data());
+            curl_easy_setopt(easy.get(),
+                             CURLOPT_POSTFIELDSIZE_LARGE,
+                             static_cast<curl_off_t>(request.body.size()));
+        }
+
+        if (header_list != nullptr) {
+            curl_easy_setopt(easy.get(), CURLOPT_HTTPHEADER, header_list);
+        }
+
+        CURLM *raw_multi = curl_multi_init();
+        if (raw_multi == nullptr) {
+            throw HttpError("curl_multi_init failed",
+                            HttpErrorCode::curl_failure,
+                            static_cast<int>(CURLM_INTERNAL_ERROR));
+        }
+        std::unique_ptr<CURLM, decltype(&curl_multi_cleanup)> multi(raw_multi, &curl_multi_cleanup);
+
+        MultiContext context;
+        curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &socket_callback);
+        curl_multi_setopt(multi.get(), CURLMOPT_SOCKETDATA, &context);
+        curl_multi_setopt(multi.get(), CURLMOPT_TIMERFUNCTION, &timer_callback);
+        curl_multi_setopt(multi.get(), CURLMOPT_TIMERDATA, &context);
+
+        const auto add_rc = curl_multi_add_handle(multi.get(), easy.get());
+        if (add_rc != CURLM_OK) {
+            throw HttpError("curl_multi_add_handle failed",
+                            HttpErrorCode::curl_failure,
+                            static_cast<int>(add_rc));
+        }
+
+        int running_handles = 0;
+        const auto start_rc =
+            curl_multi_socket_action(multi.get(), CURL_SOCKET_TIMEOUT, 0, &running_handles);
+        if (start_rc != CURLM_OK) {
+            curl_multi_remove_handle(multi.get(), easy.get());
+            throw HttpError("curl_multi_socket_action(start) failed",
+                            HttpErrorCode::curl_failure,
+                            static_cast<int>(start_rc));
+        }
+
+        co_await drive_multi_until_done(multi.get(), context, running_handles);
+
+        CURLMsg *message = nullptr;
+        int remaining = 0;
+        CURLcode done_code = CURLE_OK;
+        while ((message = curl_multi_info_read(multi.get(), &remaining)) != nullptr) {
+            if (message->msg == CURLMSG_DONE && message->easy_handle == easy.get()) {
+                done_code = message->data.result;
+                break;
+            }
+        }
+
+        curl_multi_remove_handle(multi.get(), easy.get());
+
+        if (done_code != CURLE_OK) {
+            std::ostringstream oss;
+            oss << "curl request failed: " << curl_easy_strerror(done_code);
+            throw HttpError(oss.str(),
+                            HttpErrorCode::curl_failure,
+                            static_cast<int>(done_code),
+                            0,
+                            map_transport_error_kind(static_cast<int>(done_code)));
+        }
+
+        curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &response.status_code);
+        char *effective_url = nullptr;
+        curl_easy_getinfo(easy.get(), CURLINFO_EFFECTIVE_URL, &effective_url);
+        if (effective_url != nullptr) {
+            response.effective_url = effective_url;
+        }
+
+        apply_response_interceptors(config, request, response);
+
+        if (config.throw_on_http_error && !response.ok()) {
+            std::ostringstream oss;
+            oss << "http status is not success: " << response.status_code;
+            throw HttpError(oss.str(), HttpErrorCode::http_status_failure, 0, response.status_code);
+        }
+
+        co_return response;
+    } catch (const HttpError &error) {
+        notify_error_interceptors(config, request, error);
+        throw;
     }
-
-    curl_multi_remove_handle(multi.get(), easy.get());
-
-    if (done_code != CURLE_OK) {
-        std::ostringstream oss;
-        oss << "curl request failed: " << curl_easy_strerror(done_code);
-        throw HttpError(oss.str(), HttpErrorCode::curl_failure, static_cast<int>(done_code));
-    }
-
-    curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &response.status_code);
-    char *effective_url = nullptr;
-    curl_easy_getinfo(easy.get(), CURLINFO_EFFECTIVE_URL, &effective_url);
-    if (effective_url != nullptr) {
-        response.effective_url = effective_url;
-    }
-
-    if (config.throw_on_http_error && !response.ok()) {
-        std::ostringstream oss;
-        oss << "http status is not success: " << response.status_code;
-        throw HttpError(oss.str(), HttpErrorCode::http_status_failure, 0, response.status_code);
-    }
-
-    co_return response;
 }
 
 } // namespace
@@ -797,6 +997,24 @@ Client::RequestBuilder &Client::RequestBuilder::request_format(std::string_view 
     return request_format(parse_request_format(format));
 }
 
+Client::RequestBuilder &Client::RequestBuilder::retry(RetryPolicy value) {
+    request_.retry = std::move(value);
+    return *this;
+}
+
+Client::RequestBuilder &Client::RequestBuilder::proxy(ProxyOptions value) {
+    request_.proxy = std::move(value);
+    return *this;
+}
+
+Client::RequestBuilder &
+Client::RequestBuilder::stream_response(std::function<void(std::string_view)> on_chunk,
+                                        bool aggregate) {
+    request_.on_response_chunk = std::move(on_chunk);
+    request_.aggregate_response_body = aggregate;
+    return *this;
+}
+
 Client::RequestBuilder &Client::RequestBuilder::timeout(std::chrono::milliseconds value) {
     request_.timeout = value;
     return *this;
@@ -845,7 +1063,128 @@ Client Client::Builder::build() {
 }
 
 Task<Response> Client::execute(Request request) const {
-    co_return co_await execute_async(config_, std::move(request));
+    const RetryPolicy policy = request.retry.value_or(config_.retry);
+    const std::string method =
+        to_upper(request.method.empty() ? std::string("GET") : request.method);
+
+    std::optional<HttpError> last_error;
+    for (int attempt = 1; attempt <= std::max(1, policy.max_attempts); ++attempt) {
+        bool retry = false;
+        try {
+            co_return co_await execute_async(config_, request);
+        } catch (const HttpError &error) {
+            last_error = error;
+            retry = should_retry_error(policy, error, method, attempt + 1);
+            if (!retry) {
+                throw;
+            }
+        }
+        co_await async_uv::sleep_for(retry_backoff(policy, attempt));
+    }
+    throw last_error.value_or(HttpError("request not executed", HttpErrorCode::invalid_request));
+}
+
+Task<DownloadResult> Client::download_to_file(std::string url,
+                                              std::filesystem::path output,
+                                              DownloadOptions options) const {
+    if (url.empty() || output.empty()) {
+        throw HttpError("download url or output path is empty", HttpErrorCode::invalid_request);
+    }
+
+    std::error_code ec;
+    if (output.has_parent_path()) {
+        std::filesystem::create_directories(output.parent_path(), ec);
+        if (ec) {
+            throw HttpError("failed to create output directory", HttpErrorCode::invalid_request);
+        }
+    }
+
+    const std::filesystem::path temp_path =
+        options.use_temp_file ? options.temp_path.value_or(output.string() + ".part") : output;
+
+    std::uintmax_t offset = 0;
+    if (options.resume && std::filesystem::exists(temp_path, ec) && !ec) {
+        offset = std::filesystem::file_size(temp_path, ec);
+        if (ec) {
+            offset = 0;
+        }
+    }
+
+    auto run_once =
+        [&](std::uintmax_t start_offset, bool append_mode, bool use_range) -> Task<Response> {
+        std::ofstream out;
+        auto mode = std::ios::binary | std::ios::out;
+        mode |= append_mode ? std::ios::app : std::ios::trunc;
+        out.open(temp_path, mode);
+        if (!out.is_open()) {
+            throw HttpError("failed to open download output", HttpErrorCode::invalid_request);
+        }
+
+        bool write_failed = false;
+
+        auto builder =
+            get(url)
+                .response_format(ResponseFormat::text)
+                .stream_response(
+                    [&](std::string_view chunk) {
+                        out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+                        if (!out.good()) {
+                            write_failed = true;
+                        }
+                    },
+                    false)
+                .follow_redirects(true);
+
+        if (use_range && start_offset > 0) {
+            builder.header("Range", "bytes=" + std::to_string(start_offset) + "-");
+        }
+
+        auto response = co_await builder.send().raw();
+        out.flush();
+        out.close();
+
+        if (write_failed) {
+            throw HttpError("failed while writing download stream", HttpErrorCode::invalid_request);
+        }
+
+        co_return response;
+    };
+
+    bool resumed = false;
+    auto response = co_await run_once(offset, offset > 0, offset > 0);
+
+    if (offset > 0 && response.status_code == 200) {
+        response = co_await run_once(0, false, false);
+    } else if (offset > 0 && response.status_code == 206) {
+        resumed = true;
+    }
+
+    if (options.use_temp_file) {
+        if (std::filesystem::exists(output, ec)) {
+            if (!options.overwrite) {
+                throw HttpError("output file exists and overwrite is disabled",
+                                HttpErrorCode::invalid_request);
+            }
+            std::filesystem::remove(output, ec);
+            if (ec) {
+                throw HttpError("failed to remove existing output file",
+                                HttpErrorCode::invalid_request);
+            }
+        }
+
+        std::filesystem::rename(temp_path, output, ec);
+        if (ec) {
+            throw HttpError("failed to finalize download file", HttpErrorCode::invalid_request);
+        }
+    }
+
+    DownloadResult result;
+    result.output_path = output;
+    result.resumed = resumed;
+    result.status_code = response.status_code;
+    result.size =
+        std::filesystem::exists(output, ec) && !ec ? std::filesystem::file_size(output, ec) : 0;
+    co_return result;
 }
 
 Client::RequestBuilder Client::get(std::string url) const {

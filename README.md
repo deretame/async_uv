@@ -125,6 +125,15 @@ auto file_json = co_await client.post("https://httpbin.org/post")
     })
     .send()
     .json<nlohmann::json>();
+
+// 大文件下载（流式落盘，避免整文件进内存）
+async_uv::http::DownloadOptions dl;
+dl.resume = true;
+dl.use_temp_file = true;
+dl.temp_path = "/tmp/archive.bin.part";
+
+auto dl_result = co_await client.download_to_file(
+    "https://speed.hetzner.de/100MB.bin", "/tmp/archive.bin", dl);
 ```
 
 `Client` uses reqwest-like chained request builders (`get/post/put/del -> query/json/xml/urlencoded/multipart -> send`).
@@ -135,6 +144,58 @@ You can also set request format explicitly via `request_format(...)`.
 compatible with `std::to_string`, or provide `to_string()/toString()` members.
 `query(...)` also supports initializer-list pairs such as `.query({{"lang", "cpp"}, {"sort", "desc"}})`.
 `urlencoded(container)` now applies percent-encoding for keys and values.
+
+Additional HTTP features:
+
+- interceptors (`on_request/on_response/on_error`) via `Client::Builder::interceptor(...)`
+- retry policy (`RetryPolicy`) with idempotent-method guard and exponential backoff
+- proxy options (`ProxyOptions`) and cookie jar options (`CookieJarOptions`)
+- streaming response chunks via `stream_response(...)` / `on_response_chunk(...)`
+- transport error kind (`TransportErrorKind`) for finer error handling
+
+Behavior contracts (important defaults):
+
+- `throw_on_http_error=true`: non-2xx throws `HttpErrorCode::http_status_failure`
+- default `response_format`: JSON
+- `stream_response(..., false)`: chunks are streamed, `Response.body` stays empty
+- `request_format` and payload must match, conflict returns `HttpErrorCode::invalid_request`
+- if no proxy is configured explicitly, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env is used
+
+```cpp
+async_uv::http::RetryPolicy retry;
+retry.enabled = true;
+retry.max_attempts = 3;
+retry.base_backoff = std::chrono::milliseconds(100);
+retry.max_backoff = std::chrono::seconds(1);
+
+async_uv::http::ProxyOptions proxy;
+proxy.url = "http://127.0.0.1:7890";
+
+async_uv::http::CookieJarOptions cookie;
+cookie.enabled = true;
+cookie.file_path = "/tmp/async_uv_cookie.jar";
+
+std::size_t streamed = 0;
+auto text_body = co_await client.get("https://example.com")
+    .retry(retry)
+    .proxy(proxy)
+    .stream_response([&](std::string_view chunk) { streamed += chunk.size(); }, false)
+    .response_format(async_uv::http::ResponseFormat::text)
+    .send()
+    .text();
+
+try {
+    auto _ = co_await client.get("http://nonexistent.async-uv.invalid/").send().raw();
+} catch (const async_uv::http::HttpError& e) {
+    if (e.transport_kind() == async_uv::http::TransportErrorKind::dns) {
+        // handle DNS issue
+    }
+}
+
+auto client_with_cookie = async_uv::http::Client::build()
+    .cookie_jar(cookie)
+    .build();
+```
 
 The layer2 library itself does not depend on any JSON library. You can inject your own codec.
 For example, with modern JSON (`nlohmann::json`) in application code:
@@ -161,13 +222,26 @@ public:
     }
 };
 
+class MyLoggingInterceptor : public async_uv::http::Interceptor {
+public:
+    void on_request(async_uv::http::Request& request) const override {
+        request.headers.push_back({"X-Trace-Source", "demo"});
+    }
+};
+
 auto runtime = co_await async_uv::get_current_runtime();
 auto client = async_uv::http::Client::build()
     .runtime(*runtime)
     .json_codec(std::make_shared<NlohmannJsonCodec>())
+    .interceptor(std::make_shared<MyLoggingInterceptor>())
     .user_agent("my-app/1.0")
     .build();
 ```
+
+Request/response format options:
+
+- request: `RequestFormat::json/form/xml/text/binary/multipart` (or string form)
+- response: `ResponseFormat::json/form/xml/text` (or string form)
 
 ### Runtime
 
