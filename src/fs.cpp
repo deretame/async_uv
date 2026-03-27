@@ -80,6 +80,29 @@ struct DirectoryReadState {
     uv_dirent_t entry{};
 };
 
+std::string query_uv_path(int (*getter)(char *, size_t *), const char *where) {
+    std::size_t capacity = 256;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        std::string buffer(capacity, '\0');
+        std::size_t size = buffer.size();
+        const int rc = getter(buffer.data(), &size);
+        if (rc == UV_ENOBUFS) {
+            capacity = std::max(capacity * 2, size + 1);
+            continue;
+        }
+        if (rc < 0) {
+            throw Error(where, rc);
+        }
+        if (size > 0 && buffer[size - 1] == '\0') {
+            --size;
+        }
+        buffer.resize(size);
+        return buffer;
+    }
+
+    throw std::runtime_error(std::string(where) + " buffer exceeded retry limit");
+}
+
 template <typename Result, typename State, typename Starter, typename Finish>
 Task<Result>
 run_fs_request(Runtime &runtime, const char *where, State state, Starter starter, Finish finish) {
@@ -1128,6 +1151,31 @@ Task<std::string> Fs::real_path(std::string path) {
         [](const uv_fs_t &req, std::string &) {
             const auto *resolved = static_cast<const char *>(req.ptr);
             return std::string(resolved == nullptr ? "" : resolved);
+        });
+}
+
+Task<std::string> Fs::temp_directory() {
+    auto *runtime = co_await get_current_runtime();
+    co_return co_await detail::post_task<std::string>(
+        *runtime, [](detail::Completion<std::string> complete) mutable {
+            try {
+                complete(detail::make_success<std::string>(
+                    query_uv_path(&uv_os_tmpdir, "uv_os_tmpdir")));
+            } catch (...) {
+                complete(detail::make_exception<std::string>(std::current_exception()));
+            }
+        });
+}
+
+Task<std::string> Fs::current_directory() {
+    auto *runtime = co_await get_current_runtime();
+    co_return co_await detail::post_task<std::string>(
+        *runtime, [](detail::Completion<std::string> complete) mutable {
+            try {
+                complete(detail::make_success<std::string>(query_uv_path(&uv_cwd, "uv_cwd")));
+            } catch (...) {
+                complete(detail::make_exception<std::string>(std::current_exception()));
+            }
         });
 }
 

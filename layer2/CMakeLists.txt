@@ -6,6 +6,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/async_uv_layer2_dependencies.cmake)
 
 add_library(async_uv_http
     src/http.cpp
+    src/parser.cpp
 )
 
 add_library(async_uv::http ALIAS async_uv_http)
@@ -19,6 +20,7 @@ target_link_libraries(async_uv_http
     PUBLIC
         async_uv
         CURL::libcurl
+        llhttp::llhttp
 )
 
 target_compile_features(async_uv_http PUBLIC cxx_std_23)

@@ -415,6 +415,8 @@ public:
     static Task<void> symlink(std::string target, std::string path, SymlinkFlags flags);
     static Task<std::string> read_link(std::string path);
     static Task<std::string> real_path(std::string path);
+    static Task<std::string> temp_directory();
+    static Task<std::string> current_directory();
     static Task<void> chmod(std::string path, int mode);
     static Task<void> chown(std::string path, uv_uid_t uid, uv_gid_t gid);
     static Task<void> lchown(std::string path, uv_uid_t uid, uv_gid_t gid);

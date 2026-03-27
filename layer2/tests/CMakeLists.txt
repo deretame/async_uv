@@ -23,6 +23,10 @@ target_link_libraries(async_uv_http_test PRIVATE async_uv_http)
 target_link_libraries(async_uv_http_test PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(async_uv_http_test PRIVATE tinyxml2::tinyxml2)
 
+add_executable(async_uv_http_parser_test parser_test.cpp)
+target_link_libraries(async_uv_http_parser_test PRIVATE async_uv_http)
+
 if(BUILD_TESTING)
     add_test(NAME async_uv_http_test COMMAND async_uv_http_test)
+    add_test(NAME async_uv_http_parser_test COMMAND async_uv_http_parser_test)
 endif()

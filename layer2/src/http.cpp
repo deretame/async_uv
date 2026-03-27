@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -16,7 +15,10 @@
 #include <curl/curl.h>
 
 #include "async_uv/fd.h"
+#include "async_uv/fs.h"
+#include "async_uv/message.h"
 #include "async_uv/once_cell.h"
+#include "async_uv/scope.h"
 
 namespace async_uv::http {
 namespace {
@@ -1087,67 +1089,117 @@ Task<Response> Client::execute(Request request) const {
 Task<DownloadResult> Client::download_to_file(std::string url,
                                               std::filesystem::path output,
                                               DownloadOptions options) const {
+    auto *runtime = co_await async_uv::get_current_runtime();
+    if (runtime == nullptr) {
+        throw HttpError("download_to_file requires a current runtime",
+                        HttpErrorCode::invalid_request);
+    }
+    if (config_.runtime != nullptr && config_.runtime != runtime) {
+        throw HttpError("download_to_file runtime mismatch", HttpErrorCode::invalid_request);
+    }
+
     if (url.empty() || output.empty()) {
         throw HttpError("download url or output path is empty", HttpErrorCode::invalid_request);
     }
 
-    std::error_code ec;
     if (output.has_parent_path()) {
-        std::filesystem::create_directories(output.parent_path(), ec);
-        if (ec) {
-            throw HttpError("failed to create output directory", HttpErrorCode::invalid_request);
-        }
+        co_await async_uv::Fs::create_directories(output.parent_path().string());
     }
 
-    const std::filesystem::path temp_path =
-        options.use_temp_file ? options.temp_path.value_or(output.string() + ".part") : output;
+    const std::filesystem::path temp_path = [&]() -> std::filesystem::path {
+        if (!options.use_temp_file) {
+            return output;
+        }
+        if (options.temp_path.has_value()) {
+            return *options.temp_path;
+        }
+
+        const std::string base = output.parent_path().string();
+        const std::string name = output.filename().string() + ".part";
+        return std::filesystem::path(async_uv::path::join(base, name));
+    }();
 
     std::uintmax_t offset = 0;
-    if (options.resume && std::filesystem::exists(temp_path, ec) && !ec) {
-        offset = std::filesystem::file_size(temp_path, ec);
-        if (ec) {
-            offset = 0;
-        }
+    if (options.resume && co_await async_uv::Fs::exists(temp_path.string())) {
+        const auto info = co_await async_uv::Fs::stat(temp_path.string());
+        offset = info.size;
     }
+
+    struct DownloadChunk {
+        std::string data;
+        DownloadChunk() = default;
+        explicit DownloadChunk(std::string value) : data(std::move(value)) {}
+        DownloadChunk(const DownloadChunk &) = delete;
+        DownloadChunk &operator=(const DownloadChunk &) = delete;
+        DownloadChunk(DownloadChunk &&) noexcept = default;
+        DownloadChunk &operator=(DownloadChunk &&) noexcept = default;
+    };
 
     auto run_once =
         [&](std::uintmax_t start_offset, bool append_mode, bool use_range) -> Task<Response> {
-        std::ofstream out;
-        auto mode = std::ios::binary | std::ios::out;
-        mode |= append_mode ? std::ios::app : std::ios::trunc;
-        out.open(temp_path, mode);
-        if (!out.is_open()) {
-            throw HttpError("failed to open download output", HttpErrorCode::invalid_request);
-        }
+        auto mailbox = co_await async_uv::Mailbox<std::optional<DownloadChunk>>::create(*runtime);
+        auto sender = mailbox.sender();
+        bool queue_failed = false;
 
-        bool write_failed = false;
+        co_return co_await async_uv::with_task_scope([&](async_uv::TaskScope &scope)
+                                                         -> Task<Response> {
+            (void)scope.spawn(
+                [mailbox = std::move(mailbox), temp_path, append_mode]() mutable -> Task<void> {
+                    const auto flags =
+                        append_mode
+                            ? (async_uv::OpenFlags::create | async_uv::OpenFlags::write_only |
+                               async_uv::OpenFlags::append)
+                            : (async_uv::OpenFlags::create | async_uv::OpenFlags::write_only |
+                               async_uv::OpenFlags::truncate);
 
-        auto builder =
-            get(url)
-                .response_format(ResponseFormat::text)
-                .stream_response(
-                    [&](std::string_view chunk) {
-                        out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-                        if (!out.good()) {
-                            write_failed = true;
+                    auto file = co_await async_uv::File::open(temp_path.string(), flags, 0644);
+                    while (auto item = co_await mailbox.recv()) {
+                        if (!item->has_value()) {
+                            break;
                         }
-                    },
-                    false)
-                .follow_redirects(true);
+                        co_await file.write_all(item->value().data);
+                    }
+                    co_await file.close();
+                }());
 
-        if (use_range && start_offset > 0) {
-            builder.header("Range", "bytes=" + std::to_string(start_offset) + "-");
-        }
+            auto builder =
+                get(url)
+                    .response_format(ResponseFormat::text)
+                    .stream_response(
+                        [&](std::string_view chunk) {
+                            if (queue_failed) {
+                                return;
+                            }
+                            std::optional<DownloadChunk> packet{DownloadChunk{std::string(chunk)}};
+                            if (!sender.try_send(std::move(packet))) {
+                                queue_failed = true;
+                            }
+                        },
+                        false)
+                    .follow_redirects(true);
 
-        auto response = co_await builder.send().raw();
-        out.flush();
-        out.close();
+            if (use_range && start_offset > 0) {
+                builder.header("Range", "bytes=" + std::to_string(start_offset) + "-");
+            }
 
-        if (write_failed) {
-            throw HttpError("failed while writing download stream", HttpErrorCode::invalid_request);
-        }
+            auto response = co_await builder.send().raw();
 
-        co_return response;
+            std::optional<DownloadChunk> done{};
+            if (!sender.try_send(std::move(done))) {
+                std::optional<DownloadChunk> done2{};
+                const bool ok = co_await sender.send_for(done2, std::chrono::seconds(1));
+                if (!ok) {
+                    throw HttpError("failed to notify download writer completion",
+                                    HttpErrorCode::invalid_request);
+                }
+            }
+
+            if (queue_failed) {
+                throw HttpError("download stream queue overflow", HttpErrorCode::invalid_request);
+            }
+
+            co_return response;
+        });
     };
 
     bool resumed = false;
@@ -1160,30 +1212,24 @@ Task<DownloadResult> Client::download_to_file(std::string url,
     }
 
     if (options.use_temp_file) {
-        if (std::filesystem::exists(output, ec)) {
+        if (co_await async_uv::Fs::exists(output.string())) {
             if (!options.overwrite) {
                 throw HttpError("output file exists and overwrite is disabled",
                                 HttpErrorCode::invalid_request);
             }
-            std::filesystem::remove(output, ec);
-            if (ec) {
-                throw HttpError("failed to remove existing output file",
-                                HttpErrorCode::invalid_request);
-            }
+            co_await async_uv::Fs::remove(output.string());
         }
 
-        std::filesystem::rename(temp_path, output, ec);
-        if (ec) {
-            throw HttpError("failed to finalize download file", HttpErrorCode::invalid_request);
-        }
+        co_await async_uv::Fs::rename(temp_path.string(), output.string());
     }
 
     DownloadResult result;
     result.output_path = output;
     result.resumed = resumed;
     result.status_code = response.status_code;
-    result.size =
-        std::filesystem::exists(output, ec) && !ec ? std::filesystem::file_size(output, ec) : 0;
+    if (co_await async_uv::Fs::exists(output.string())) {
+        result.size = (co_await async_uv::Fs::stat(output.string())).size;
+    }
     co_return result;
 }
 

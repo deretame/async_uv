@@ -152,6 +152,7 @@ Additional HTTP features:
 - proxy options (`ProxyOptions`) and cookie jar options (`CookieJarOptions`)
 - streaming response chunks via `stream_response(...)` / `on_response_chunk(...)`
 - transport error kind (`TransportErrorKind`) for finer error handling
+- llhttp parser (`HttpParser` + `HttpMessage`) for incremental raw HTTP parsing
 
 Behavior contracts (important defaults):
 
@@ -195,7 +196,51 @@ try {
 auto client_with_cookie = async_uv::http::Client::build()
     .cookie_jar(cookie)
     .build();
+
+async_uv::http::HttpParser parser(async_uv::http::ParseMode::response);
+co_await parser.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+if (auto msg = co_await parser.next_message()) {
+    auto content_length = msg->header("Content-Length");
+    auto body = msg->body();
+}
+
+auto one = co_await async_uv::http::parse_first_message(
+    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+auto all = co_await async_uv::http::parse_all_messages(
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+
+// 大体积响应体可自动落盘（例如 multipart/form-data 或大文件）
+async_uv::http::ParserOptions parse_opts;
+parse_opts.max_body_in_memory = 1024; // 超过 1KB 自动写临时文件
+parse_opts.temp_directory = "/tmp/async_uv_parser";
+parse_opts.max_feed_chunk_size = 64 * 1024; // 大块输入分片解析
+parse_opts.yield_every_chunks = 8; // 每处理若干分片让出一次执行权
+
+// 推荐参数（按场景调整）
+// 1) 低延迟/高并发：max_feed_chunk_size=16KB~64KB, yield_every_chunks=1~4
+// 2) 高吞吐/大包优先：max_feed_chunk_size=128KB~512KB, yield_every_chunks=8~32
+// 3) 默认平衡值：max_feed_chunk_size=64KB, yield_every_chunks=8
+
+async_uv::http::HttpParser big_parser(async_uv::http::ParseMode::response, parse_opts);
+co_await big_parser.feed(raw_http_data);
+if (auto msg = co_await big_parser.next_message(); msg && msg->body_in_file()) {
+    auto tmp = msg->body_file_path();
+    auto size = msg->body_size();
+    co_await msg->move_body_file_to("/tmp/final_upload_body.bin");
+}
+
+// 主动异步清理临时 body 文件
+if (auto msg = co_await big_parser.next_message(); msg && msg->body_in_file()) {
+    bool disposed = co_await msg->dispose_body_file();
+    (void)disposed;
+}
 ```
+
+`download_to_file` and request execution use the current runtime context; they do not create
+an internal runtime. `HttpParser` and `HttpMessage` parser file operations are async and use the
+current runtime context. If a message still owns a temp body file when destructed, cleanup is
+dispatched with runtime `spawn` (non-blocking fire-and-forget); when no runtime is available,
+it falls back to a detached thread for non-blocking cleanup.
 
 The layer2 library itself does not depend on any JSON library. You can inject your own codec.
 For example, with modern JSON (`nlohmann::json`) in application code:
