@@ -103,9 +103,9 @@ target_link_libraries(async_uv_ws
         async_uv
 )
 
-if(ASYNC_UV_WS_HAS_IXWEBSOCKET)
-    target_link_libraries(async_uv_ws PUBLIC ixwebsocket::ixwebsocket)
-    target_compile_definitions(async_uv_ws PUBLIC ASYNC_UV_WS_HAS_IXWEBSOCKET=1)
+if(ASYNC_UV_WS_HAS_LIBWEBSOCKETS)
+    target_link_libraries(async_uv_ws PUBLIC async_uv::layer2_lws)
+    target_compile_definitions(async_uv_ws PUBLIC ASYNC_UV_WS_HAS_LIBWEBSOCKETS=1)
 endif()
 
 target_compile_features(async_uv_ws PUBLIC cxx_std_23)

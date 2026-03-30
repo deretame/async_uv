@@ -1,32 +1,31 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
+#include "async_uv/cancel.h"
+#include "async_uv/runtime.h"
 #include "async_uv/stream.h"
 #include "async_uv/task.h"
 
 namespace async_uv::ws {
 
 enum class MessageType {
-    open,
-    close,
     text,
     binary,
-    error,
-    ping,
-    pong,
 };
 
 struct Message {
     MessageType type = MessageType::text;
-    std::string data;
-    std::optional<int> close_code;
-    std::string reason;
+    std::string payload;
+    bool is_first_fragment = true;
+    bool is_final_fragment = true;
 
     Message() = default;
     Message(const Message &) = delete;
@@ -35,99 +34,182 @@ struct Message {
     Message &operator=(Message &&) noexcept = default;
 };
 
-struct ClientOptions {
-    std::string url;
-    int connect_timeout_ms = 10000;
-    int close_timeout_ms = 5000;
-    int ping_interval_seconds = 30;
-    bool disable_automatic_reconnection = true;
+struct StreamChunk {
+    MessageType type = MessageType::text;
+    std::string payload;
+    bool is_first_fragment = true;
+    bool is_final_fragment = true;
 
-    bool tls_verify_peer = true;
-    std::string tls_ca_file;
-    std::string tls_cert_file;
-    std::string tls_key_file;
-    std::string tls_server_name;
+    StreamChunk() = default;
+    StreamChunk(const StreamChunk &) = delete;
+    StreamChunk &operator=(const StreamChunk &) = delete;
+    StreamChunk(StreamChunk &&) noexcept = default;
+    StreamChunk &operator=(StreamChunk &&) noexcept = default;
+};
 
-    class Builder {
-    public:
-        Builder &url(std::string value);
-        Builder &connect_timeout_ms(int value);
-        Builder &close_timeout_ms(int value);
-        Builder &ping_interval_seconds(int value);
-        Builder &disable_automatic_reconnection(bool value);
-        Builder &tls_verify_peer(bool value);
-        Builder &tls_ca_file(std::string value);
-        Builder &tls_cert_file(std::string value);
-        Builder &tls_key_file(std::string value);
-        Builder &tls_server_name(std::string value);
-        [[nodiscard]] ClientOptions build() const;
-
-    private:
-        std::string url_;
-        int connect_timeout_ms_ = 10000;
-        int close_timeout_ms_ = 5000;
-        int ping_interval_seconds_ = 30;
-        bool disable_automatic_reconnection_ = true;
-        bool tls_verify_peer_ = true;
-        std::string tls_ca_file_;
-        std::string tls_cert_file_;
-        std::string tls_key_file_;
-        std::string tls_server_name_;
+struct ServerEvent {
+    enum class Kind {
+        open,
+        message,
+        close,
     };
 
-    static Builder builder();
+    Kind kind = Kind::message;
+    std::uint64_t connection_id = 0;
+    std::optional<Message> message;
+    int close_code = 0;
+    std::string close_reason;
+
+    ServerEvent() = default;
+    ServerEvent(const ServerEvent &) = delete;
+    ServerEvent &operator=(const ServerEvent &) = delete;
+    ServerEvent(ServerEvent &&) noexcept = default;
+    ServerEvent &operator=(ServerEvent &&) noexcept = default;
 };
 
-enum class WsErrorKind {
-    invalid_argument,
-    runtime_missing,
-    connect_failed,
-    not_connected,
-    send_failed,
-    receive_failed,
-    internal_error,
-};
-
-class WsError : public std::runtime_error {
+class WebSocketError : public std::runtime_error {
 public:
-    WsError(std::string message, WsErrorKind kind)
-        : std::runtime_error(std::move(message)), kind_(kind) {}
+    explicit WebSocketError(std::string message) : std::runtime_error(std::move(message)) {}
+};
 
-    WsErrorKind kind() const noexcept {
-        return kind_;
+class Server {
+public:
+    using next_type = std::optional<ServerEvent>;
+    using task_type = Task<next_type>;
+    using stream_type = Stream<ServerEvent>;
+
+    struct Config {
+        Runtime *runtime = nullptr;
+        std::string host = "127.0.0.1";
+        int port = 0;
+        std::string pattern;
+        int listen_options = 0;
+        unsigned int max_payload_length = 16 * 1024;
+        bool use_tls = false;
+        std::string tls_cert_file;
+        std::string tls_private_key_file;
+        std::string tls_ca_file;
+    };
+
+    static Server create(Config config);
+
+    Server();
+    ~Server();
+
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
+    Server(Server &&other) noexcept;
+    Server &operator=(Server &&other) noexcept;
+
+    Task<void> start();
+    Task<void> stop();
+
+    int port() const noexcept;
+    bool started() const noexcept;
+
+    task_type next();
+
+    template <typename Rep, typename Period>
+    task_type next_for(std::chrono::duration<Rep, Period> timeout) {
+        co_return co_await async_uv::with_timeout(timeout, next());
     }
 
+    template <typename Clock, typename Duration>
+    task_type next_until(std::chrono::time_point<Clock, Duration> deadline) {
+        co_return co_await async_uv::with_deadline(deadline, next());
+    }
+
+    stream_type events();
+
+    Task<bool> send_text(std::uint64_t connection_id, std::string_view payload);
+    Task<bool> send_binary(std::uint64_t connection_id, std::string_view payload);
+    Task<bool> send_stream(std::uint64_t connection_id, StreamChunk chunk);
+    Task<bool> close(std::uint64_t connection_id, int code = 1000, std::string reason = {});
+
 private:
-    WsErrorKind kind_ = WsErrorKind::internal_error;
+    struct State;
+
+    explicit Server(std::shared_ptr<State> state);
+    std::shared_ptr<State> state_;
 };
 
 class Client {
 public:
-    using stream_type = Stream<Message>;
+    struct Config {
+        Runtime *runtime = nullptr;
+        std::string address = "127.0.0.1";
+        int port = 0;
+        std::string path = "/";
+        std::string host;
+        std::string origin;
+        bool use_tls = false;
+        std::string tls_ca_file;
+        bool tls_allow_insecure = false;
+    };
+
+    struct Event {
+        enum class Kind {
+            open,
+            message,
+            close,
+            error,
+        };
+
+        Kind kind = Kind::message;
+        std::optional<Message> message;
+        int close_code = 0;
+        std::string close_reason;
+        std::string error;
+
+        Event() = default;
+        Event(const Event &) = delete;
+        Event &operator=(const Event &) = delete;
+        Event(Event &&) noexcept = default;
+        Event &operator=(Event &&) noexcept = default;
+    };
+
+    using next_type = std::optional<Event>;
+    using task_type = Task<next_type>;
+    using stream_type = Stream<Event>;
+
+    static Client create(Config config);
 
     Client();
     ~Client();
 
-    Client(Client &&) noexcept;
-    Client &operator=(Client &&) noexcept;
-
     Client(const Client &) = delete;
     Client &operator=(const Client &) = delete;
+    Client(Client &&other) noexcept;
+    Client &operator=(Client &&other) noexcept;
 
-    Task<void> open(ClientOptions options);
-    Task<void> close();
-    Task<bool> is_open() const;
+    Task<void> connect();
+    Task<void> close(int code = 1000, std::string reason = {});
 
-    Task<void> send_text(std::string text);
-    Task<void> send_binary(std::string binary);
+    bool connected() const noexcept;
 
-    Task<Message> next_message();
-    Task<std::optional<Message>> next_message_for(std::chrono::milliseconds timeout);
-    stream_type messages() const;
+    task_type next();
+
+    template <typename Rep, typename Period>
+    task_type next_for(std::chrono::duration<Rep, Period> timeout) {
+        co_return co_await async_uv::with_timeout(timeout, next());
+    }
+
+    template <typename Clock, typename Duration>
+    task_type next_until(std::chrono::time_point<Clock, Duration> deadline) {
+        co_return co_await async_uv::with_deadline(deadline, next());
+    }
+
+    stream_type events();
+
+    Task<bool> send_text(std::string_view payload);
+    Task<bool> send_binary(std::string_view payload);
+    Task<bool> send_stream(StreamChunk chunk);
 
 private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+    struct State;
+
+    explicit Client(std::shared_ptr<State> state);
+    std::shared_ptr<State> state_;
 };
 
 } // namespace async_uv::ws

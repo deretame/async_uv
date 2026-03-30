@@ -106,44 +106,40 @@ inline const char *to_string_view(http::HttpErrorCode value) {
     return "invalid_request";
 }
 
-inline const char *to_string_view(ws::WsErrorKind value) {
-    switch (value) {
-        case ws::WsErrorKind::invalid_argument:
-            return "invalid_argument";
-        case ws::WsErrorKind::runtime_missing:
-            return "runtime_missing";
-        case ws::WsErrorKind::connect_failed:
-            return "connect_failed";
-        case ws::WsErrorKind::not_connected:
-            return "not_connected";
-        case ws::WsErrorKind::send_failed:
-            return "send_failed";
-        case ws::WsErrorKind::receive_failed:
-            return "receive_failed";
-        case ws::WsErrorKind::internal_error:
-            return "internal_error";
-    }
-    return "internal_error";
-}
-
 inline const char *to_string_view(ws::MessageType value) {
     switch (value) {
-        case ws::MessageType::open:
-            return "open";
-        case ws::MessageType::close:
-            return "close";
         case ws::MessageType::text:
             return "text";
         case ws::MessageType::binary:
             return "binary";
-        case ws::MessageType::error:
-            return "error";
-        case ws::MessageType::ping:
-            return "ping";
-        case ws::MessageType::pong:
-            return "pong";
     }
     return "text";
+}
+
+inline const char *to_string_view(ws::ServerEvent::Kind value) {
+    switch (value) {
+        case ws::ServerEvent::Kind::open:
+            return "open";
+        case ws::ServerEvent::Kind::message:
+            return "message";
+        case ws::ServerEvent::Kind::close:
+            return "close";
+    }
+    return "message";
+}
+
+inline const char *to_string_view(ws::Client::Event::Kind value) {
+    switch (value) {
+        case ws::Client::Event::Kind::open:
+            return "open";
+        case ws::Client::Event::Kind::message:
+            return "message";
+        case ws::Client::Event::Kind::close:
+            return "close";
+        case ws::Client::Event::Kind::error:
+            return "error";
+    }
+    return "message";
 }
 
 inline std::string to_string(ErrorKind value) {
@@ -166,28 +162,76 @@ inline std::string to_string(http::HttpErrorCode value) {
     return to_string_view(value);
 }
 
-inline std::string to_string(ws::WsErrorKind value) {
+inline std::string to_string(ws::MessageType value) {
     return to_string_view(value);
 }
 
-inline std::string to_string(ws::MessageType value) {
+inline std::string to_string(ws::ServerEvent::Kind value) {
+    return to_string_view(value);
+}
+
+inline std::string to_string(ws::Client::Event::Kind value) {
     return to_string_view(value);
 }
 
 inline std::string to_string(const ws::Message &message) {
     std::string out;
-    out.reserve(96 + message.data.size());
+    out.reserve(96 + message.payload.size());
     out += "{type=";
     out += to_string_view(message.type);
-    out += ",data_size=";
-    out += std::to_string(message.data.size());
-    if (message.close_code.has_value()) {
-        out += ",close_code=";
-        out += std::to_string(*message.close_code);
+    out += ",payload_size=";
+    out += std::to_string(message.payload.size());
+    out += ",first_fragment=";
+    out += message.is_first_fragment ? "true" : "false";
+    out += ",final_fragment=";
+    out += message.is_final_fragment ? "true" : "false";
+    out += '}';
+    return out;
+}
+
+inline std::string to_string(const ws::ServerEvent &event) {
+    std::string out;
+    out.reserve(128);
+    out += "{kind=";
+    out += to_string_view(event.kind);
+    out += ",connection_id=";
+    out += std::to_string(event.connection_id);
+    if (event.message.has_value()) {
+        out += ",message=";
+        out += to_string(*event.message);
     }
-    if (!message.reason.empty()) {
-        out += ",reason=";
-        out += message.reason;
+    if (event.close_code != 0) {
+        out += ",close_code=";
+        out += std::to_string(event.close_code);
+    }
+    if (!event.close_reason.empty()) {
+        out += ",close_reason=";
+        out += event.close_reason;
+    }
+    out += '}';
+    return out;
+}
+
+inline std::string to_string(const ws::Client::Event &event) {
+    std::string out;
+    out.reserve(128);
+    out += "{kind=";
+    out += to_string_view(event.kind);
+    if (event.message.has_value()) {
+        out += ",message=";
+        out += to_string(*event.message);
+    }
+    if (event.close_code != 0) {
+        out += ",close_code=";
+        out += std::to_string(event.close_code);
+    }
+    if (!event.close_reason.empty()) {
+        out += ",close_reason=";
+        out += event.close_reason;
+    }
+    if (!event.error.empty()) {
+        out += ",error=";
+        out += event.error;
     }
     out += '}';
     return out;

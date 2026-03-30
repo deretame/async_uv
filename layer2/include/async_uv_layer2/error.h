@@ -73,23 +73,8 @@ inline ErrorKind to_error_kind(http::HttpErrorCode code, http::TransportErrorKin
     return ErrorKind::internal_error;
 }
 
-inline ErrorKind to_error_kind(ws::WsErrorKind kind) {
-    switch (kind) {
-        case ws::WsErrorKind::invalid_argument:
-            return ErrorKind::invalid_argument;
-        case ws::WsErrorKind::runtime_missing:
-            return ErrorKind::runtime_missing;
-        case ws::WsErrorKind::connect_failed:
-            return ErrorKind::connect_failed;
-        case ws::WsErrorKind::not_connected:
-            return ErrorKind::not_connected;
-        case ws::WsErrorKind::send_failed:
-        case ws::WsErrorKind::receive_failed:
-            return ErrorKind::operation_failed;
-        case ws::WsErrorKind::internal_error:
-            return ErrorKind::internal_error;
-    }
-    return ErrorKind::internal_error;
+inline ErrorKind to_error_kind(const ws::WebSocketError &) {
+    return ErrorKind::operation_failed;
 }
 
 } // namespace async_uv::layer2

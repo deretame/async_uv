@@ -1,302 +1,265 @@
 #include <cassert>
 #include <chrono>
-#include <cstdint>
 #include <filesystem>
-#include <memory>
-#include <mutex>
-#include <stdexcept>
+#include <fstream>
 #include <string>
-#include <vector>
 
-#if ASYNC_UV_WS_HAS_IXWEBSOCKET
-#include <ixwebsocket/IXGetFreePort.h>
-#include <ixwebsocket/IXNetSystem.h>
-#include <ixwebsocket/IXSocketTLSOptions.h>
-#include <ixwebsocket/IXWebSocketMessageType.h>
-#include <ixwebsocket/IXWebSocketServer.h>
-#endif
-
-#include "async_uv/async_uv.h"
+#include "async_uv/runtime.h"
+#include "async_uv_layer2/error.h"
 #include "async_uv_layer2/to_string.h"
 #include "async_uv_ws/ws.h"
 
 namespace {
 
-async_uv::Task<void> run_connect_failed_check() {
-    async_uv::ws::Client client;
+constexpr const char *kCertPem = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDCTCCAfGgAwIBAgIUULEwMmnD65Or4VF7MdEFWk6iNoMwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDMyODEwMTAxNFoXDTI3MDMy
+ODEwMTAxNFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEA0h5PzfPEky62Eqsa7Csv28KOoZ+I+gaONOT4XOz0EDSG
+NpwdkuP8JKeP2j5Bh7bssqg49e2zj9SbzVcKfGuk5hj0vqc8YlfFmiKEQl6gGQko
+zvcmHv6n/5VryhFVmbCji/7GiPc91beaPb/UqdkfqvoHBkGuNNfxCLPoNXE/U6wd
+2s8MlyM7uRX56U5UZ2GskMHXmlMGM5oYI0aFA8deOrqg/yYgfj9rJBnbJRmYgviC
+sn9NY5Ny6Qh6gDKJBi4yQrw6wZWiCEzIUrDMkxtDIFC4dwnp601oO+j++DBRN9+t
+ZAiYYjk8dh3ZEYtgmkdU5SbPZwsk66tXF8aPbBF2jwIDAQABo1MwUTAdBgNVHQ4E
+FgQUfaLtKdcr+BoL5MywYEoBO2B/XFkwHwYDVR0jBBgwFoAUfaLtKdcr+BoL5Myw
+YEoBO2B/XFkwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEANuUi
+pgVxLTuU+5lSutnoo4867moMYZFbEIRWi8rGOMhxg7Ha800KcEQZFaI4Q8xxGFUe
+fs/XdpItxDjlppbX1NPT6tRTTa7r9htj3m7XhvwIFuTjtUVETI7ygR6kdABKfkRE
+NJ1x5Ib2AQsrrlzdoGNlVTr/jhs59AR5sqKCp4iHdRu6hKnJQtMiO3h/MFoNvM+D
+P406gfKX/9yByzycrvzQzRSGloC4Tfo13xo53hwVvUmKABV3Ter05EKci8iybBv0
+oac87ZNAzgAM7JxDZtunli+sigh1A+X5rmM7pQjEDXH074FnQ2O7aJA17zITXK89
+VbAdL0HxcNFF9rlSqA==
+-----END CERTIFICATE-----
+)PEM";
 
-    auto options = async_uv::ws::ClientOptions::builder()
-                       .url("ws://127.0.0.1:1")
-                       .connect_timeout_ms(300)
-                       .build();
+constexpr const char *kKeyPem = R"PEM(-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDSHk/N88STLrYS
+qxrsKy/bwo6hn4j6Bo405Phc7PQQNIY2nB2S4/wkp4/aPkGHtuyyqDj17bOP1JvN
+Vwp8a6TmGPS+pzxiV8WaIoRCXqAZCSjO9yYe/qf/lWvKEVWZsKOL/saI9z3Vt5o9
+v9Sp2R+q+gcGQa401/EIs+g1cT9TrB3azwyXIzu5FfnpTlRnYayQwdeaUwYzmhgj
+RoUDx146uqD/JiB+P2skGdslGZiC+IKyf01jk3LpCHqAMokGLjJCvDrBlaIITMhS
+sMyTG0MgULh3CenrTWg76P74MFE3361kCJhiOTx2HdkRi2CaR1TlJs9nCyTrq1cX
+xo9sEXaPAgMBAAECggEACcTdAv9NaWZnkrCf3NEZNYdzKDKJpM4/OFhY78EYi9RV
+VR6nBVhSNcYQmx3/3/ZyRNArbcuyaIKDB+X/F8/NZ+FLJ74QwaXBCyyFp6xMlz1k
+x1KYVCKU3v4sd8WcjDu5Lt4WjvGnz1Ls+ef8VDVDEqjzQKg3GD/d9gCfUDTGs/Yb
++vWOFXtGjp6cKSLHNhTZdA2Kg4/YlTixnCeennimF4DQrh21ww3bZIVsydYaR01F
+rdvPxU3pjk0JQJnH0Wi5NXFG1eZQHrkFPLqDVkDF5QH0xNmmEO0FmZb9jp4n4QKB
+gjX2jnCGKPs2SVJs7EhbsxW/HPd6EggJ5DroZgkEiQKBgQD9OMLso39N5JO8I4wW
+4kg2gCBwxQhWhYh8FmMk596OgdoK9b0sUWntTuH8gHd3lh6IBuL+cUfhvWP6TvKS
+f2855NSs9sjY0yt6raIojHUUt1jkwDdnTuYuVy5Cvi3bgSEXnLJHJZWjU058x516
+6wbO292knjfzej4IashzCI+ArQKBgQDUbHvHpY7r6BIY04rtjCbb5t/c3lXZLcBh
+FUVGOWB9CV+av1uweiljFWwvspbcVVKLlrutijmD4LvPnngino+zX/bSVdXxMliB
+gR5uMNEEgQJukul0Mh0/OBvYvcXB/MhJmVcX0cM45NuwQs/h7acxpVofNtZ3eHmq
+EFFRqQnvqwKBgQDOluyQ26MVDZNqPyYf1WVM8aOF3Xo7/J2pfypMBdARO+eEYZCB
+A7sEHQNKWhUdv6ARIm03YXxfs4BJyvckhktcVFEe/AhIvaAPanGN22n6CMvBdQC+
+jCRHUmEvmrEXEHbLKNBaM1Ot+F1keAcHLZBUXBSsJVlIj0bk3xnCoA1T0QKBgHra
+rw/9WVZopqbDGfNe/k5qDYjA8eekRUIguiruHjbSh/+Isq+zR2Jtzl8bq5KMqivf
+JnYsniz+ecCPBy4GhFeapbZqPEy98GAd3AqgoxI2xsBKqUgxf6bDfZ9xygDygKfI
+To2RHJY4DjK3wWEKQIs+9Ytd/NWl0L+hplZTLFL3AoGBAIA4F6Rk5fzVBTvStw4j
+w7SnlbOxc5SOqAcD+aDu7rQ5lAKqXaY1yWzSicD/kmFp2/wEv4TVmBKuWoxYI8ty
+fo83aEI1D+2VG9rjvJ2sFYWco3Bz1Hs81mD1I/6vslvN8mYUUB8wGYRQAQ2IP1zV
+WGf73tZzw5Rs9DKk6JyVH//C
+-----END PRIVATE KEY-----
+)PEM";
 
-    bool failed = false;
-    try {
-        co_await client.open(options);
-    } catch (const async_uv::ws::WsError &e) {
-        failed = true;
-#if ASYNC_UV_WS_HAS_IXWEBSOCKET
-        assert(e.kind() == async_uv::ws::WsErrorKind::connect_failed);
-#else
-        assert(e.kind() == async_uv::ws::WsErrorKind::invalid_argument);
-#endif
-    }
-    assert(failed);
+void write_text_file(const std::filesystem::path &path, const std::string &text) {
+    std::ofstream out(path, std::ios::binary);
+    out << text;
+    out.close();
+    assert(out.good());
+}
 
-    assert(async_uv::layer2::to_string(async_uv::layer2::ErrorKind::timeout) == "timeout");
+async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
+    auto server = async_uv::ws::Server::create({
+        .runtime = &runtime,
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+
+    co_await server.start();
+    assert(server.started());
+    assert(server.port() > 0);
+
+    auto client = async_uv::ws::Client::create({
+        .runtime = &runtime,
+        .address = "127.0.0.1",
+        .port = server.port(),
+        .path = "/",
+    });
+
+    co_await client.connect();
+    assert(client.connected());
+
+    auto server_open = co_await server.next();
+    assert(server_open.has_value());
+    assert(server_open->kind == async_uv::ws::ServerEvent::Kind::open);
+    const auto connection_id = server_open->connection_id;
+
+    auto client_open = co_await client.next();
+    assert(client_open.has_value());
+    assert(client_open->kind == async_uv::ws::Client::Event::Kind::open);
+
     assert(async_uv::layer2::to_string(async_uv::ws::MessageType::text) == "text");
-    async_uv::ws::Message sample;
-    sample.type = async_uv::ws::MessageType::text;
-    sample.data = "abc";
-    const auto text = async_uv::layer2::to_string(sample);
-    assert(text.find("type=text") != std::string::npos);
-    assert(text.find("data_size=3") != std::string::npos);
-    co_return;
-}
-
-#if ASYNC_UV_WS_HAS_IXWEBSOCKET
-
-#ifndef ASYNC_UV_WS_TEST_CERT_DIR
-#define ASYNC_UV_WS_TEST_CERT_DIR ""
-#endif
-
-#ifndef ASYNC_UV_WS_TEST_TRUSTED_CA
-#define ASYNC_UV_WS_TEST_TRUSTED_CA ""
-#endif
-
-#ifndef ASYNC_UV_WS_TEST_SERVER_CERT
-#define ASYNC_UV_WS_TEST_SERVER_CERT ""
-#endif
-
-#ifndef ASYNC_UV_WS_TEST_SERVER_KEY
-#define ASYNC_UV_WS_TEST_SERVER_KEY ""
-#endif
-
-class EchoServer {
-public:
-    explicit EchoServer(bool tls) : port_(ix::getFreePort()), server_(port_, "127.0.0.1") {
-        if (tls) {
-            ix::SocketTLSOptions tls_options;
-            tls_options.tls = true;
-            tls_options.caFile = "NONE";
-            tls_options.certFile = ASYNC_UV_WS_TEST_SERVER_CERT;
-            tls_options.keyFile = ASYNC_UV_WS_TEST_SERVER_KEY;
-            server_.setTLSOptions(tls_options);
-        }
-
-        server_.setOnClientMessageCallback([](std::shared_ptr<ix::ConnectionState>,
-                                              ix::WebSocket &socket,
-                                              const ix::WebSocketMessagePtr &msg) {
-            if (msg->type == ix::WebSocketMessageType::Message) {
-                (void)socket.send(msg->str, msg->binary);
-            }
-        });
-
-        const auto result = server_.listen();
-        if (!result.first) {
-            throw std::runtime_error("failed to listen websocket test server: " + result.second);
-        }
-        server_.start();
-    }
-
-    ~EchoServer() {
-        server_.stop();
-    }
-
-    [[nodiscard]] std::string url(bool tls) const {
-        return std::string(tls ? "wss://localhost:" : "ws://127.0.0.1:") + std::to_string(port_);
-    }
-
-private:
-    int port_;
-    ix::WebSocketServer server_;
-};
-
-async_uv::Task<async_uv::ws::Message> wait_for_message_type(async_uv::ws::Client &client,
-                                                            async_uv::ws::MessageType expected,
-                                                            std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
-        auto next = co_await client.next_message_for(remaining);
-        if (!next.has_value()) {
-            continue;
-        }
-
-        auto message = std::move(*next);
-        if (message.type == expected) {
-            co_return std::move(message);
-        }
-        if (message.type == async_uv::ws::MessageType::error) {
-            throw std::runtime_error("unexpected websocket error message: " + message.reason);
-        }
-    }
-
-    throw std::runtime_error("timed out while waiting for websocket message");
-}
-
-async_uv::Task<void> run_echo_checks(const std::string &url) {
-    async_uv::ws::Client client;
-    auto options = async_uv::ws::ClientOptions::builder()
-                       .url(url)
-                       .connect_timeout_ms(2000)
-                       .close_timeout_ms(1000)
-                       .ping_interval_seconds(30)
-                       .disable_automatic_reconnection(true)
-                       .build();
-
-    co_await client.open(options);
-    assert(co_await client.is_open());
-
-    co_await client.send_text("hello async_uv ws");
-    auto text_message = co_await wait_for_message_type(
-        client, async_uv::ws::MessageType::text, std::chrono::milliseconds(2000));
-    assert(text_message.data == "hello async_uv ws");
-
-    std::string binary_payload;
-    binary_payload.push_back(static_cast<char>(0x01));
-    binary_payload.push_back(static_cast<char>(0x7f));
-    binary_payload.push_back(static_cast<char>(0x00));
-    co_await client.send_binary(binary_payload);
-
-    auto binary_message = co_await wait_for_message_type(
-        client, async_uv::ws::MessageType::binary, std::chrono::milliseconds(2000));
-    assert(binary_message.data == binary_payload);
-
-    co_await client.close();
-    assert(!(co_await client.is_open()));
-
-    bool send_failed = false;
-    try {
-        co_await client.send_text("after-close");
-    } catch (const async_uv::ws::WsError &e) {
-        send_failed = true;
-        assert(e.kind() == async_uv::ws::WsErrorKind::not_connected);
-    }
-    assert(send_failed);
-
-    bool receive_failed = false;
-    try {
-        (void)co_await client.next_message_for(std::chrono::milliseconds(100));
-    } catch (const async_uv::ws::WsError &e) {
-        receive_failed = true;
-        assert(e.kind() == async_uv::ws::WsErrorKind::not_connected);
-    }
-    assert(receive_failed);
-    co_return;
-}
-
-async_uv::Task<void> run_stream_receive_checks(const std::string &url) {
-    async_uv::ws::Client client;
-    auto options = async_uv::ws::ClientOptions::builder()
-                       .url(url)
-                       .connect_timeout_ms(2000)
-                       .close_timeout_ms(1000)
-                       .build();
-
-    co_await client.open(options);
-    auto stream = client.messages();
-
-    co_await client.send_text("stream-msg-1");
-    co_await client.send_text("stream-msg-2");
-
-    std::vector<std::string> got;
-    while (auto next = co_await stream.next()) {
-        auto message = std::move(*next);
-        if (message.type != async_uv::ws::MessageType::text) {
-            continue;
-        }
-
-        got.push_back(message.data);
-        if (got.size() == 2) {
-            break;
-        }
-    }
-
-    assert(got[0] == "stream-msg-1");
-    assert(got[1] == "stream-msg-2");
-
-    co_await client.close();
-
-    auto end = co_await stream.next();
-    assert(!end.has_value());
-    co_return;
-}
-
-async_uv::Task<void> run_wss_checks() {
-    const auto cert_dir = std::filesystem::path(ASYNC_UV_WS_TEST_CERT_DIR);
-    const auto trusted_ca = std::filesystem::path(ASYNC_UV_WS_TEST_TRUSTED_CA);
-    const auto server_cert = std::filesystem::path(ASYNC_UV_WS_TEST_SERVER_CERT);
-    const auto server_key = std::filesystem::path(ASYNC_UV_WS_TEST_SERVER_KEY);
-    assert(!cert_dir.empty());
-    assert(std::filesystem::exists(trusted_ca));
-    assert(std::filesystem::exists(server_cert));
-    assert(std::filesystem::exists(server_key));
-
-    EchoServer tls_server(true);
-    const auto tls_url = tls_server.url(true);
 
     {
-        async_uv::ws::Client client;
-        auto options = async_uv::ws::ClientOptions::builder()
-                           .url(tls_url)
-                           .connect_timeout_ms(1500)
-                           .tls_verify_peer(true)
-                           .tls_ca_file(trusted_ca.string())
-                           .build();
-
-        bool failed = false;
-        try {
-            co_await client.open(options);
-        } catch (const async_uv::ws::WsError &e) {
-            failed = true;
-            assert(e.kind() == async_uv::ws::WsErrorKind::connect_failed);
-        }
-        assert(failed);
+        async_uv::ws::StreamChunk chunk;
+        chunk.type = async_uv::ws::MessageType::text;
+        chunk.payload = "hel";
+        chunk.is_first_fragment = true;
+        chunk.is_final_fragment = false;
+        const bool sent = co_await client.send_stream(std::move(chunk));
+        assert(sent);
     }
+    {
+        async_uv::ws::StreamChunk chunk;
+        chunk.type = async_uv::ws::MessageType::text;
+        chunk.payload = "lo";
+        chunk.is_first_fragment = false;
+        chunk.is_final_fragment = true;
+        const bool sent = co_await client.send_stream(std::move(chunk));
+        assert(sent);
+    }
+
+    auto server_msg_1 = co_await server.next();
+    assert(server_msg_1.has_value());
+    assert(server_msg_1->kind == async_uv::ws::ServerEvent::Kind::message);
+    assert(server_msg_1->connection_id == connection_id);
+    assert(server_msg_1->message.has_value());
+    assert(server_msg_1->message->payload == "hel");
+    assert(!server_msg_1->message->is_final_fragment);
+
+    auto server_msg_2 = co_await server.next();
+    assert(server_msg_2.has_value());
+    assert(server_msg_2->kind == async_uv::ws::ServerEvent::Kind::message);
+    assert(server_msg_2->connection_id == connection_id);
+    assert(server_msg_2->message.has_value());
+    assert(server_msg_2->message->payload == "lo");
+    assert(server_msg_2->message->is_final_fragment);
 
     {
-        async_uv::ws::Client client;
-        auto options = async_uv::ws::ClientOptions::builder()
-                           .url(tls_url)
-                           .connect_timeout_ms(3000)
-                           .close_timeout_ms(1000)
-                           .tls_verify_peer(false)
-                           .build();
-
-        co_await client.open(options);
-        co_await client.send_text("wss-insecure");
-        auto echoed = co_await wait_for_message_type(
-            client, async_uv::ws::MessageType::text, std::chrono::milliseconds(2000));
-        assert(echoed.data == "wss-insecure");
-        co_await client.close();
+        async_uv::ws::StreamChunk chunk;
+        chunk.type = async_uv::ws::MessageType::binary;
+        chunk.payload = "12";
+        chunk.is_first_fragment = true;
+        chunk.is_final_fragment = false;
+        const bool sent = co_await server.send_stream(connection_id, std::move(chunk));
+        assert(sent);
+    }
+    {
+        async_uv::ws::StreamChunk chunk;
+        chunk.type = async_uv::ws::MessageType::binary;
+        chunk.payload = "34";
+        chunk.is_first_fragment = false;
+        chunk.is_final_fragment = true;
+        const bool sent = co_await server.send_stream(connection_id, std::move(chunk));
+        assert(sent);
     }
 
-    co_return;
+    auto client_msg_1 = co_await client.next();
+    assert(client_msg_1.has_value());
+    assert(client_msg_1->kind == async_uv::ws::Client::Event::Kind::message);
+    assert(client_msg_1->message.has_value());
+    assert(client_msg_1->message->payload == "12");
+
+    auto client_msg_2 = co_await client.next();
+    assert(client_msg_2.has_value());
+    assert(client_msg_2->kind == async_uv::ws::Client::Event::Kind::message);
+    assert(client_msg_2->message.has_value());
+    assert(client_msg_2->message->payload == "34");
+
+    const auto text = async_uv::layer2::to_string(*client_msg_2->message);
+    assert(text.find("type=binary") != std::string::npos);
+    assert(text.find("payload_size=2") != std::string::npos);
+
+    co_await client.close(1000, "done");
+    auto server_close = co_await server.next();
+    assert(server_close.has_value());
+    assert(server_close->kind == async_uv::ws::ServerEvent::Kind::close);
+
+    {
+        async_uv::ws::StreamChunk chunk;
+        chunk.type = async_uv::ws::MessageType::binary;
+        chunk.payload = "payload";
+        chunk.is_first_fragment = true;
+        chunk.is_final_fragment = false;
+        const bool sent_server = co_await server.send_stream(connection_id, std::move(chunk));
+        assert(!sent_server);
+    }
+
+    co_await server.stop();
+    assert(!server.started());
 }
 
-#endif
+async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
+    const auto temp = std::filesystem::temp_directory_path() / "async_uv_wss_test";
+    std::filesystem::create_directories(temp);
+    const auto cert_path = temp / "server.crt";
+    const auto key_path = temp / "server.key";
+    write_text_file(cert_path, kCertPem);
+    write_text_file(key_path, kKeyPem);
+
+    auto server = async_uv::ws::Server::create({
+        .runtime = &runtime,
+        .host = "127.0.0.1",
+        .port = 0,
+        .use_tls = true,
+        .tls_cert_file = cert_path.string(),
+        .tls_private_key_file = key_path.string(),
+    });
+    co_await server.start();
+    assert(server.started());
+    assert(server.port() > 0);
+
+    auto client = async_uv::ws::Client::create({
+        .runtime = &runtime,
+        .address = "127.0.0.1",
+        .port = server.port(),
+        .path = "/",
+        .host = "localhost",
+        .use_tls = true,
+        .tls_allow_insecure = true,
+    });
+
+    co_await client.connect();
+    auto server_open = co_await server.next();
+    assert(server_open.has_value());
+    assert(server_open->kind == async_uv::ws::ServerEvent::Kind::open);
+    const auto connection_id = server_open->connection_id;
+
+    auto client_open = co_await client.next();
+    assert(client_open.has_value());
+    assert(client_open->kind == async_uv::ws::Client::Event::Kind::open);
+
+    {
+        const bool sent = co_await client.send_text("wss-c2s");
+        assert(sent);
+    }
+    auto server_msg = co_await server.next();
+    assert(server_msg.has_value());
+    assert(server_msg->kind == async_uv::ws::ServerEvent::Kind::message);
+    assert(server_msg->connection_id == connection_id);
+    assert(server_msg->message.has_value());
+    assert(server_msg->message->payload == "wss-c2s");
+
+    {
+        const bool sent = co_await server.send_binary(connection_id, "wss-s2c");
+        assert(sent);
+    }
+    auto client_msg = co_await client.next();
+    assert(client_msg.has_value());
+    assert(client_msg->kind == async_uv::ws::Client::Event::Kind::message);
+    assert(client_msg->message.has_value());
+    assert(client_msg->message->payload == "wss-s2c");
+
+    co_await client.close(1000, "done");
+    co_await server.stop();
+}
 
 } // namespace
 
 int main() {
     async_uv::Runtime runtime(async_uv::Runtime::build().name("async_uv_ws_test"));
-
-#if ASYNC_UV_WS_HAS_IXWEBSOCKET
-    static std::once_flag once;
-    std::call_once(once, [] {
-        ix::initNetSystem();
-    });
-
-    EchoServer server(false);
-    runtime.block_on(run_connect_failed_check());
-    runtime.block_on(run_echo_checks(server.url(false)));
-    runtime.block_on(run_stream_receive_checks(server.url(false)));
-    runtime.block_on(run_wss_checks());
-#else
-    runtime.block_on(run_connect_failed_check());
-#endif
-
+    runtime.block_on(run_plain_ws(runtime));
+    runtime.block_on(run_wss(runtime));
     return 0;
 }
