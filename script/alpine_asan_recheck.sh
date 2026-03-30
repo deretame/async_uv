@@ -76,7 +76,7 @@ retry() {
   done
 }
 
-if [ ! -f /var/tmp/.async_uv_deps_ready ]; then
+if [ ! -f /var/tmp/.async_uv_deps_ready ] || ! apk info -e openssl-dev >/dev/null 2>&1; then
   sed -i "s#https\\?://dl-cdn.alpinelinux.org/alpine#https://mirrors.cernet.edu.cn/alpine#g" /etc/apk/repositories
   retry 5 apk update
   retry 5 apk add --no-cache \
@@ -89,7 +89,8 @@ if [ ! -f /var/tmp/.async_uv_deps_ready ]; then
     linux-headers \
     lld \
     ninja-build \
-    ninja-is-really-ninja
+    ninja-is-really-ninja \
+    openssl-dev
   touch /var/tmp/.async_uv_deps_ready
 fi
 

@@ -27,7 +27,8 @@ jobs:
             linux-headers \
             lld \
             ninja-build \
-            ninja-is-really-ninja
+            ninja-is-really-ninja \
+            openssl-dev
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,7 +80,9 @@ jobs:
             linux-headers \
             lld \
             ninja-build \
-            ninja-is-really-ninja
+            ninja-is-really-ninja \
+            openssl-dev \
+            openssl-libs-static
 
       - name: Checkout
         uses: actions/checkout@v4
