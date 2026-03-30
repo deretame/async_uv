@@ -29,11 +29,6 @@ if(NOT ASYNC_UV_LAYER2_FETCH_LIBWEBSOCKETS)
     message(FATAL_ERROR "websocket wrapper requires libwebsockets; set ASYNC_UV_LAYER2_FETCH_LIBWEBSOCKETS=ON")
 endif()
 
-if(NOT BUILD_SHARED_LIBS AND NOT DEFINED OPENSSL_USE_STATIC_LIBS)
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-    set(_async_uv_ws_reset_openssl_use_static_libs TRUE)
-endif()
-
 find_package(OpenSSL QUIET)
 
 set(LWS_WITH_NETWORK ON CACHE BOOL "" FORCE)
@@ -54,11 +49,6 @@ if(ASYNC_UV_LAYER2_ENABLE_WSS)
 else()
     set(LWS_WITH_SSL OFF CACHE BOOL "" FORCE)
     set(LWS_WITH_MBEDTLS OFF CACHE BOOL "" FORCE)
-endif()
-
-if(_async_uv_ws_reset_openssl_use_static_libs)
-    unset(OPENSSL_USE_STATIC_LIBS)
-    unset(_async_uv_ws_reset_openssl_use_static_libs)
 endif()
 set(LWS_WITHOUT_TESTAPPS ON CACHE BOOL "" FORCE)
 set(LWS_WITH_MINIMAL_EXAMPLES OFF CACHE BOOL "" FORCE)

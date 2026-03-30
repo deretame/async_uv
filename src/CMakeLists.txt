@@ -26,17 +26,7 @@ target_link_libraries(async_uv
         libuv::libuv
 )
 
-if(NOT BUILD_SHARED_LIBS AND NOT DEFINED OPENSSL_USE_STATIC_LIBS)
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-    set(_async_uv_reset_openssl_use_static_libs TRUE)
-endif()
-
 find_package(OpenSSL REQUIRED)
-
-if(_async_uv_reset_openssl_use_static_libs)
-    unset(OPENSSL_USE_STATIC_LIBS)
-    unset(_async_uv_reset_openssl_use_static_libs)
-endif()
 
 target_link_libraries(async_uv PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 

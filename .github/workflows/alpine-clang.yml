@@ -97,6 +97,7 @@ jobs:
             -DASYNC_UV_BUILD_TESTS=ON \
             -DASYNC_UV_USE_MIMALLOC=ON \
             -DBUILD_SHARED_LIBS=OFF \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DCMAKE_EXE_LINKER_FLAGS="-static"
 
       - name: Build
