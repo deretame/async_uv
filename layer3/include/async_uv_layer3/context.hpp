@@ -11,7 +11,8 @@
 #include <rfl.hpp>
 #include <rfl/json.hpp>
 
-#include "async_uv_http/server.h"
+#include <async_uv_layer3/types.hpp>
+#include <async_uv_http/server.h>
 
 namespace async_uv::layer3 {
 
@@ -40,7 +41,10 @@ struct Context : http::ServerRequest {
     std::optional<T> local(std::string_view name) const {
         auto it = locals.find(std::string(name));
         if (it != locals.end()) {
-            return std::any_cast<T>(&it->second);
+            const T* ptr = std::any_cast<T>(&it->second);
+            if (ptr) {
+                return *ptr;
+            }
         }
         return std::nullopt;
     }

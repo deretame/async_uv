@@ -48,6 +48,14 @@ if(ASYNC_UV_BUILD_TESTS)
     add_executable(router_test tests/router_test.cpp)
     target_link_libraries(router_test PRIVATE async_uv_layer3)
     
+    add_executable(form_parser_test tests/form_parser_test.cpp)
+    target_link_libraries(form_parser_test PRIVATE async_uv_layer3)
+    
+    add_executable(multipart_parser_test tests/multipart_parser_test.cpp)
+    target_link_libraries(multipart_parser_test PRIVATE async_uv_layer3)
+    
     enable_testing()
     add_test(NAME RouterTest COMMAND router_test)
+    add_test(NAME FormParserTest COMMAND form_parser_test)
+    add_test(NAME MultipartParserTest COMMAND multipart_parser_test)
 endif()

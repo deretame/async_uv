@@ -89,7 +89,8 @@ inline bool has_form_data(Context& ctx) {
 }
 
 inline const std::map<std::string, std::string>* all_form_data(Context& ctx) {
-    return ctx.local<std::map<std::string, std::string>>("form_data");
+    auto form_data = ctx.local<std::map<std::string, std::string>>("form_data");
+    return form_data.has_value() ? &*form_data : nullptr;
 }
 
 } // namespace async_uv::layer3
