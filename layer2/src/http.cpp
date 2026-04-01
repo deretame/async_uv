@@ -165,40 +165,8 @@ std::optional<std::string_view> content_type_for_request_format(RequestFormat fo
     return std::nullopt;
 }
 
-int from_hex(char ch) {
-    if (ch >= '0' && ch <= '9') {
-        return ch - '0';
-    }
-    if (ch >= 'a' && ch <= 'f') {
-        return ch - 'a' + 10;
-    }
-    if (ch >= 'A' && ch <= 'F') {
-        return ch - 'A' + 10;
-    }
-    return -1;
-}
-
 std::string percent_decode(std::string_view text) {
-    std::string out;
-    out.reserve(text.size());
-    for (std::size_t i = 0; i < text.size(); ++i) {
-        const char ch = text[i];
-        if (ch == '+') {
-            out.push_back(' ');
-            continue;
-        }
-        if (ch == '%' && i + 2 < text.size()) {
-            const int hi = from_hex(text[i + 1]);
-            const int lo = from_hex(text[i + 2]);
-            if (hi >= 0 && lo >= 0) {
-                out.push_back(static_cast<char>((hi << 4) | lo));
-                i += 2;
-                continue;
-            }
-        }
-        out.push_back(ch);
-    }
-    return out;
+    return ada::unicode::percent_decode(text, text.find('%'));
 }
 
 TransportErrorKind map_transport_error_kind(int code) {
