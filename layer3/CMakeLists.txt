@@ -43,8 +43,11 @@ target_link_libraries(async_uv_layer3
 
 target_compile_features(async_uv_layer3 PUBLIC cxx_std_23)
 
-# Tests will be added later
-# if(ASYNC_UV_BUILD_TESTS)
-#     add_executable(layer3_router_test tests/router_test.cpp)
-#     target_link_libraries(layer3_router_test PRIVATE async_uv_layer3)
-# endif()
+# Tests
+if(ASYNC_UV_BUILD_TESTS)
+    add_executable(router_test tests/router_test.cpp)
+    target_link_libraries(router_test PRIVATE async_uv_layer3)
+    
+    enable_testing()
+    add_test(NAME RouterTest COMMAND router_test)
+endif()
