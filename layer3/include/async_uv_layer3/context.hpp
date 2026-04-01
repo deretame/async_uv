@@ -56,11 +56,11 @@ struct Context : http::ServerRequest {
 
     template<typename T>
     std::optional<T> json_as() const {
-        try {
-            return rfl::json::read<T>(body);
-        } catch (const std::exception&) {
-            return std::nullopt;
+        auto result = rfl::json::read<T>(body);
+        if (result) {
+            return std::move(*result);
         }
+        return std::nullopt;
     }
 
     template<typename T>
@@ -69,9 +69,9 @@ struct Context : http::ServerRequest {
         response.body = rfl::json::write(obj);
     }
 
-    void json_raw(std::string body) {
+    void json_raw(std::string body_content) {
         response.headers.push_back({"Content-Type", "application/json"});
-        response.body = std::move(body);
+        response.body = std::move(body_content);
     }
 
     void status(int code) {
@@ -80,6 +80,50 @@ struct Context : http::ServerRequest {
 
     void set(std::string_view name, std::string_view value) {
         response.headers.push_back({std::string(name), std::string(value)});
+    }
+
+    void redirect(const std::string& url, int code = 302) {
+        response.status_code = code;
+        response.headers.push_back({"Location", url});
+        response.body = "";
+    }
+
+    void redirect_permanent(const std::string& url) {
+        redirect(url, 301);
+    }
+
+    void redirect_temporary(const std::string& url) {
+        redirect(url, 307);
+    }
+
+    void attachment(std::string filename = "") {
+        if (!filename.empty()) {
+            response.headers.push_back({"Content-Disposition", 
+                "attachment; filename=\"" + filename + "\""});
+        } else {
+            response.headers.push_back({"Content-Disposition", "attachment"});
+        }
+    }
+
+    void attachment_inline(std::string filename = "") {
+        if (!filename.empty()) {
+            response.headers.push_back({"Content-Disposition", 
+                "inline; filename=\"" + filename + "\""});
+        }
+    }
+
+    void content_type(std::string_view type) {
+        response.headers.push_back({"Content-Type", std::string(type)});
+    }
+
+    void send(std::string body_content, int code = 200) {
+        response.status_code = code;
+        response.body = std::move(body_content);
+    }
+
+    void send_status(int code) {
+        response.status_code = code;
+        response.body = "";
     }
 
     std::optional<std::string> header(std::string_view name) const {
