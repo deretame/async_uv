@@ -161,6 +161,30 @@ TEST(multipart_middleware_integration) {
     assert(multipart->get("test") == "value");
 }
 
+TEST(multipart_large_file_handling) {
+    std::string boundary = "boundary123";
+    std::string filename = "large_file.bin";
+    std::string content(1024, 'X');
+    
+    std::string body =
+        "--" + boundary + "\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+        + content + "\r\n"
+        "--" + boundary + "--";
+    
+    auto result = parse_multipart(body, boundary);
+    assert(result.has_value());
+    
+    auto file = result->get_file("file");
+    assert(file.has_value());
+    assert(file->filename == filename);
+    assert(file->content_type == "application/octet-stream");
+    assert(file->data.size() == content.size());
+    assert(file->data == content);
+}
+
 int main() {
     std::cout << "=== Multipart Parser Tests ===\n";
     
@@ -172,6 +196,7 @@ int main() {
     RUN_TEST(multipart_parse_empty);
     RUN_TEST(multipart_content_disposition_parsing);
     RUN_TEST(multipart_middleware_integration);
+    RUN_TEST(multipart_large_file_handling);
     
     std::cout << "\nAll tests passed!\n";
     return 0;
