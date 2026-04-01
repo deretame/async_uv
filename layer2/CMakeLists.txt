@@ -40,6 +40,7 @@ target_link_libraries(async_uv_http
         async_uv
         CURL::libcurl
         llhttp::llhttp
+        ada::ada
 )
 
 target_compile_features(async_uv_http PUBLIC cxx_std_23)

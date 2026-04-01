@@ -6,6 +6,7 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
 
 option(ASYNC_UV_LAYER2_FETCH_CURL "Fetch curl from source when system curl is unavailable" ON)
 option(ASYNC_UV_LAYER2_FETCH_LLHTTP "Fetch llhttp from source when unavailable" ON)
+option(ASYNC_UV_LAYER2_FETCH_BOOST "Fetch boost from source when unavailable" ON)
 
 find_package(OpenSSL QUIET)
 find_package(CURL QUIET)
@@ -116,5 +117,30 @@ if(NOT TARGET llhttp::llhttp)
 
     if(NOT TARGET llhttp::llhttp)
         message(FATAL_ERROR "Failed to provide llhttp::llhttp target")
+    endif()
+endif()
+
+option(ASYNC_UV_LAYER2_FETCH_ADA "Fetch ada-url from source when unavailable" ON)
+
+if(NOT TARGET ada::ada)
+    if(NOT ASYNC_UV_LAYER2_FETCH_ADA)
+        message(FATAL_ERROR "layer2 requires ada::ada. Install ada-url or set ASYNC_UV_LAYER2_FETCH_ADA=ON")
+    endif()
+
+    FetchContent_Declare(
+        ada_url
+        URL https://codeload.github.com/ada-url/ada/tar.gz/refs/tags/v2.9.1
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    )
+
+    FetchContent_MakeAvailable(ada_url)
+
+    if(NOT TARGET ada::ada)
+        if(EXISTS "${ada_url_SOURCE_DIR}/include")
+            add_library(ada::ada INTERFACE IMPORTED GLOBAL)
+            target_include_directories(ada::ada INTERFACE "${ada_url_SOURCE_DIR}/include")
+        else()
+            message(FATAL_ERROR "Failed to provide ada::ada target")
+        endif()
     endif()
 endif()

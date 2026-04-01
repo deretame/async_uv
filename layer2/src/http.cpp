@@ -27,6 +27,11 @@ struct CurlInitState {
     CURLcode code = CURLE_OK;
 };
 
+inline bool is_unreserved_char(unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+           ch == '-' || ch == '_' || ch == '.' || ch == '~';
+}
+
 void ensure_curl_global_init() {
     static async_uv::OnceCell<CurlInitState> cell;
     const auto &state = cell.get_or_init([]() {
@@ -345,49 +350,36 @@ void notify_error_interceptors(const Client::Config &config,
     }
 }
 
-bool is_unreserved_char(unsigned char ch) {
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
-           ch == '-' || ch == '_' || ch == '.' || ch == '~';
-}
-
-std::string percent_encode(std::string_view text) {
-    static constexpr char hex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(text.size() * 3);
-    for (unsigned char ch : text) {
-        if (is_unreserved_char(ch)) {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[(ch >> 4) & 0x0F]);
-            out.push_back(hex[ch & 0x0F]);
-        }
-    }
-    return out;
-}
-
-std::string
-append_query_items(std::string url,
-                   const std::vector<std::pair<std::string, std::string>> &query_items) {
+std::string build_url_with_query(std::string_view base_url,
+                                  const std::vector<std::pair<std::string, std::string>> &query_items) {
     if (query_items.empty()) {
-        return url;
+        return std::string(base_url);
     }
 
-    const bool has_query = url.find('?') != std::string::npos;
-    url.push_back(has_query ? '&' : '?');
-
-    bool first = true;
-    for (const auto &[k, v] : query_items) {
-        if (!first) {
-            url.push_back('&');
+    auto url_result = ada::parse<ada::url>(base_url);
+    if (!url_result) {
+        std::string result(base_url);
+        bool has_query = result.contains('?');
+        result.push_back(has_query ? '&' : '?');
+        
+        ada::url_search_params params;
+        for (const auto &[k, v] : query_items) {
+            params.append(k, v);
         }
-        first = false;
-        url += percent_encode(k);
-        url.push_back('=');
-        url += percent_encode(v);
+        result += params.to_string();
+        return result;
     }
 
-    return url;
+    ada::url url = std::move(*url_result);
+    ada::url_search_params params(url.get_search());
+    
+    for (const auto &[k, v] : query_items) {
+        params.append(k, v);
+    }
+    
+    url.set_search(params.to_string());
+
+    return std::string(url.get_href());
 }
 
 struct ResponseBodySink {
@@ -660,7 +652,7 @@ Task<Response> execute_async(const Client::Config &config, Request request) {
         header_guard.reset(header_list);
 
         const std::string effective_request_url =
-            append_query_items(request.url, request.query_items);
+            build_url_with_query(request.url, request.query_items);
         curl_easy_setopt(easy.get(), CURLOPT_URL, effective_request_url.c_str());
         curl_easy_setopt(easy.get(), CURLOPT_FOLLOWLOCATION, follow_redirects ? 1L : 0L);
         curl_easy_setopt(easy.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(timeout.count()));

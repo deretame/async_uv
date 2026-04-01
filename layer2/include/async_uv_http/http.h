@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+#include <ada.h>
+
 #include "async_uv/runtime.h"
 #include "async_uv/task.h"
 
@@ -40,25 +42,8 @@ concept HasStdToString = requires(const T &value) {
     { std::to_string(value) } -> std::convertible_to<std::string>;
 };
 
-inline bool is_unreserved_char(unsigned char ch) {
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
-           ch == '-' || ch == '_' || ch == '.' || ch == '~';
-}
-
 inline std::string percent_encode_component(std::string_view text) {
-    static constexpr char hex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(text.size() * 3);
-    for (unsigned char ch : text) {
-        if (is_unreserved_char(ch)) {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[(ch >> 4) & 0x0F]);
-            out.push_back(hex[ch & 0x0F]);
-        }
-    }
-    return out;
+    return ada::unicode::percent_encode(text, ada::character_sets::WWW_FORM_URLENCODED_PERCENT_ENCODE);
 }
 
 template <typename T>
