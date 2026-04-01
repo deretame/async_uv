@@ -2,6 +2,7 @@
 
 #include <any>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -16,10 +17,15 @@
 
 namespace async_uv::layer3 {
 
+class StreamWriter;
+
+using StreamHandler = std::function<Task<void>(StreamWriter&)>;
+
 struct Context : http::ServerRequest {
     http::ServerResponse response;
     std::map<std::string, std::string> params;
     std::map<std::string, std::any> locals;
+    StreamHandler stream_handler;
 
     explicit Context(http::ServerRequest&& req)
         : ServerRequest(std::move(req)) {}
@@ -124,6 +130,15 @@ struct Context : http::ServerRequest {
     void send_status(int code) {
         response.status_code = code;
         response.body = "";
+    }
+
+    void stream(StreamHandler handler) {
+        stream_handler = std::move(handler);
+        response.chunked = true;
+    }
+
+    bool is_streaming() const noexcept {
+        return static_cast<bool>(stream_handler);
     }
 
     std::optional<std::string> header(std::string_view name) const {
