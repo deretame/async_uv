@@ -2,6 +2,7 @@
 
 #include <any>
 #include <cctype>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <optional>
@@ -14,6 +15,7 @@
 
 #include <async_uv_layer3/types.hpp>
 #include <async_uv_http/server.h>
+#include <async_uv_http/parser.h>
 
 namespace async_uv::layer3 {
 
@@ -139,6 +141,14 @@ struct Context : http::ServerRequest {
 
     bool is_streaming() const noexcept {
         return static_cast<bool>(stream_handler);
+    }
+
+    bool has_body_file() const noexcept {
+        return body_file_path.has_value();
+    }
+
+    const std::optional<std::filesystem::path>& body_file_path_v() const noexcept {
+        return body_file_path;
     }
 
     std::optional<std::string> header(std::string_view name) const {

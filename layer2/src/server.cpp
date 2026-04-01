@@ -109,6 +109,8 @@ ServerRequest ServerRequest::from_message(const HttpMessage &message, RequestCon
     out.http_major = message.http_major();
     out.http_minor = message.http_minor();
     out.meta = std::move(meta);
+    out.body_file_path = message.body_file_path();
+    out.body_file_state = message.body_file_state_shared();
     return out;
 }
 

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -43,8 +44,11 @@ struct ServerRequest {
     int http_major = 1;
     int http_minor = 1;
     RequestContextMeta meta;
+    std::optional<std::filesystem::path> body_file_path;
+    std::shared_ptr<void> body_file_state;
 
     [[nodiscard]] std::optional<std::string> header(std::string_view name) const;
+    [[nodiscard]] bool has_body_file() const noexcept { return body_file_path.has_value(); }
     static ServerRequest from_message(const HttpMessage &message, RequestContextMeta meta = {});
 };
 

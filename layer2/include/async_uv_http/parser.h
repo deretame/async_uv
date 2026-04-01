@@ -75,6 +75,10 @@ public:
         return body_file_path_;
     }
 
+    std::shared_ptr<void> body_file_state_shared() const noexcept {
+        return body_file_state_;
+    }
+
     std::uintmax_t body_size() const noexcept {
         return body_size_;
     }
