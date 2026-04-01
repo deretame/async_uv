@@ -214,6 +214,159 @@ private:
 
 ### 2.5 待添加的类型 ⏳
 
+---
+
+## 2.6 配置详解
+
+### 2.6.1 ServerLimits
+
+```cpp
+struct ServerLimits {
+    std::size_t max_header_count = 256;      // 最大 header 数量
+    std::size_t max_header_bytes = 16 * 1024;  // 最大 header 总字节数 (16KB)
+    std::size_t max_body_bytes = 8 * 1024 * 1024;  // 最大 body 字节数 (8MB)
+    std::size_t max_target_bytes = 8 * 1024;  // 最大 URL 长度 (8KB)
+    std::size_t max_method_bytes = 16;        // 最大 HTTP 方法长度
+};
+```
+
+**使用**：
+
+```cpp
+app.with_limits({
+    .max_body_bytes = 50 * 1024 * 1024,  // 50MB，适合文件上传
+    .max_header_bytes = 32 * 1024,        // 32KB，支持大 cookie
+});
+```
+
+### 2.6.2 ServerConnectionPolicy
+
+```cpp
+struct ServerConnectionPolicy {
+    bool keep_alive_enabled = true;           // 是否启用 keep-alive
+    std::size_t max_keep_alive_requests = 100; // 单连接最大请求数
+    std::chrono::milliseconds read_timeout = std::chrono::seconds(15);   // 读超时
+    std::chrono::milliseconds write_timeout = std::chrono::seconds(15);  // 写超时
+    std::chrono::milliseconds idle_timeout = std::chrono::seconds(30);    // 空闲超时
+};
+```
+
+**使用**：
+
+```cpp
+app.with_policy({
+    .keep_alive_enabled = true,
+    .max_keep_alive_requests = 1000,     // 每个连接最多 1000 请求
+    .read_timeout = std::chrono::seconds(30),
+    .write_timeout = std::chrono::seconds(30),
+    .idle_timeout = std::chrono::seconds(60),
+});
+```
+
+### 2.6.3 配置最佳实践
+
+| 场景 | max_body_bytes | read_timeout | idle_timeout |
+|------|-----------------|--------------|---------------|
+| API 服务 | 1-10MB | 15s | 30s |
+| 文件上传 | 50-100MB | 60s | 120s |
+| 长轮询 | 1MB | 300s | 300s |
+| WebSocket 升级 | 64KB | 300s | 0 (不超时) |
+
+---
+
+## 2.7 请求生命周期
+
+### 2.7.1 完整流程图
+
+```
+TCP 连接建立
+    │
+    ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                         请求读取阶段                                │
+│  1. 读取 HTTP 请求行 (method, path, version)                       │
+│  2. 读取 Headers (检查 max_header_count/bytes)                     │
+│  3. 读取 Body (检查 max_body_bytes)                                │
+│  4. 解析 URL (protocol://host:port/path?query#fragment)             │
+│  5. 构建 ServerRequest 对象                                        │
+└──────────────────────── ┬───────────────────────────────────────────┘
+                          │
+                          ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                     中间件链执行阶段                                │
+│                                                                    │
+│  Context ctx(std::move(request))                                   │
+│       │                                                            │
+│       ▼                                                            │
+│  ┌─────────────┐                                                   │
+│  │ Middleware 1│ ────── 前置逻辑 ──────┐                           │
+│  └─────────────┘                      │                            │
+│                                      ▼                            │
+│                           ┌─────────────┐                          │
+│                           │ Middleware 2│ ── 前置逻辑 ─┐           │
+│                           └─────────────┘            │           │
+│                                                     ▼           │
+│                                          ┌─────────────┐         │
+│                                          │   Handler   │         │
+│                                          └─────────────┘         │
+│                                                     │           │
+│                           ◄──── 后置逻辑 ◄─────────┘           │
+│                           ┌─────────────┐                       │
+│                           │ Middleware 2│ ◄─── 后置逻辑 ◄────────┤
+│                           └─────────────┘                       │
+│  ◄─────────────────────── 后置逻辑 ◄────────────────────────────┤
+│  ┌─────────────┐                                                 │
+│  │ Middleware 1│                                                 │
+│  └─────────────┘                                                 │
+└──────────────────────── ┬─────────────────────────────────────────┘
+                          │
+                          ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                         响应发送阶段                                │
+│  1. 序列化响应 (status line + headers + body)                      │
+│  2. 写入 socket                                                   │
+│  3. 检查 keep-alive                                                │
+│     - 如果 keep-alive 且未超限 → 回到请求读取阶段                   │
+│     - 否则 → 关闭连接                                              │
+└────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+                    TCP 连接关闭
+```
+
+### 2.7.2 关键检查点
+
+| 阶段 | 检查项 | 失败响应 |
+|------|--------|---------|
+| Header 读取 | `max_header_count`, `max_header_bytes` | 431 Request Header Fields Too Large |
+| URL 解析 | `max_target_bytes` | 414 URI Too Long |
+| Body 读取 | `max_body_bytes` | 413 Payload Too Large |
+| 路由匹配 | 路由是否存在 | 404 Not Found |
+| 方法检查 | 方法是否允许 | 405 Method Not Allowed |
+| 中间件 | 业务逻辑验证 | 自定义错误 |
+| Handler | 未捕获异常 | 500 Internal Server Error |
+
+### 2.7.3 连接状态管理
+
+```cpp
+struct ServerConnectionState {
+    std::size_t handled_requests = 0;  // 已处理请求数
+};
+
+// Keep-alive 检查逻辑
+bool should_keep_alive(
+    const ServerRequest& request,      // 请求头 Connection
+    const ServerResponse& response,    // 响应头 Connection
+    const ServerConnectionPolicy& policy,  // keep_alive_enabled, max_keep_alive_requests
+    const ServerConnectionState& state      // handled_requests
+) {
+    if (!policy.keep_alive_enabled) return false;
+    if (state.handled_requests >= policy.max_keep_alive_requests) return false;
+    if (request.http_major == 1 && request.http_minor == 0) return false;  // HTTP/1.0
+    return true;
+}
+```
+
 #### 2.5.1 RouteGroup ⏳
 
 ```cpp
@@ -883,14 +1036,25 @@ Middleware compress(CompressOptions options = {});
 
 ## 9. 安全考虑
 
-### 9.1 HTTPS 支持 📋
+### 9.1 HTTPS 和 HTTP/2 ❌
 
-Layer 3 依赖 Layer 2 的 TLS 支持：
+**不做原因**：交给 Nginx 处理
 
-```cpp
-// 启动 HTTPS 服务（计划）
-app.with_tls(cert_path, key_path);
-co_await app.listen(443);
+```
+Nginx 负责终结：
+- HTTPS 加密
+- HTTP/2 支持
+- 静态文件服务
+- 负载均衡
+- 限流
+
+Layer 3 只负责：
+- 路由
+- 中间件
+- 业务逻辑
+
+架构：
+浏览器 → Nginx (HTTPS/HTTP/2) → 反向代理 → Layer 3 (HTTP)
 ```
 
 ### 9.2 输入验证 ⏳
@@ -1287,13 +1451,7 @@ app.websocket("/ws", [](WebSocket& ws) -> Task<> {
 
 ## 13. 未来扩展
 
-### 13.1 HTTP/2 支持 📋
-
-- 使用 Layer 2 的 HTTP/2 支持
-- 复用现有路由和中间件
-- 服务器推送
-
-### 13.2 WebSocket 支持 📋
+### 13.1 WebSocket 支持 📋
 
 ```cpp
 class WebSocket {
@@ -1303,56 +1461,160 @@ public:
     void on_message(std::function<Task<void>(std::string_view)> handler);
     void on_close(std::function<Task<void>()> handler);
 };
+
+// 使用
+app.websocket("/ws", [](WebSocket& ws) -> Task<> {
+    ws.on_message([&](std::string_view msg) -> Task<> {
+        co_await ws.send("Echo: " + std::string(msg));
+    });
+});
 ```
 
-### 13.3 OpenAPI 文档生成 ⏳
+**实现要点**：
+- HTTP 升级协议处理
+- Frame 解析（PING/PONG/CLOSE/TEXT/BINARY）
+- 连接状态管理
+- 与现有中间件链集成
+
+### 13.2 OpenAPI 文档生成 ⏳
 
 ```cpp
-// 从路由生成 OpenAPI 文档
+// 从路由自动生成 OpenAPI 文档
 auto openapi = app.generate_openapi({
     .title = "My API",
-    .version = "1.0.0"
+    .version = "1.0.0",
+    .description = "API 文档"
 });
 
+// 暴露文档端点
 app.get("/openapi.json", [&](Context& ctx) -> Task<> {
     ctx.json(openapi);
     co_return;
 });
 ```
 
-### 13.4 请求验证 ⏳
+**生成内容**：
+- 路径和操作列表
+- 参数定义（path/query/header/body）
+- 响应模式
+- 从 `reflect-cpp` 类型自动推导 schema
+
+### 13.3 请求验证 ⏳
 
 ```cpp
-// 使用 reflect-cpp 的验证功能
+// 类型 + 约束验证
 struct UserCreate {
-    std::string name;        // rfl::Pattern正则验证
-    std::string email;
-    int age;                 // rfl::GreaterThan<0>
+    rfl::Field<"name", std::string> name;        // 非空
+    rfl::Field<"email", std::string> email;       // 邮箱格式
+    rfl::Field<"age", int> age;                   // > 0
 };
 
+// 验证中间件
+template<typename T>
+Middleware validate() {
+    return [](Context& ctx, Next next) -> Task<void> {
+        auto obj = ctx.json_as<T>();
+        if (!obj) {
+            ctx.status(400);
+            ctx.json({{"error", "Invalid request body"}});
+            co_return;
+        }
+        
+        // 使用 reflect-cpp 验证
+        auto errors = rfl::validate(*obj);
+        if (errors) {
+            ctx.status(400);
+            ctx.json({{"errors", *errors}});
+            co_return;
+        }
+        
+        ctx.set_local("validated", std::move(*obj));
+        co_await next();
+    };
+}
+
+// 使用
 app.post("/users", validate<UserCreate>(), [](Context& ctx) -> Task<> {
-    // 验证通过，user 已验证
-    auto user = ctx.json_as<UserCreate>();
+    auto& user = ctx.local<UserCreate>("validated");
+    // ...
+});
+```
+
+### 13.4 依赖注入 ⏳
+
+```cpp
+// 服务容器
+class ServiceContainer {
+public:
+    template<typename T>
+    void register_service(std::shared_ptr<T> service);
+    
+    template<typename T>
+    std::shared_ptr<T> get();
+};
+
+// 通过中间件注入
+app.use([](Context& ctx, Next next) -> Task<void> {
+    ctx.set_local("db", std::make_shared<Database>());
+    ctx.set_local("cache", std::make_shared<Cache>());
+    co_await next();
+});
+
+// 在 handler 中使用
+app.get("/users", [](Context& ctx) -> Task<> {
+    auto& db = ctx.local<Database>("db");
+    auto users = co_await db.get_all_users();
+    ctx.json(users);
     co_return;
 });
 ```
 
-### 13.5 依赖注入 ⏳
+### 13.5 生命周期钩子 ⏳
 
 ```cpp
-// 服务注入
-class Database { /* ... */ };
+// 服务器生命周期钩子
+struct LifeCycle {
+    std::function<Task<void>()> on_start;    // 启动后
+    std::function<Task<void>()> on_stop;     // 停止前
+    std::function<void(Context&)> on_error;  // 错误时
+};
 
-app.use([](Context& ctx, Next next) -> Task<void> {
-    ctx.set_local("db", Database{});
-    co_await next();
-});
+App& with_lifecycle(LifeCycle lifecycle);
 
-app.get("/users", [](Context& ctx) -> Task<> {
-    auto& db = ctx.local<Database>("db");
-    // ...
+// 使用
+app.with_lifecycle({
+    .on_start = []() -> Task<> {
+        std::cout << "Server started\n";
+        co_return;
+    },
+    .on_stop = []() -> Task<> {
+        std::cout << "Server shutting down\n";
+        co_return;
+    }
 });
 ```
+
+### 13.6 路由元数据 ⏳
+
+```cpp
+// 每个路由附加元数据（用于 OpenAPI、权限等）
+app.get("/users/{id}", get_user_handler, {
+    .name = "getUser",
+    .description = "Get user by ID",
+    .tags = {"users"},
+    .require_auth = true
+});
+```
+
+### 13.7 不做的功能 ❌
+
+| 功能 | 原因 | 替代方案 |
+|------|------|---------|
+| HTTPS | Nginx 更专业 | Nginx 终结 TLS |
+| HTTP/2 服务端 | Nginx 已支持 | Nginx 反向代理 |
+| 静态文件 | Nginx 性能更好 | Nginx `location /static` |
+| 负载均衡 | Nginx/云服务更好 | Nginx upstream |
+| 客户端请求 | libcurl 已满足 | Layer 2 HTTP Client |
 
 ---
 
