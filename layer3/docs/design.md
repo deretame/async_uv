@@ -787,6 +787,146 @@ Task<void> main_task() {
 }
 ```
 
+### 6.4 请求体解析
+
+Layer 3 支持多种请求体格式，可通过内置中间件或手动解析。
+
+#### 6.4.1 Content-Type 处理流程
+
+```
+请求到达
+    │
+    ▼
+检查 Content-Type 头
+    │
+    ├─ application/json              → ctx.json_as<T>()
+    ├─ application/x-www-form-urlencoded → form_parser 中间件
+    ├─ multipart/form-data           → multipart_parser 中间件
+    └─ text/plain                    → ctx.body
+```
+
+#### 6.4.2 application/x-www-form-urlencoded
+
+标准 HTML 表单格式：
+
+```
+POST /login HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+username=alice&password=secret123
+```
+
+实现思路：
+
+```cpp
+// 解析逻辑（伪代码）
+inline Task<void> form_parser(Context& ctx, Next next) {
+    auto content_type = ctx.header("Content-Type");
+    if (content_type && content_type->find("application/x-www-form-urlencoded") != std::string::npos) {
+        // 分割 & 符号
+        // 对每个 key=value 对：
+        //   - percent_decode(key)
+        //   - percent_decode(value)
+        // 存入 ctx.locals["form_data"]
+    }
+    co_await next();
+}
+```
+
+#### 6.4.3 multipart/form-data
+
+用于文件上传和复杂表单：
+
+```
+POST /upload HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="username"
+
+alice
+------WebKitFormBoundary
+Content-Disposition: form-data; name="avatar"; filename="photo.jpg"
+Content-Type: image/jpeg
+
+[二进制数据]
+------WebKitFormBoundary--
+```
+
+**解析器数据结构**：
+
+```cpp
+struct MultipartField {
+    std::string name;           // 字段名
+    std::string filename;       // 文件名（仅文件字段）
+    std::string content_type;   // Content-Type
+    std::string data;           // 字段数据
+    
+    bool is_file() const { return !filename.empty(); }
+};
+
+struct MultipartFormData {
+    std::unordered_map<std::string, std::vector<MultipartField>> fields;
+    
+    std::optional<std::string> get(std::string_view name) const;
+    std::optional<MultipartField> get_file(std::string_view name) const;
+    const std::vector<MultipartField>* get_all(std::string_view name) const;
+};
+```
+
+**使用示例**：
+
+```cpp
+app.post("/upload", 
+    async_uv::layer3::middleware::multipart_parser(), 
+    [](Context& ctx) -> Task<> {
+        auto multipart = async_uv::layer3::get_multipart(ctx);
+        if (!multipart) {
+            ctx.status(400);
+            co_return;
+        }
+        
+        // 获取普通字段
+        auto username = multipart->get("username");
+        
+        // 获取上传文件
+        auto file = multipart->get_file("avatar");
+        if (file) {
+            // file->filename - 原始文件名
+            // file->content_type - MIME 类型
+            // file->data - 文件内容
+        }
+        
+        ctx.json({{"success", true}});
+        co_return;
+    }
+);
+```
+
+#### 6.4.4 Content-Type 对比
+
+| Content-Type | 用途 | 解析方式 |
+|-------------|------|---------|
+| `application/json` | API 请求 | `ctx.json_as<T>()` |
+| `application/x-www-form-urlencoded` | HTML 表单 | `form_parser` 中间件 |
+| `multipart/form-data` | 文件上传 | `multipart_parser` 中间件 |
+| `text/plain` | 纯文本 | 直接访问 `ctx.body` |
+
+#### 6.4.5 请求体大小限制
+
+```cpp
+// body_limit 中间件
+app.use([](Context& ctx, Next next) -> Task<void> {
+    constexpr size_t MAX_BODY = 10 * 1024 * 1024;  // 10MB
+    if (ctx.body_size > MAX_BODY) {
+        ctx.status(413);  // Payload Too Large
+        ctx.json({{"error", "Payload too large"}});
+        co_return;
+    }
+    co_await next();
+});
+```
+
 ---
 
 ## 7. 错误处理
