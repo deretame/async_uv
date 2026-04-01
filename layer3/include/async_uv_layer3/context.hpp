@@ -13,6 +13,7 @@
 #include <rfl.hpp>
 #include <rfl/json.hpp>
 
+#include <async_uv/fs.h>
 #include <async_uv_layer3/types.hpp>
 #include <async_uv_http/server.h>
 #include <async_uv_http/parser.h>
@@ -149,6 +150,33 @@ struct Context : http::ServerRequest {
 
     const std::optional<std::filesystem::path>& body_file_path_v() const noexcept {
         return body_file_path;
+    }
+
+    Task<void> save_body_to(std::filesystem::path target_path) {
+        if (has_body_file()) {
+            co_await async_uv::Fs::rename(body_file_path->string(), target_path.string());
+            body_file_path = target_path;
+        } else {
+            auto file = co_await async_uv::File::open(
+                target_path.string(),
+                async_uv::OpenFlags::create | async_uv::OpenFlags::write_only | async_uv::OpenFlags::truncate,
+                0644);
+            co_await file.write_all(body);
+            co_await file.close();
+        }
+    }
+
+    Task<std::string> read_body() {
+        if (has_body_file()) {
+            auto file = co_await async_uv::File::open(
+                body_file_path->string(),
+                async_uv::OpenFlags::read_only);
+            auto content = co_await file.read_all();
+            co_await file.close();
+            co_return content;
+        } else {
+            co_return body;
+        }
     }
 
     std::optional<std::string> header(std::string_view name) const {
