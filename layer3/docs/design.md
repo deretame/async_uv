@@ -6,10 +6,48 @@
 > - 📋 设计完成，待编码
 > - ❌ 不做（说明原因）
 
+> **维护说明（2026-04-02）**：
+> - 本文档定位为“设计规范 + 开发 TODO”，优先保证语义完整、一致、可执行。
+> - 本文档只定义目标行为，不绑定某次具体实现细节。
+> - 若实现与本文档冲突，应先更新本文档中的决策，再落地代码。
+> - 文档当前版本：`v0.4`（本次修订补齐 `trace_id` 规范与重复路由注册约束）。
+
+## 0. 设计审查结论与 TODO（文档维度）
+
+### 0.1 已修订的关键规范
+
+| 项目 | 当前结论 | 备注 |
+|------|----------|------|
+| 路由语法 | 统一使用 `{name}` / `{name*}` | 禁用混合写法 `/*` |
+| Keep-Alive | 按 HTTP/1.0/1.1 语义分别处理 | 明确 `Connection` 规则 |
+| 错误码体系 | 分层定义 HTTP 状态码与业务码 | 增加映射策略 |
+| CORS | 增加 `Vary: Origin` 与凭证约束 | 避免缓存与安全歧义 |
+| 示例一致性 | 修复签名与 API 用法冲突 | 示例可直接作为设计参考 |
+| 错误可观测性 | 错误体字段契约覆盖 `request_id`/`trace_id` | 明确日志关联策略 |
+| 路由冲突策略 | 同 method+pattern 重复注册视为配置错误 | 禁止隐式覆盖 |
+
+### 0.2 后续 TODO（按优先级）
+
+- [x] P1 补充 `RouteGroup` 与 `App::route` 组合使用的边界示例
+- [x] P2 补充路径规范化规则的反例与边界样例
+- [x] P2 为错误响应增加可选的追踪字段规范（如 `trace_id`）
+- [ ] P3 定义错误标识注册表的“新增/废弃”流程（避免长期演进漂移）
+
+### 0.3 术语与示例约定
+
+- 本文档中的 C++ 片段默认是“规范示例”，用于定义行为，不保证可直接编译。
+- 若示例中出现 `Task<void>`、`Middleware`、`Context` 等类型，语义以第 2 节定义为准。
+- 未展开的辅助函数（如 `to_lower`、`join`）视为已存在工具函数，重点在行为约束。
+- 规范强度词：
+  - `必须`：实现必须满足
+  - `建议`：默认推荐，若不采用应有明确理由
+  - `可选`：按项目需求决定
+
 ---
 
 ## 目录
 
+0. [设计审查结论与 TODO](#0-设计审查结论与-todo文档维度)
 1. [概述](#1-概述)
 2. [核心类型定义](#2-核心类型定义)
 3. [路由系统](#3-路由系统)
@@ -25,6 +63,7 @@
 13. [未来扩展](#13-未来扩展)
 14. [文件结构](#14-文件结构)
 15. [编译和使用](#15-编译和使用)
+16. [附录：错误标识注册表](#16-附录错误标识注册表)
 
 ---
 
@@ -196,6 +235,7 @@ public:
     
     // === 子路由 ===
     App& route(std::string_view prefix, Router sub_router);
+    App& router(std::string_view prefix, std::function<void(RouteGroup&)> builder); // DSL 写法（支持嵌套）
     
     // === 配置 ===
     App& with_limits(http::ServerLimits limits);
@@ -342,7 +382,7 @@ TCP 连接建立
 | URL 解析 | `max_target_bytes` | 414 URI Too Long |
 | Body 读取 | `max_body_bytes` | 413 Payload Too Large |
 | 路由匹配 | 路由是否存在 | 404 Not Found |
-| 方法检查 | 方法是否允许 | 405 Method Not Allowed |
+| 方法检查 | 方法是否允许 | 405 Method Not Allowed（含 `Allow`） |
 | 中间件 | 业务逻辑验证 | 自定义错误 |
 | Handler | 未捕获异常 | 500 Internal Server Error |
 
@@ -361,13 +401,20 @@ bool should_keep_alive(
     const ServerConnectionState& state      // handled_requests
 ) {
     if (!policy.keep_alive_enabled) return false;
-    if (state.handled_requests >= policy.max_keep_alive_requests) return false;
-    if (request.http_major == 1 && request.http_minor == 0) return false;  // HTTP/1.0
-    return true;
+    if (!response.keep_alive) return false;
+    if (state.handled_requests + 1 >= policy.max_keep_alive_requests) return false;
+
+    auto conn = to_lower(request.header("Connection").value_or(""));
+    // HTTP/1.1: 默认 keep-alive，除非显式 close
+    if (request.http_major > 1 || (request.http_major == 1 && request.http_minor == 1)) {
+        return conn != "close";
+    }
+    // HTTP/1.0: 默认 close，只有显式 keep-alive 才复用
+    return conn == "keep-alive";
 }
 ```
 
-#### 2.5.1 RouteGroup ⏳
+### 2.8 RouteGroup ✅
 
 ```cpp
 // 路由组 - 对一组路由应用相同的中间件
@@ -377,8 +424,10 @@ public:
     RouteGroup& get(std::string_view pattern, Handler handler);
     RouteGroup& post(std::string_view pattern, Handler handler);
     // ...
+    RouteGroup& router(std::string_view prefix, std::function<void(RouteGroup&)> builder); // 嵌套 DSL
     
-    Router to_router() const;  // 转换为普通 Router
+    Router to_router() const;  // 仅导出路由定义，不携带组中间件
+    void apply_to(App& app);   // 将组中间件 + 路由一起挂载到 App
 
 private:
     std::vector<Middleware> middlewares_;
@@ -395,20 +444,57 @@ api.use(auth_middleware);  // 只对这组路由生效
 api.get("/users", list_users);
 api.get("/posts", list_posts);
 
-app.route("/api", api.to_router());
+api.apply_to(app);         // 推荐：保留组中间件语义
 ```
 
-#### 2.5.2 RequestLifeCycle ⏳
+```cpp
+// DSL 风格（支持嵌套）：/login 不鉴权，其它路由鉴权
+app.router("/api", [](RouteGroup& r) {
+    r.post("/login", login_handler);  // 不加 auth
+
+    r.router("", [](RouteGroup& protected_routes) {
+        protected_routes.use(auth_middleware); // 仅对子作用域生效
+        protected_routes.get("/profile", profile_handler);
+
+        protected_routes.router("/admin", [](RouteGroup& admin) {
+            admin.use(admin_only_middleware);
+            admin.get("/users", list_users);
+        });
+    });
+});
+```
+
+### 2.8.1 `RouteGroup` 与 `App::route` 组合边界 ✅
+
+为避免重复挂载和中间件语义歧义，约定如下：
+
+1. `RouteGroup::apply_to(app)` 为首选，适用于“组中间件 + 路由”整体挂载。
+2. `RouteGroup::to_router()` 仅导出路由定义，不包含组中间件。
+3. 禁止同一组路由同时 `apply_to(app)` 且再通过 `app.route(prefix, group.to_router())` 二次挂载。
+4. 若必须组合 `App::route`，应显式说明该分支不需要组中间件。
+
+反例（禁止）：
+
+```cpp
+auto admin = RouteGroup("/admin");
+admin.use(auth_middleware);
+admin.get("/users", list_users);
+
+admin.apply_to(app);
+app.route("/admin", std::move(admin).to_router()); // 禁止：重复挂载，语义冲突
+```
+
+### 2.9 Lifecycle ✅（基础版）
 
 ```cpp
 // 生命周期钩子
-struct LifeCycle {
+struct Lifecycle {
     std::function<Task<void>()> on_start;      // 服务器启动时
     std::function<Task<void>()> on_stop;       // 服务器停止时
     std::function<void(Context&)> on_error;    // 错误处理
 };
 
-App& with_lifecycle(LifeCycle lifecycle);
+App& with_lifecycle(Lifecycle lifecycle);
 ```
 
 ---
@@ -446,6 +532,35 @@ public:
 | `/users/{id}` | PARAM | 单段 | `"id": "123"` |
 | `/files/{path*}` | WILDCARD | 多段 | `"path": "a/b/c"` |
 
+### 3.2.1 路径规范化规则 ✅
+
+为保证路由可预测性，匹配前统一执行以下规范化：
+
+1. 去掉 query 与 fragment，仅用 path 参与匹配
+2. 合并连续 `/` 为单个 `/`
+3. 去掉尾部 `/`（根路径 `/` 除外）
+4. 不做大小写折叠（路径默认大小写敏感）
+5. URL decode 仅对参数值生效，不对路由模板做 decode
+
+### 3.2.2 规范化示例 ✅
+
+| 原始请求目标 | 参与匹配的 path |
+|-------------|-----------------|
+| `/users?id=1` | `/users` |
+| `/users///123/` | `/users/123` |
+| `/Users/123` | `/Users/123`（大小写保留） |
+| `/files/a%2Fb` | `/files/a%2Fb`（模板不 decode） |
+
+### 3.2.3 反例与边界样例 ✅
+
+| 场景 | 输入 | 期望 |
+|------|------|------|
+| 空 path | `` | 规范化为 `/` |
+| 仅 query | `?a=1` | 规范化为 `/` |
+| 多个尾部 `/` | `/users///` | 规范化为 `/users` |
+| fragment-only | `#part` | 规范化为 `/` |
+| 编码斜杠参数 | `/files/a%2Fb` + `/files/{path*}` | `path` 值保持 `a%2Fb`，不在模板阶段 decode |
+
 ### 3.3 匹配优先级 ✅
 
 ```
@@ -458,7 +573,7 @@ public:
   GET /users/profile      (STATIC)
   GET /users/{id}         (PARAM)
   GET /users/{id}/posts   (PARAM + STATIC)
-  GET /users/{id}/*       (PARAM + WILDCARD)
+  GET /users/{id}/{rest*} (PARAM + WILDCARD)
 
 请求匹配：
   /users/profile      → STATIC
@@ -466,6 +581,16 @@ public:
   /users/123/posts    → PARAM + STATIC
   /users/123/extra    → PARAM + WILDCARD
 ```
+
+### 3.3.1 重复注册约束 ✅
+
+为避免运行期出现“最后一次注册覆盖前一次注册”的隐式行为，约定如下：
+
+1. 路由唯一键定义为：`(method, normalized_pattern)`。
+2. 同一 `Router` 内注册到相同唯一键时，`必须`判定为配置错误（抛异常或返回显式错误），禁止静默覆盖。
+3. 规范化后等价的路径也视为冲突（如 `/users/` 与 `/users`）。
+4. `all()` 语义若展开为多个方法，`必须`逐个方法执行冲突检查。
+5. 错误信息`建议`包含冲突的 method/pattern，便于启动期快速定位。
 
 ### 3.4 插入算法 ✅
 
@@ -481,9 +606,9 @@ add_route("GET", "/users/{id}/posts"):
 4. 在最终节点存储 handler
 ```
 
-### 3.5 待添加的路由功能 ⏳
+### 3.5 路由附加能力 ✅（基础版）
 
-#### 3.5.1 路由元数据 ⏳
+#### 3.5.1 路由元数据 ✅
 
 ```cpp
 // 每个路由可以附加元数据
@@ -498,7 +623,7 @@ struct RouteMeta {
 Router& get(std::string_view pattern, Handler handler, RouteMeta meta);
 ```
 
-#### 3.5.2 路由列表 ⏳
+#### 3.5.2 路由列表 ✅
 
 ```cpp
 // 获取所有已注册路由
@@ -514,13 +639,18 @@ struct RouteInfo {
 // 用于生成 OpenAPI 文档
 ```
 
-#### 3.5.3 方法检查 ⏳
+#### 3.5.3 方法检查 ✅
 
 ```cpp
 // 检查某路径支持哪些方法
 std::vector<std::string> Router::allowed_methods(std::string_view path) const;
 
 // 用于 405 Method Not Allowed 响应
+// 约定：
+// 1. 返回值需去重并按字典序稳定输出
+// 2. 若存在 GET，建议自动包含 HEAD
+// 3. 生成 405 时必须附带 Allow 头
+// 4. 对于 OPTIONS，请优先返回能力探测（200/204）而不是 405
 ```
 
 ---
@@ -643,9 +773,9 @@ ctx.json({
 });
 ```
 
-### 5.3 Form 解析 📋
+### 5.3 Form 解析 ✅
 
-#### 5.3.1 application/x-www-form-urlencoded 📋
+#### 5.3.1 application/x-www-form-urlencoded ✅
 
 ```cpp
 // form_parser.hpp
@@ -662,7 +792,7 @@ std::optional<std::string> form_field(Context& ctx, std::string_view name);
 - 调用 `ada::unicode::percent_decode` 解码
 - 存入 `ctx.locals["form_data"]`
 
-#### 5.3.2 multipart/form-data 📋
+#### 5.3.2 multipart/form-data ✅
 
 ```cpp
 // multipart_parser.hpp
@@ -706,7 +836,7 @@ std::optional<MultipartFormData> get_multipart(Context& ctx);
 4. 提取 `name`, `filename` 等参数
 5. 读取 body 数据
 
-### 5.4 请求体大小限制 ⏳
+### 5.4 请求体大小限制 ✅
 
 ```cpp
 // body_limit.hpp
@@ -739,7 +869,7 @@ struct ServerResponse {
 };
 ```
 
-### 6.2 响应便捷方法 ✅
+### 6.2 已有响应方法 ✅
 
 ```cpp
 // Context 中的响应方法
@@ -748,12 +878,11 @@ void set(std::string_view name, std::string_view value);  // 设置头
 void json(const T& obj);                            // JSON 响应
 void json_raw(std::string body);                    // 原始 JSON 字符串
 void send(std::string body);                        // 纯文本响应
-void send_file(std::filesystem::path path);         // ⏳ 发送文件
 ```
 
 ### 6.3 待添加的响应方法 ⏳
 
-#### 6.3.1 重定向 ⏳
+#### 6.3.1 重定向 ✅
 
 ```cpp
 // 重定向
@@ -762,7 +891,7 @@ void redirect_permanent(std::string_view url);  // 301
 void redirect_temporary(std::string_view url);  // 307
 ```
 
-#### 6.3.2 文件下载 ⏳
+#### 6.3.2 文件下载 ✅
 
 ```cpp
 // 发送文件
@@ -772,14 +901,14 @@ void download(std::filesystem::path path, std::string_view filename);
 // 设置 Content-Disposition: attachment; filename="..."
 ```
 
-#### 6.3.3 流式响应 ⏳
+#### 6.3.3 流式响应 ✅
 
 ```cpp
 // 流式响应（用于大文件）
 Task<void> stream(Context& ctx, std::function<Task<void>(std::function<Task<void>(std::string_view)>)> generator);
 
 // 示例：流式返回日志
-app.get("/logs", [](Context& ctx) -> Task<> {
+app.get("/logs", [](Context& ctx) -> Task<void> {
     co_await ctx.stream([](auto write) -> Task<void> {
         for (int i = 0; i < 100; ++i) {
             co_await write("log line " + std::to_string(i) + "\n");
@@ -788,7 +917,7 @@ app.get("/logs", [](Context& ctx) -> Task<> {
 });
 ```
 
-### 6.4 Content-Type 自动设置 📋
+### 6.4 Content-Type 自动设置 ✅（文件响应）
 
 ```cpp
 // 根据文件扩展名自动设置 Content-Type
@@ -816,86 +945,182 @@ std::string_view mime_type(std::string_view path) {
 
 ```cpp
 // 框架自动返回的错误
-404 Not Found    - 路由不匹配
-405 Method Not Allowed - 路由存在但方法不对 ⏳
-413 Payload Too Large - 请求体过大 ⏳
-415 Unsupported Media Type - Content-Type 不支持 ⏳
-500 Internal Server Error - 内部错误
+404 Not Found               - 路由不匹配
+405 Method Not Allowed      - 路由存在但方法不允许（必须返回 Allow 头）
+413 Payload Too Large       - 请求体过大
+415 Unsupported Media Type  - Content-Type 不支持
+500 Internal Server Error   - 内部错误
 ```
 
 ### 7.2 错误响应格式 ✅
 
 ```json
 {
+    "status": 404,
     "error": "Not Found",
+    "code": "ROUTE_NOT_FOUND",
+    "biz_code": null,
     "path": "/users/123",
     "method": "GET",
-    "request_id": "abc123"
+    "request_id": "req-abc123",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
 }
 ```
 
-### 7.3 自定义错误处理 ⏳
+字段契约（规范）：
+
+| 字段 | 类型 | 是否必须 | 约束 |
+|------|------|----------|------|
+| `status` | number | 必须 | HTTP 状态码 |
+| `error` | string | 必须 | 面向调用方的简短错误描述 |
+| `code` | string | 必须 | 机器可读稳定标识，推荐全大写下划线 |
+| `biz_code` | number \| null | 必须 | 业务码；无业务码时必须为 `null` |
+| `path` | string \| null | 建议 | 参与路由匹配的请求 path |
+| `method` | string \| null | 建议 | 请求方法（`GET`/`POST`...） |
+| `request_id` | string \| null | 建议 | 单次请求标识，用于日志关联 |
+| `trace_id` | string \| null | 可选 | 分布式链路标识；无链路追踪时为 `null` |
+
+补充约定：
+
+1. 对外错误响应`必须`至少包含：`status`、`error`、`code`、`biz_code`。
+2. 若上下文可获得 `request_id`/`trace_id`，`建议`始终回传，便于跨系统排障。
+3. `request_id` 与 `trace_id` 可以相同，也可以独立；两者语义不同，不应混用命名。
+4. `trace_id` 格式`建议`兼容 W3C Trace Context 的 32 位十六进制表示。
+
+### 7.3 自定义错误处理 ✅
 
 ```cpp
 // 自定义错误处理中间件
-app.use([](Context& ctx, Next next) -> Task<> {
+app.use([](Context& ctx, Next next) -> Task<void> {
+    // 语义化伪接口：ctx.get_local_or_null("k") 表示“存在则取值，不存在返回 null”
+    auto write_error = [&](int status,
+                           std::string_view message,
+                           std::string_view code,
+                           std::optional<int> biz_code = std::nullopt) {
+        if (biz_code) {
+            ctx.status(status);
+            ctx.json({
+                {"status", status},
+                {"error", message},
+                {"code", code},
+                {"biz_code", *biz_code},
+                {"path", ctx.path},
+                {"method", ctx.method},
+                {"request_id", ctx.get_local_or_null("request_id")},
+                {"trace_id", ctx.get_local_or_null("trace_id")}
+            });
+        } else {
+            ctx.status(status);
+            ctx.json({
+                {"status", status},
+                {"error", message},
+                {"code", code},
+                {"biz_code", nullptr},
+                {"path", ctx.path},
+                {"method", ctx.method},
+                {"request_id", ctx.get_local_or_null("request_id")},
+                {"trace_id", ctx.get_local_or_null("trace_id")}
+            });
+        }
+    };
+
     try {
         co_await next();
+    } catch (const AppErrorException& e) {
+        write_error(
+            static_cast<int>(e.error.http_error),
+            e.error.message,
+            e.error.code,
+            e.error.biz_error ? std::optional<int>(static_cast<int>(*e.error.biz_error))
+                              : std::nullopt);
     } catch (const ValidationError& e) {
-        ctx.status(400);
-        ctx.json({{"error", e.what()}});
+        write_error(400, e.what(), "INVALID_FIELD", 10003);
     } catch (const AuthError& e) {
-        ctx.status(401);
-        ctx.json({{"error", e.what()}});
+        write_error(401, e.what(), "INVALID_TOKEN", 11001);
     } catch (const std::exception& e) {
-        ctx.status(500);
-        ctx.json({{"error", "Internal Server Error"}});
+        write_error(500, "Internal Server Error", "INTERNAL_ERROR");
         // 记录日志
     }
 });
 ```
 
-### 7.4 错误码定义 ⏳
+### 7.4 错误码定义 ✅
 
 ```cpp
 // error_codes.hpp
 namespace async_uv::layer3 {
 
-enum class ErrorCode : int {
-    // 400xx - 客户端错误
-    Bad_Request = 40000,
-    Invalid_JSON = 40001,
-    Missing_Field = 40002,
-    Invalid_Field = 40003,
-    
-    // 401xx - 认证错误
-    Unauthorized = 40100,
-    Invalid_Token = 40101,
-    Token_Expired = 40102,
-    
-    // 403xx - 权限错误
-    Forbidden = 40300,
-    Insufficient_Permissions = 40301,
-    
-    // 404xx - 资源不存在
-    Not_Found = 40400,
-    Resource_Not_Found = 40401,
-    
-    // 500xx - 服务端错误
-    Internal_Error = 50000,
-    Database_Error = 50001,
-    External_Service_Error = 50002,
+// 第一层：HTTP 状态码（协议语义）
+enum class HttpError : int {
+    BadRequest = 400,
+    Unauthorized = 401,
+    Forbidden = 403,
+    NotFound = 404,
+    MethodNotAllowed = 405,
+    PayloadTooLarge = 413,
+    UnsupportedMediaType = 415,
+    TooManyRequests = 429,
+    InternalServerError = 500,
 };
 
-struct Error {
-    ErrorCode code;
+// 第二层：业务错误码（应用语义）
+enum class BizError : int {
+    InvalidJson = 10001,
+    MissingField = 10002,
+    InvalidField = 10003,
+    InvalidToken = 11001,
+    TokenExpired = 11002,
+    ResourceNotFound = 14001,
+    DatabaseError = 15001,
+    ExternalServiceError = 15002,
+};
+
+struct AppError {
+    HttpError http_error;
+    std::string code;
+    std::optional<BizError> biz_error;
     std::string message;
     std::optional<std::string> detail;
     
-    void to_json(Context& ctx) const;
+    // 统一错误输出
+    void write(Context& ctx) const;
+};
+
+struct AppErrorException : std::runtime_error {
+    AppError error;
 };
 
 } // namespace async_uv::layer3
+```
+
+### 7.5 错误映射策略 ✅
+
+| 场景 | HTTP 状态码 | 业务码 |
+|------|-------------|--------|
+| 路由不存在 | `404` | 可空（`code=ROUTE_NOT_FOUND`） |
+| 方法不允许 | `405` | 可空（`code=METHOD_NOT_ALLOWED`） |
+| JSON 解析失败 | `400` | `InvalidJson`（`code=INVALID_JSON`） |
+| 认证失败 | `401` | `InvalidToken` / `TokenExpired` |
+| 参数校验失败 | `400` | `MissingField` / `InvalidField` |
+| 未知异常 | `500` | 可空（`code=INTERNAL_ERROR`） |
+
+### 7.6 405 响应规范 ✅
+
+当路径存在但方法不允许时，响应必须满足：
+
+1. 状态码为 `405 Method Not Allowed`
+2. 必须包含 `Allow` 头，值为该路径允许的方法集合（逗号分隔）
+3. 错误体沿用统一错误结构（至少包含 `status`、`error`、`code`、`biz_code`）
+4. 若上下文有 `request_id`/`trace_id`，建议一并返回
+
+示例：
+
+```http
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD, POST
+Content-Type: application/json
+
+{"status":405,"error":"Method Not Allowed","code":"METHOD_NOT_ALLOWED","biz_code":null}
 ```
 
 ---
@@ -909,20 +1134,20 @@ struct Error {
 | `logger()` | 请求日志 | ✅ |
 | `error_handler()` | 错误捕获 | ✅ |
 
-### 8.2 待实现 ⏳
+### 8.2 实现状态更新 ✅
 
-| 中间件 | 功能 | 优先级 |
-|--------|------|--------|
-| `cors()` | CORS 处理 | 高 |
-| `body_limit(size)` | 请求体大小限制 | 高 |
-| `form_parser()` | 表单解析 | 中 |
-| `multipart_parser()` | 文件上传解析 | 中 |
-| `rate_limit()` | 限流 | 中 |
-| `compress()` | 响应压缩 | 低 |
-| `etag()` | ETag 缓存 | 低 |
-| `static_files()` | 静态文件服务 | ❌ (交给 Nginx) |
+| 中间件 | 功能 | 设计状态 | 优先级 |
+|--------|------|----------|--------|
+| `cors()` | CORS 处理 | ✅ | 高 |
+| `body_limit(size)` | 请求体大小限制 | ✅ | 高 |
+| `form_parser()` | 表单解析 | ✅ | 中 |
+| `multipart_parser()` | 文件上传解析 | ✅ | 中 |
+| `rate_limit()` | 限流 | ✅ | 中 |
+| `compress()` | 响应压缩 | ✅ | 低 |
+| `etag()` | ETag 缓存 | ✅ | 低 |
+| `static_files()` | 静态文件服务 | ❌ (交给 Nginx) | 低 |
 
-### 8.3 CORS 中间件 ⏳
+### 8.3 CORS 中间件 ✅
 
 ```cpp
 // cors.hpp
@@ -962,14 +1187,21 @@ inline Middleware cors(CorsOptions options) {
             co_return;
         }
         
-        ctx.set("Access-Control-Allow-Origin", *origin);
-        
+        // CORS 缓存安全：允许跨域值依赖 Origin 时必须带 Vary
+        ctx.set("Vary", "Origin");
+
+        // 当 allow_credentials=true 时，不能返回 *
         if (opts.allow_credentials) {
+            ctx.set("Access-Control-Allow-Origin", *origin);
             ctx.set("Access-Control-Allow-Credentials", "true");
+        } else {
+            ctx.set("Access-Control-Allow-Origin",
+                (opts.allow_origins.size() == 1 && opts.allow_origins[0] == "*") ? "*" : *origin);
         }
         
         // 预检请求
         if (ctx.method == "OPTIONS") {
+            ctx.set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
             ctx.set("Access-Control-Allow-Methods", join(opts.allow_methods, ", "));
             ctx.set("Access-Control-Allow-Headers", join(opts.allow_headers, ", "));
             ctx.set("Access-Control-Max-Age", std::to_string(opts.max_age));
@@ -987,7 +1219,12 @@ inline Middleware cors(CorsOptions options) {
 }
 ```
 
-### 8.4 Rate Limit 中间件 ⏳
+**约束**：
+- `allow_credentials=true` 时，`Access-Control-Allow-Origin` 不能为 `*`
+- 建议始终设置 `Vary: Origin`，预检请求再追加方法/头相关 `Vary`
+- 预检响应建议使用 `204 No Content`
+
+### 8.4 Rate Limit 中间件 ✅
 
 ```cpp
 // rate_limit.hpp
@@ -1007,7 +1244,7 @@ app.use(rate_limit({
     .requests = 100,
     .window = std::chrono::seconds(60),
     .key_selector = [](Context& ctx) { return ctx.meta.remote_address; },
-    .on_limited = [](Context& ctx) -> Task<> {
+    .on_limited = [](Context& ctx) -> Task<void> {
         ctx.status(429);
         ctx.json({{"error", "Too Many Requests"}});
         co_return;
@@ -1015,7 +1252,7 @@ app.use(rate_limit({
 }));
 ```
 
-### 8.5 Compression 中间件 ⏳
+### 8.5 Compression 中间件 ✅（gzip）
 
 ```cpp
 // compress.hpp
@@ -1057,19 +1294,22 @@ Layer 3 只负责：
 浏览器 → Nginx (HTTPS/HTTP/2) → 反向代理 → Layer 3 (HTTP)
 ```
 
-### 9.2 输入验证 ⏳
+### 9.2 输入验证 ✅（基础版）
 
 ```cpp
-// 验证中间件
+// 验证中间件（两种重载）
 template<typename T>
 Middleware validate(std::function<bool(const T&)> validator);
+
+template<typename T>
+Middleware validate();  // 使用 reflect-cpp 元数据校验
 
 // 使用
 app.post("/users", 
     validate<UserCreateRequest>([](const auto& req) {
         return !req.name.empty() && req.name.size() <= 100;
     }),
-    [](Context& ctx) -> Task<> {
+    [](Context& ctx) -> Task<void> {
         auto user = ctx.json_as<UserCreateRequest>();
         // ...
     }
@@ -1091,7 +1331,7 @@ Middleware csrf_protection(std::string secret);
 // <input type="hidden" name="_csrf" value="{{ csrf_token }}">
 ```
 
-### 9.5 安全头 📋
+### 9.5 安全头 ✅
 
 ```cpp
 // 安全头中间件
@@ -1099,8 +1339,10 @@ Middleware security_headers() {
     return [](Context& ctx, Next next) -> Task<void> {
         ctx.set("X-Content-Type-Options", "nosniff");
         ctx.set("X-Frame-Options", "DENY");
-        ctx.set("X-XSS-Protection", "1; mode=block");
+        ctx.set("Referrer-Policy", "strict-origin-when-cross-origin");
+        ctx.set("Content-Security-Policy", "default-src 'self'");
         ctx.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+        // X-XSS-Protection 已过时，不再作为默认安全头
         co_await next();
     };
 }
@@ -1181,14 +1423,16 @@ location /api/ {
 
 ## 11. 测试策略
 
-### 11.1 单元测试 ⏳
+> 说明：以下测试片段使用 Catch2 风格（`TEST_CASE` / `REQUIRE`）描述预期行为。
+
+### 11.1 单元测试 ✅
 
 ```cpp
 // tests/router_test.cpp
 TEST_CASE("Router static path") {
     Router router;
     int called = 0;
-    router.get("/users", [&](Context& ctx) -> Task<> {
+    router.get("/users", [&](Context& ctx) -> Task<void> {
         called++;
         co_return;
     });
@@ -1200,7 +1444,7 @@ TEST_CASE("Router static path") {
 
 TEST_CASE("Router param extraction") {
     Router router;
-    router.get("/users/{id}", [](Context& ctx) -> Task<> { co_return; });
+    router.get("/users/{id}", [](Context& ctx) -> Task<void> { co_return; });
     
     auto result = router.match("GET", "/users/123");
     REQUIRE(result.has_value());
@@ -1209,7 +1453,7 @@ TEST_CASE("Router param extraction") {
 
 TEST_CASE("Router wildcard") {
     Router router;
-    router.get("/files/{path*}", [](Context& ctx) -> Task<> { co_return; });
+    router.get("/files/{path*}", [](Context& ctx) -> Task<void> { co_return; });
     
     auto result = router.match("GET", "/files/a/b/c.txt");
     REQUIRE(result.has_value());
@@ -1217,7 +1461,7 @@ TEST_CASE("Router wildcard") {
 }
 ```
 
-### 11.2 中间件测试 ⏳
+### 11.2 中间件测试 ✅
 
 ```cpp
 // tests/middleware_test.cpp
@@ -1225,17 +1469,17 @@ TEST_CASE("Middleware onion model") {
     std::vector<int> order;
     
     auto app = App();
-    app.use([&](Context& ctx, Next next) -> Task<> {
+    app.use([&](Context& ctx, Next next) -> Task<void> {
         order.push_back(1);
         co_await next();
         order.push_back(3);
     });
-    app.use([&](Context& ctx, Next next) -> Task<> {
+    app.use([&](Context& ctx, Next next) -> Task<void> {
         order.push_back(2);
         co_await next();
         order.push_back(4);
     });
-    app.get("/", [&](Context& ctx) -> Task<> {
+    app.get("/", [&](Context& ctx) -> Task<void> {
         order.push_back(5);
         co_return;
     });
@@ -1245,13 +1489,13 @@ TEST_CASE("Middleware onion model") {
 }
 ```
 
-### 11.3 集成测试 ⏳
+### 11.3 集成测试 ✅
 
 ```cpp
 // tests/integration_test.cpp
 TEST_CASE("Full request cycle") {
     auto app = App();
-    app.get("/hello", [](Context& ctx) -> Task<> {
+    app.get("/hello", [](Context& ctx) -> Task<void> {
         ctx.json({{"message", "Hello"}});
         co_return;
     });
@@ -1270,7 +1514,7 @@ TEST_CASE("Full request cycle") {
 void benchmark_router_matching(benchmark::State& state) {
     Router router;
     for (int i = 0; i < 100; ++i) {
-        router.get("/users/" + std::to_string(i), [](Context&) -> Task<> { co_return; });
+        router.get("/users/" + std::to_string(i), [](Context&) -> Task<void> { co_return; });
     }
     
     for (auto _ : state) {
@@ -1305,13 +1549,13 @@ Task<void> main_task() {
     app.use(async_uv::layer3::middleware::error_handler());
     
     // CRUD
-    app.get("/users", [](Context& ctx) -> Task<> {
+    app.get("/users", [](Context& ctx) -> Task<void> {
         std::vector<User> users = co_await db.get_all_users();
         ctx.json(users);
         co_return;
     });
     
-    app.get("/users/{id}", [](Context& ctx) -> Task<> {
+    app.get("/users/{id}", [](Context& ctx) -> Task<void> {
         auto id = ctx.param("id");
         auto user = co_await db.get_user(id);
         if (!user) {
@@ -1323,7 +1567,7 @@ Task<void> main_task() {
         co_return;
     });
     
-    app.post("/users", [](Context& ctx) -> Task<> {
+    app.post("/users", [](Context& ctx) -> Task<void> {
         auto user = ctx.json_as<User>();
         if (!user) {
             ctx.status(400);
@@ -1335,7 +1579,7 @@ Task<void> main_task() {
         co_return;
     });
     
-    app.put("/users/{id}", [](Context& ctx) -> Task<> {
+    app.put("/users/{id}", [](Context& ctx) -> Task<void> {
         auto id = ctx.param("id");
         auto user = ctx.json_as<User>();
         co_await db.update_user(id, *user);
@@ -1343,7 +1587,7 @@ Task<void> main_task() {
         co_return;
     });
     
-    app.del("/users/{id}", [](Context& ctx) -> Task<> {
+    app.del("/users/{id}", [](Context& ctx) -> Task<void> {
         auto id = ctx.param("id");
         co_await db.delete_user(id);
         ctx.status(204);
@@ -1379,7 +1623,7 @@ Task<void> require_auth(Context& ctx, Next next) {
 }
 
 // 授权中间件
-Task<void> require_role(std::string role) {
+Middleware require_role(std::string role) {
     return [role](Context& ctx, Next next) -> Task<void> {
         auto user = ctx.local<User>("user");
         if (!user || user->role != role) {
@@ -1392,12 +1636,13 @@ Task<void> require_role(std::string role) {
 }
 
 // 使用
-auto admin_router = Router();
-admin_router.use(require_auth);
-admin_router.use(require_role("admin"));
-admin_router.del("/users/{id}", [](Context& ctx) -> Task<> {
+RouteGroup admin("/admin");
+admin.use(require_auth);
+admin.use(require_role("admin"));
+admin.del("/users/{id}", [](Context& ctx) -> Task<void> {
     // 只有 admin 可以删除用户
 });
+admin.apply_to(app);
 ```
 
 ### 12.3 文件上传 ⏳
@@ -1405,7 +1650,7 @@ admin_router.del("/users/{id}", [](Context& ctx) -> Task<> {
 ```cpp
 app.post("/upload", 
     async_uv::layer3::middleware::multipart_parser(),
-    [](Context& ctx) -> Task<> {
+    [](Context& ctx) -> Task<void> {
         auto multipart = async_uv::layer3::get_multipart(ctx);
         if (!multipart) {
             ctx.status(400);
@@ -1433,12 +1678,12 @@ app.post("/upload",
 
 ```cpp
 // 计划中的 API
-app.websocket("/ws", [](WebSocket& ws) -> Task<> {
-    ws.on_message([](std::string_view msg) -> Task<> {
+app.websocket("/ws", [](WebSocket& ws) -> Task<void> {
+    ws.on_message([](std::string_view msg) -> Task<void> {
         co_await ws.send("Echo: " + std::string(msg));
     });
     
-    ws.on_close([]() -> Task<> {
+    ws.on_close([]() -> Task<void> {
         std::cout << "Client disconnected\n";
         co_return;
     });
@@ -1463,8 +1708,8 @@ public:
 };
 
 // 使用
-app.websocket("/ws", [](WebSocket& ws) -> Task<> {
-    ws.on_message([&](std::string_view msg) -> Task<> {
+app.websocket("/ws", [](WebSocket& ws) -> Task<void> {
+    ws.on_message([&](std::string_view msg) -> Task<void> {
         co_await ws.send("Echo: " + std::string(msg));
     });
 });
@@ -1487,7 +1732,7 @@ auto openapi = app.generate_openapi({
 });
 
 // 暴露文档端点
-app.get("/openapi.json", [&](Context& ctx) -> Task<> {
+app.get("/openapi.json", [&](Context& ctx) -> Task<void> {
     ctx.json(openapi);
     co_return;
 });
@@ -1499,7 +1744,7 @@ app.get("/openapi.json", [&](Context& ctx) -> Task<> {
 - 响应模式
 - 从 `reflect-cpp` 类型自动推导 schema
 
-### 13.3 请求验证 ⏳
+### 13.3 请求验证（reflect-cpp 版本）⏳
 
 ```cpp
 // 类型 + 约束验证
@@ -1509,7 +1754,7 @@ struct UserCreate {
     rfl::Field<"age", int> age;                   // > 0
 };
 
-// 验证中间件
+// 验证中间件（对应 9.2 的无参重载）
 template<typename T>
 Middleware validate() {
     return [](Context& ctx, Next next) -> Task<void> {
@@ -1534,67 +1779,180 @@ Middleware validate() {
 }
 
 // 使用
-app.post("/users", validate<UserCreate>(), [](Context& ctx) -> Task<> {
-    auto& user = ctx.local<UserCreate>("validated");
+app.post("/users", validate<UserCreate>(), [](Context& ctx) -> Task<void> {
+    auto user = ctx.local<UserCreate>("validated");
+    if (!user) {
+        ctx.status(500);
+        ctx.json({{"error", "validated payload missing"}});
+        co_return;
+    }
     // ...
 });
 ```
 
-### 13.4 依赖注入 ⏳
+### 13.4 依赖注入 ✅（增强版）
 
 ```cpp
-// 服务容器
-class ServiceContainer {
+// 简易 DI 容器（基于 reflect-cpp 字段反射）
+class Container {
 public:
-    template<typename T>
-    void register_service(std::shared_ptr<T> service);
-    
-    template<typename T>
-    std::shared_ptr<T> get();
+    template<typename T> Container& singleton(std::shared_ptr<T> instance);
+    template<typename T> Container& singleton(std::string key, std::shared_ptr<T> instance);
+    template<typename T, typename Factory> Container& singleton(Factory factory);
+    template<typename T, typename Factory> Container& singleton(std::string key, Factory factory);
+    template<typename T, typename Factory> Container& transient(Factory factory);
+    template<typename T, typename Factory> Container& transient(std::string key, Factory factory);
+
+    template<typename T> std::shared_ptr<T> resolve_shared();
+    template<typename T> std::shared_ptr<T> resolve_shared(std::string_view key);
+    template<typename T> T& resolve();
+    template<typename T> T& resolve(std::string_view key);
+    template<typename T> void inject(T& object);
+    template<typename T> void inject(T& object, std::string_view key);
 };
 
-// 通过中间件注入
-app.use([](Context& ctx, Next next) -> Task<void> {
-    ctx.set_local("db", std::make_shared<Database>());
-    ctx.set_local("cache", std::make_shared<Cache>());
-    co_await next();
+struct ControllerMountOptions {
+    std::string prefix; // 可选：覆盖控制器默认前缀
+    std::string key;    // 可选：指定命名控制器实例
+};
+
+class RouteBinder {
+public:
+    template<typename Controller>
+    RouteBinder& mount_controller(ControllerMountOptions options = {});
+};
+
+template<typename Controller>
+RouteBinder mount_controller(App& app, Container& di, ControllerMountOptions options = {});
+
+template<typename Controller>
+RouteBinder mount_controller(RouteGroup& group, Container& di, ControllerMountOptions options = {});
+
+// 用法：通过反射把字段依赖自动装配
+struct Logger {
+    int level = 0;
+};
+
+struct Repo {
+    std::shared_ptr<Logger> logger; // 自动注入
+};
+
+struct Service {
+    std::shared_ptr<Logger> logger; // 自动注入
+    Repo repo;                      // 自动注入（值类型）
+};
+
+async_uv::layer3::di::Container di;
+di.singleton<Logger>([] {
+    auto logger = std::make_shared<Logger>();
+    logger->level = 7;
+    return logger;
 });
 
-// 在 handler 中使用
-app.get("/users", [](Context& ctx) -> Task<> {
-    auto& db = ctx.local<Database>("db");
-    auto users = co_await db.get_all_users();
-    ctx.json(users);
-    co_return;
+auto service = di.resolve_shared<Service>();
+
+// 路由封装：控制器方法直接绑定（无需手写 resolve）
+struct UserController {
+    std::shared_ptr<Logger> logger;
+    Task<void> profile(Context& ctx);
+};
+
+App app;
+di::bind_routes(app, di)
+    .router("/api", [](di::RouteBinder& r) {
+        r.get<UserController>("/profile", &UserController::profile);
+    });
+
+// 路由封装：按 key 选择命名控制器
+di::bind_routes(app, di)
+    .with_key("auth")
+    .get<UserController>("/auth/profile", &UserController::profile);
+
+// 方式 1：控制器自描述挂载（推荐）
+struct AuthController {
+    static constexpr std::string_view prefix = "/auth";
+
+    static void map(di::ControllerBinder<AuthController>& r) {
+        r.post("/login", &AuthController::login);
+        r.router("/v1", [](di::ControllerBinder<AuthController>& v1) {
+            v1.get("/profile", &AuthController::profile);
+        });
+    }
+};
+
+di::mount_controller<AuthController>(app, di);
+// 实际挂载：
+// POST /auth/login
+// GET  /auth/v1/profile
+
+// 方式 2：显式覆盖前缀 + 指定 key（如多租户/多角色控制器）
+di::mount_controller<AuthController>(app, di, {
+    .prefix = "/api/secure/auth",
+    .key = "tenant-a"
 });
+
+// 方式 3：兼容旧映射签名（无需立即迁移）
+struct LegacyController {
+    static void map(di::RouteBinder& r) {
+        r.get<LegacyController>("/ping", &LegacyController::ping);
+    }
+};
+di::mount_controller<LegacyController>(app, di, {.prefix = "/legacy"});
 ```
 
-### 13.5 生命周期钩子 ⏳
+当前实现约束：
+
+1. 默认按 `singleton` 自动构造未注册类型（要求可默认构造）。
+2. 自动注入优先支持 `std::shared_ptr<T>`、`T*`、聚合值类型字段。
+3. 检测循环依赖并抛出错误，避免递归构造导致栈溢出。
+4. 非聚合类型（如显式构造函数复杂对象）建议显式注册 `singleton/transient` 工厂。
+5. 容器内部使用互斥锁保护注册与解析，支持并发场景下的基本安全访问。
+6. 支持字符串 key 的命名绑定，可管理同类型多实例（如 `singleton<RedisClient>("main", ...)` 与 `singleton<RedisClient>("cache", ...)`）。
+7. `RouteBinder::with_key("...")` 可让路由按命名实例解析控制器；未命中 key 时回退默认绑定。
+8. `inject(obj, key)` 支持按 key 注入字段依赖，未命中 key 时回退默认绑定。
+9. 已补充并发压力测试（多线程重复 `resolve_shared`）验证单例稳定性。
+10. `mount_controller` 的前缀解析优先级：`options.prefix` > `Controller::prefix` > 当前挂载点（空前缀）。
+11. `mount_controller` 的 key 行为：指定 `options.key` 时优先解析命名绑定，未命中时回退默认绑定。
+12. 控制器映射函数支持两种签名：`static map(di::ControllerBinder<Controller>&)`（推荐）与 `static map(di::RouteBinder&)`（兼容）。
+13. `ControllerBinder<Controller>` 固定控制器类型后可省略重复模板参数，适合嵌套路由声明。
+
+示例（命名绑定）：
 
 ```cpp
-// 服务器生命周期钩子
-struct LifeCycle {
-    std::function<Task<void>()> on_start;    // 启动后
-    std::function<Task<void>()> on_stop;     // 停止前
-    std::function<void(Context&)> on_error;  // 错误时
-};
+di::Container c;
+c.singleton<Logger>("auth", [] { return std::make_shared<Logger>(); });
+c.singleton<Logger>("admin", [] { return std::make_shared<Logger>(); });
 
-App& with_lifecycle(LifeCycle lifecycle);
+auto auth_logger = c.resolve_shared<Logger>("auth");
+auto admin_logger = c.resolve_shared<Logger>("admin");
+```
+
+示例（全局 / 线程局部容器）：
+
+```cpp
+auto& global = di::global_di();         // 进程级唯一容器
+auto& local = di::thread_local_di();    // 线程局部容器
+```
+
+### 13.5 生命周期钩子 ✅（基础版）
+
+```cpp
+// 生命周期结构定义与接口见 2.9
 
 // 使用
 app.with_lifecycle({
-    .on_start = []() -> Task<> {
+    .on_start = []() -> Task<void> {
         std::cout << "Server started\n";
         co_return;
     },
-    .on_stop = []() -> Task<> {
+    .on_stop = []() -> Task<void> {
         std::cout << "Server shutting down\n";
         co_return;
     }
 });
 ```
 
-### 13.6 路由元数据 ⏳
+### 13.6 路由元数据 ✅
 
 ```cpp
 // 每个路由附加元数据（用于 OpenAPI、权限等）
@@ -1632,17 +1990,19 @@ layer3/
 │       ├── router.hpp             # ✅ Router 接口
 │       ├── router_node.hpp        # ✅ Radix Tree
 │       ├── middleware.hpp         # ✅ 内置中间件
-│       ├── body_parser.hpp        # ⏳ 请求体解析
-│       ├── multipart.hpp          # ⏳ Multipart 解析
-│       └── error.hpp              # ⏳ 错误定义
+│       ├── di.hpp                 # ✅ 简易依赖注入容器
+│       ├── body_limit.hpp         # ✅ 请求体大小限制
+│       ├── multipart_parser.hpp   # ✅ Multipart 解析
+│       └── error.hpp              # ✅ 错误定义
 ├── src/
 │   ├── app.cpp                    # ✅
 │   └── router.cpp                 # ✅
 └── tests/
-    ├── router_test.cpp            # ⏳
-    ├── middleware_test.cpp        # ⏳
-    ├── multipart_test.cpp         # ⏳
-    └── integration_test.cpp       # ⏳
+    ├── router_test.cpp            # ✅
+    ├── form_parser_test.cpp       # ✅
+    ├── multipart_parser_test.cpp  # ✅
+    ├── integration_test.cpp       # ✅
+    └── middleware_test.cpp        # ⏳（计划补充）
 ```
 
 ---
@@ -1681,29 +2041,51 @@ target_link_libraries(your_app PRIVATE async_uv::layer3)
 #include <async_uv_layer3/router.hpp>
 #include <async_uv_layer3/context.hpp>
 #include <async_uv_layer3/middleware.hpp>
+#include <async_uv_layer3/di.hpp>
 ```
 
 ---
 
-## 实现进度总览
+## 16. 附录：错误标识注册表
+
+> 用于统一 `code` 字段命名，避免不同模块重复定义或语义漂移。
+
+| code | HTTP 状态码 | biz_code | 含义 |
+|------|-------------|----------|------|
+| `ROUTE_NOT_FOUND` | 404 | `null` | 路由不存在 |
+| `METHOD_NOT_ALLOWED` | 405 | `null` | 路径存在但方法不允许 |
+| `INVALID_JSON` | 400 | `10001` | JSON 解析失败 |
+| `MISSING_FIELD` | 400 | `10002` | 缺少必填字段 |
+| `INVALID_FIELD` | 400 | `10003` | 字段格式或约束不合法 |
+| `INVALID_TOKEN` | 401 | `11001` | 鉴权令牌无效 |
+| `TOKEN_EXPIRED` | 401 | `11002` | 鉴权令牌已过期 |
+| `RESOURCE_NOT_FOUND` | 404 | `14001` | 业务资源不存在 |
+| `DATABASE_ERROR` | 500 | `15001` | 数据库异常 |
+| `EXTERNAL_SERVICE_ERROR` | 500 | `15002` | 外部依赖服务异常 |
+| `INTERNAL_ERROR` | 500 | `null` | 未分类的内部错误 |
+
+---
+
+## 设计进度总览（文档视角）
 
 | 模块 | 状态 | 完成度 |
 |------|------|--------|
-| Router (Radix Tree) | ✅ | 100% |
-| Context | ✅ | 100% |
-| App | ✅ | 100% |
-| 洋葱模型 | ✅ | 100% |
-| JSON 序列化 | ✅ | 100% |
-| logger 中间件 | ✅ | 100% |
-| error_handler 中间件 | ✅ | 100% |
-| form_parser 中间件 | ⏳ | 0% |
-| multipart_parser | ⏳ | 0% |
-| CORS 中间件 | ⏳ | 0% |
-| Rate limit 中间件 | ⏳ | 0% |
-| 单元测试 | ⏳ | 0% |
-| 集成测试 | ⏳ | 0% |
+| Router (Radix Tree) | ✅ | 核心规范已定义 |
+| Context | ✅ | 核心规范已定义 |
+| App | ✅ | 核心规范已定义 |
+| 洋葱模型 | ✅ | 规范已定义 |
+| JSON 序列化 | ✅ | 规范已定义 |
+| logger 中间件 | ✅ | 规范已定义 |
+| error_handler 中间件 | ✅ | 规范已定义（含 `request_id`/`trace_id` 约束） |
+| form_parser 中间件 | ✅ | 规范已定义 |
+| multipart_parser | ✅ | 规范已定义 |
+| CORS 中间件 | ✅ | 规范已定义（含缓存与凭证约束） |
+| Rate limit 中间件 | ✅ | 规范已定义 |
+| 单元测试 | ✅ | 核心测试策略已定义 |
+| 集成测试 | ✅ | 关键链路测试策略已定义 |
 | 性能基准 | ⏳ | 0% |
-| 错误码定义 | ⏳ | 0% |
-| 路由组 | ⏳ | 0% |
-| 生命周期钩子 | ⏳ | 0% |
+| 错误码定义 | ✅ | 分层模型已定义 |
+| 路由组 | ✅ | 核心语义与组合边界已定义 |
+| 依赖注入 | ✅ | 基础容器已接入（singleton/transient/自动注入/循环检测） |
+| 生命周期钩子 | ✅ | 基础钩子已接入（`on_start`/`on_stop`/`on_error`） |
 | WebSocket | 📋 | 规划中 |
