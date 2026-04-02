@@ -13,10 +13,25 @@ namespace detail {
 
 inline std::string percent_decode_component(std::string_view text) {
     size_t first_percent = text.find('%');
-    if (first_percent == std::string_view::npos) {
+    size_t first_plus = text.find('+');
+    if (first_percent == std::string_view::npos && first_plus == std::string_view::npos) {
         return std::string(text);
     }
-    return ada::unicode::percent_decode(text, first_percent);
+
+    std::string normalized(text);
+    if (first_plus != std::string_view::npos) {
+        for (char& ch : normalized) {
+            if (ch == '+') {
+                ch = ' ';
+            }
+        }
+    }
+
+    first_percent = normalized.find('%');
+    if (first_percent == std::string::npos) {
+        return normalized;
+    }
+    return ada::unicode::percent_decode(normalized, first_percent);
 }
 
 inline std::map<std::string, std::string> parse_form_data(std::string_view body) {
@@ -60,7 +75,7 @@ inline Task<void> form_parser(Context& ctx, Next next) {
     if (content_type) {
         std::string_view ct = *content_type;
         if (ct.find("application/x-www-form-urlencoded") != std::string_view::npos) {
-            auto form_data = detail::parse_form_data(ctx.body);
+            auto form_data = async_uv::layer3::detail::parse_form_data(ctx.body);
             ctx.set_local<std::map<std::string, std::string>>("form_data", std::move(form_data));
         }
     }
@@ -88,9 +103,8 @@ inline bool has_form_data(Context& ctx) {
     return ctx.local<std::map<std::string, std::string>>("form_data").has_value();
 }
 
-inline const std::map<std::string, std::string>* all_form_data(Context& ctx) {
-    auto form_data = ctx.local<std::map<std::string, std::string>>("form_data");
-    return form_data.has_value() ? &*form_data : nullptr;
+inline std::optional<std::map<std::string, std::string>> all_form_data(Context& ctx) {
+    return ctx.local<std::map<std::string, std::string>>("form_data");
 }
 
 } // namespace async_uv::layer3

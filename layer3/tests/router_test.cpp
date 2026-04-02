@@ -1,8 +1,11 @@
 #include <cassert>
+#include <algorithm>
+#include <stdexcept>
 #include <iostream>
 #include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <async_uv/task.h>
 #include <async_uv_layer3/router.hpp>
@@ -124,6 +127,21 @@ TEST(router_mixed) {
     assert(result->params.at("post_id") == "456");
 }
 
+TEST(router_priority_registration_order) {
+    Router router;
+    router.get("/users/{id}", mock_handler);
+    router.get("/users/profile", mock_handler);
+    router.get("/users/{path*}", mock_handler);
+
+    auto result = router.match("GET", "/users/profile");
+    assert(result.has_value());
+    assert(result->params.empty());
+
+    result = router.match("GET", "/users/123");
+    assert(result.has_value());
+    assert(result->params.at("id") == "123");
+}
+
 // 测试不同 HTTP 方法
 TEST(router_methods) {
     Router router;
@@ -144,6 +162,15 @@ TEST(router_methods) {
     assert(!router.match("OPTIONS", "/resource").has_value());
 }
 
+TEST(router_all_method) {
+    Router router;
+    router.all("/health", mock_handler);
+
+    assert(router.match("GET", "/health").has_value());
+    assert(router.match("POST", "/health").has_value());
+    assert(router.match("HEAD", "/health").has_value());
+}
+
 // 测试子路由
 TEST(router_sub_router) {
     Router api_router;
@@ -162,6 +189,10 @@ TEST(router_sub_router) {
     
     // 不匹配根路径
     result = router.match("GET", "/users");
+    assert(!result.has_value());
+
+    // 不应匹配 /api2 前缀
+    result = router.match("GET", "/api2/users");
     assert(!result.has_value());
 }
 
@@ -187,6 +218,103 @@ TEST(router_node_types) {
     assert(wild_child->type == RouterNode<Handler>::Type::WILDCARD);
 }
 
+TEST(router_path_normalization) {
+    Router router;
+    router.get("/users///{id}/", mock_handler);
+    router.get("/", mock_handler);
+
+    auto result = router.match("GET", "//users//123/?a=1#part");
+    assert(result.has_value());
+    assert(result->params.at("id") == "123");
+
+    assert(router.match("GET", "").has_value());
+    assert(router.match("GET", "?a=1").has_value());
+    assert(router.match("GET", "#frag").has_value());
+}
+
+TEST(router_duplicate_registration_rejected) {
+    Router router;
+    router.get("/users/", mock_handler);
+
+    bool duplicate_thrown = false;
+    try {
+        router.get("/users", mock_handler);
+    } catch (const std::invalid_argument&) {
+        duplicate_thrown = true;
+    }
+    assert(duplicate_thrown);
+
+    Router wildcard_router;
+    wildcard_router.all("/health", mock_handler);
+    duplicate_thrown = false;
+    try {
+        wildcard_router.get("/health", mock_handler);
+    } catch (const std::invalid_argument&) {
+        duplicate_thrown = true;
+    }
+    assert(duplicate_thrown);
+}
+
+TEST(router_allowed_methods) {
+    Router router;
+    router.get("/resource", mock_handler);
+    router.post("/resource", mock_handler);
+
+    auto methods = router.allowed_methods("/resource/");
+    assert(methods.size() == 3);
+    assert(methods[0] == "GET");
+    assert(methods[1] == "HEAD");
+    assert(methods[2] == "POST");
+
+    Router wildcard_router;
+    wildcard_router.all("/health", mock_handler);
+    auto wildcard_methods = wildcard_router.allowed_methods("/health");
+    assert(!wildcard_methods.empty());
+    assert(std::find(wildcard_methods.begin(), wildcard_methods.end(), "GET") != wildcard_methods.end());
+    assert(std::find(wildcard_methods.begin(), wildcard_methods.end(), "HEAD") != wildcard_methods.end());
+    assert(std::find(wildcard_methods.begin(), wildcard_methods.end(), "OPTIONS") != wildcard_methods.end());
+}
+
+TEST(router_route_list_and_meta) {
+    Router router;
+    Router::RouteMeta meta;
+    meta.name = "get_user";
+    meta.description = "Get user by id";
+    meta.tags = {"users"};
+    meta.require_auth = true;
+
+    router.get("/users/{id}", mock_handler, meta);
+    router.post("/users", mock_handler);
+
+    auto routes = router.routes();
+    assert(routes.size() == 2);
+
+    bool found_get_user = false;
+    for (const auto& route : routes) {
+        if (route.method == "GET" && route.pattern == "/users/{id}") {
+            found_get_user = true;
+            assert(route.meta.name == "get_user");
+            assert(route.meta.require_auth);
+            assert(route.param_names.size() == 1);
+            assert(route.param_names[0] == "id");
+        }
+    }
+    assert(found_get_user);
+}
+
+TEST(router_route_list_with_subrouter) {
+    Router api;
+    api.get("/health", mock_handler);
+
+    Router parent;
+    parent.route("/api", std::move(api));
+
+    auto routes = parent.routes();
+    assert(routes.size() == 1);
+    assert(routes[0].pattern == "/api/health");
+    assert(routes[0].method == "GET");
+}
+
 int main() {
     std::cout << "=== Router Tests ===\n";
     
@@ -194,9 +322,16 @@ int main() {
     RUN_TEST(router_param);
     RUN_TEST(router_wildcard);
     RUN_TEST(router_mixed);
+    RUN_TEST(router_priority_registration_order);
     RUN_TEST(router_methods);
+    RUN_TEST(router_all_method);
     RUN_TEST(router_sub_router);
     RUN_TEST(router_node_types);
+    RUN_TEST(router_path_normalization);
+    RUN_TEST(router_duplicate_registration_rejected);
+    RUN_TEST(router_allowed_methods);
+    RUN_TEST(router_route_list_and_meta);
+    RUN_TEST(router_route_list_with_subrouter);
     
     std::cout << "\nAll tests passed!\n";
     return 0;

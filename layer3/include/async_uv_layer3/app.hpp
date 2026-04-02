@@ -2,12 +2,14 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
 
 #include <async_uv_layer3/context.hpp>
+#include <async_uv_layer3/lifecycle.hpp>
 #include <async_uv_layer3/router.hpp>
 #include <async_uv_layer3/stream.hpp>
 #include <async_uv/task.h>
@@ -15,6 +17,8 @@
 #include <async_uv_http/server.h>
 
 namespace async_uv::layer3 {
+
+class RouteGroup;
 
 class App {
 public:
@@ -33,11 +37,23 @@ public:
     App& put(std::string_view pattern, Handler handler);
     App& del(std::string_view pattern, Handler handler);
     App& patch(std::string_view pattern, Handler handler);
+    App& all(std::string_view pattern, Handler handler);
+
+    App& get(std::string_view pattern, Handler handler, Router::RouteMeta meta);
+    App& post(std::string_view pattern, Handler handler, Router::RouteMeta meta);
+    App& put(std::string_view pattern, Handler handler, Router::RouteMeta meta);
+    App& del(std::string_view pattern, Handler handler, Router::RouteMeta meta);
+    App& patch(std::string_view pattern, Handler handler, Router::RouteMeta meta);
+    App& all(std::string_view pattern, Handler handler, Router::RouteMeta meta);
 
     App& route(std::string_view prefix, Router sub_router);
+    App& router(std::string_view prefix, std::function<void(RouteGroup&)> builder);
+
+    std::vector<Router::RouteInfo> routes() const;
 
     App& with_limits(http::ServerLimits limits);
     App& with_policy(http::ServerConnectionPolicy policy);
+    App& with_lifecycle(Lifecycle lifecycle);
 
     Task<void> listen(uint16_t port, std::string_view host = "0.0.0.0");
 
@@ -62,6 +78,7 @@ private:
     Router router_;
     http::ServerLimits limits_;
     http::ServerConnectionPolicy policy_;
+    std::optional<Lifecycle> lifecycle_;
 };
 
 App app();

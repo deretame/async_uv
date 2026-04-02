@@ -51,6 +51,19 @@ TEST(form_parser_encoded) {
     assert(form_data->at("email") == "test@example.com");
 }
 
+TEST(form_parser_plus_as_space) {
+    std::string body = "query=hello+world&name=Alice+Bob";
+    auto ctx = make_context(body, "application/x-www-form-urlencoded");
+
+    Next next = []() -> async_uv::Task<void> { co_return; };
+    async_simple::coro::syncAwait(middleware::form_parser(ctx, next));
+
+    auto form_data = ctx.local<std::map<std::string, std::string>>("form_data");
+    assert(form_data.has_value());
+    assert(form_data->at("query") == "hello world");
+    assert(form_data->at("name") == "Alice Bob");
+}
+
 TEST(form_parser_empty_value) {
     std::string body = "key1=&key2=value";
     auto ctx = make_context(body, "application/x-www-form-urlencoded");
@@ -92,6 +105,10 @@ TEST(form_field_helper) {
     
     auto missing = form_field(ctx, "nonexistent");
     assert(!missing.has_value());
+
+    auto all = all_form_data(ctx);
+    assert(all.has_value());
+    assert(all->size() == 2);
 }
 
 int main() {
@@ -99,6 +116,7 @@ int main() {
     
     RUN_TEST(form_parser_basic);
     RUN_TEST(form_parser_encoded);
+    RUN_TEST(form_parser_plus_as_space);
     RUN_TEST(form_parser_empty_value);
     RUN_TEST(form_parser_wrong_content_type);
     RUN_TEST(form_field_helper);

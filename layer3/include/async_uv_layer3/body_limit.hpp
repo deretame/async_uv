@@ -14,7 +14,7 @@ struct BodyLimitOptions {
 inline Task<void> body_limit(Context& ctx, BodyLimitOptions options, Next next) {
     if (ctx.body_size > options.max_bytes) {
         if (options.reject_on_limit) {
-            throw HttpError(ErrorCode::PayloadTooLarge,
+            throw FrameworkError(ErrorCode::PayloadTooLarge,
                 "Request body too large",
                 "Maximum allowed: " + std::to_string(options.max_bytes) + " bytes");
         }

@@ -35,36 +35,65 @@ public:
     static constexpr char WILDCARD_CHAR = '*';
 
     static constexpr Type classify(std::string_view segment) {
-        if (segment.empty()) return Type::STATIC;
-        if (segment[0] == PARAM_CHAR) {
-            if (segment.size() > 1 && segment.back() == '*') {
+        if (segment.empty()) {
+            return Type::STATIC;
+        }
+        if (segment[0] != PARAM_CHAR) {
+            return Type::STATIC;
+        }
+
+        // Canonical syntax: {name} / {name*}
+        if (segment.size() >= 2 && segment.back() == '}') {
+            const std::string_view inner = segment.substr(1, segment.size() - 2);
+            if (!inner.empty() && inner.back() == '*') {
                 return Type::WILDCARD;
             }
             return Type::PARAM;
         }
-        return Type::STATIC;
+
+        // Backward-compatible fallback: "{name*"
+        if (segment.size() > 1 && segment.back() == '*') {
+            return Type::WILDCARD;
+        }
+        return Type::PARAM;
     }
 
     static constexpr std::pair<std::string_view, std::string_view> parse_param_segment(std::string_view segment) {
         if (segment.empty() || segment[0] != PARAM_CHAR) {
             return {segment, ""};
         }
-        
+
+        // Canonical syntax: {name} / {name*}
+        if (segment.size() >= 2 && segment.back() == '}') {
+            std::string_view inner = segment.substr(1, segment.size() - 2);
+            if (!inner.empty() && inner.back() == '*') {
+                inner = inner.substr(0, inner.size() - 1);
+            }
+            return {"", inner};
+        }
+
+        // Backward-compatible fallback: "{name*"
         if (segment.size() > 1 && segment.back() == '*') {
             return {"", segment.substr(1, segment.size() - 2)};
         }
-        
-        size_t end = segment.find('}');
+
+        const size_t end = segment.find('}');
         if (end == std::string_view::npos) {
             return {segment, ""};
         }
-        
         return {"", segment.substr(1, end - 1)};
     }
 
     RouterNode* add_child(std::string_view path, Type type, std::string param_name = "") {
         for (auto& child : children) {
             if (child->type != type) continue;
+
+            if (type == Type::PARAM || type == Type::WILDCARD) {
+                if (child->param_name.empty() && !param_name.empty()) {
+                    child->param_name = param_name;
+                }
+                return child.get();
+            }
             
             if (type == Type::STATIC) {
                 size_t common = common_prefix(child->prefix, path);
@@ -109,54 +138,136 @@ public:
         std::string_view remaining = path;
         
         while (!remaining.empty()) {
-            bool matched = false;
-            
-            for (const auto& child : node->children) {
-                switch (child->type) {
-                    case Type::STATIC: {
-                        if (remaining.size() >= child->prefix.size() && 
-                            remaining.substr(0, child->prefix.size()) == child->prefix) {
+            if (!remaining.empty() && remaining.front() == '/') {
+                remaining = remaining.substr(1);
+                continue;
+            }
+
+            auto try_match = [&](Type expected) -> bool {
+                for (const auto& child : node->children) {
+                    if (child->type != expected) {
+                        continue;
+                    }
+
+                    if (expected == Type::STATIC) {
+                        if (remaining.size() >= child->prefix.size()
+                            && remaining.substr(0, child->prefix.size()) == child->prefix) {
                             remaining = remaining.substr(child->prefix.size());
                             node = child.get();
-                            matched = true;
+                            return true;
                         }
-                        break;
+                        continue;
                     }
-                    case Type::PARAM: {
+
+                    if (expected == Type::PARAM) {
                         size_t slash_pos = remaining.find('/');
-                        std::string_view value = (slash_pos == std::string_view::npos) 
+                        std::string_view value = (slash_pos == std::string_view::npos)
                             ? remaining : remaining.substr(0, slash_pos);
-                        
                         if (!value.empty()) {
                             params.emplace_back(child->param_name, std::string(value));
-                            remaining = (slash_pos == std::string_view::npos) 
+                            remaining = (slash_pos == std::string_view::npos)
                                 ? std::string_view{} : remaining.substr(slash_pos);
                             node = child.get();
-                            matched = true;
+                            return true;
                         }
-                        break;
+                        continue;
                     }
-                    case Type::WILDCARD: {
-                        params.emplace_back(child->param_name, std::string(remaining));
-                        remaining = {};
-                        node = child.get();
-                        matched = true;
-                        break;
-                    }
+
+                    params.emplace_back(child->param_name, std::string(remaining));
+                    remaining = {};
+                    node = child.get();
+                    return true;
                 }
-                
-                if (matched) break;
+                return false;
+            };
+
+            bool matched = try_match(Type::STATIC) || try_match(Type::PARAM) || try_match(Type::WILDCARD);
+            if (!matched) {
+                break;
             }
-            
-            if (!matched) break;
         }
         
-        auto it = node->handlers.find(std::string(method));
-        if (it != node->handlers.end() && remaining.empty()) {
-            return MatchResult{it->second, std::move(params)};
+        if (remaining.empty()) {
+            std::string method_key(method);
+            auto it = node->handlers.find(method_key);
+            if (it != node->handlers.end()) {
+                return MatchResult{it->second, std::move(params)};
+            }
+
+            it = node->handlers.find("*");
+            if (it != node->handlers.end()) {
+                return MatchResult{it->second, std::move(params)};
+            }
         }
-        
+
         return std::nullopt;
+    }
+
+    const RouterNode* match_node(std::string_view path) const {
+        const RouterNode* node = this;
+        std::string_view remaining = path;
+
+        while (!remaining.empty()) {
+            if (!remaining.empty() && remaining.front() == '/') {
+                remaining = remaining.substr(1);
+                continue;
+            }
+
+            bool matched = false;
+
+            for (const auto& child : node->children) {
+                if (child->type != Type::STATIC) {
+                    continue;
+                }
+                if (remaining.size() >= child->prefix.size()
+                    && remaining.substr(0, child->prefix.size()) == child->prefix) {
+                    remaining = remaining.substr(child->prefix.size());
+                    node = child.get();
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) {
+                continue;
+            }
+
+            for (const auto& child : node->children) {
+                if (child->type != Type::PARAM) {
+                    continue;
+                }
+                size_t slash_pos = remaining.find('/');
+                std::string_view value = (slash_pos == std::string_view::npos)
+                    ? remaining : remaining.substr(0, slash_pos);
+                if (value.empty()) {
+                    continue;
+                }
+
+                remaining = (slash_pos == std::string_view::npos)
+                    ? std::string_view{} : remaining.substr(slash_pos);
+                node = child.get();
+                matched = true;
+                break;
+            }
+            if (matched) {
+                continue;
+            }
+
+            for (const auto& child : node->children) {
+                if (child->type != Type::WILDCARD) {
+                    continue;
+                }
+                remaining = {};
+                node = child.get();
+                matched = true;
+                break;
+            }
+
+            if (!matched) {
+                return nullptr;
+            }
+        }
+
+        return remaining.empty() ? node : nullptr;
     }
 
 private:

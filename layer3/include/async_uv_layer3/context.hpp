@@ -1,13 +1,17 @@
 #pragma once
 
 #include <any>
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <rfl.hpp>
@@ -74,12 +78,12 @@ struct Context : http::ServerRequest {
 
     template<typename T>
     void json(const T& obj) {
-        response.headers.push_back({"Content-Type", "application/json"});
+        set("Content-Type", "application/json");
         response.body = rfl::json::write(obj);
     }
 
     void json_raw(std::string body_content) {
-        response.headers.push_back({"Content-Type", "application/json"});
+        set("Content-Type", "application/json");
         response.body = std::move(body_content);
     }
 
@@ -88,6 +92,12 @@ struct Context : http::ServerRequest {
     }
 
     void set(std::string_view name, std::string_view value) {
+        for (auto& h : response.headers) {
+            if (iequals_ascii(h.name, name)) {
+                h.value = std::string(value);
+                return;
+            }
+        }
         response.headers.push_back({std::string(name), std::string(value)});
     }
 
@@ -122,7 +132,7 @@ struct Context : http::ServerRequest {
     }
 
     void content_type(std::string_view type) {
-        response.headers.push_back({"Content-Type", std::string(type)});
+        set("Content-Type", type);
     }
 
     void send(std::string body_content, int code = 200) {
@@ -133,6 +143,74 @@ struct Context : http::ServerRequest {
     void send_status(int code) {
         response.status_code = code;
         response.body = "";
+    }
+
+    static std::string_view mime_type(std::string_view path) {
+        static const std::unordered_map<std::string_view, std::string_view> kMime = {
+            {".html", "text/html"},
+            {".htm", "text/html"},
+            {".css", "text/css"},
+            {".js", "application/javascript"},
+            {".json", "application/json"},
+            {".txt", "text/plain"},
+            {".xml", "application/xml"},
+            {".csv", "text/csv"},
+            {".pdf", "application/pdf"},
+            {".png", "image/png"},
+            {".jpg", "image/jpeg"},
+            {".jpeg", "image/jpeg"},
+            {".gif", "image/gif"},
+            {".svg", "image/svg+xml"},
+            {".webp", "image/webp"},
+            {".ico", "image/x-icon"},
+            {".mp4", "video/mp4"},
+            {".mp3", "audio/mpeg"},
+            {".wav", "audio/wav"},
+            {".woff", "font/woff"},
+            {".woff2", "font/woff2"}
+        };
+
+        const auto dot = path.find_last_of('.');
+        if (dot == std::string_view::npos) {
+            return "application/octet-stream";
+        }
+        std::string ext(path.substr(dot));
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        const std::string_view ext_view(ext);
+        auto it = kMime.find(ext_view);
+        if (it == kMime.end()) {
+            return "application/octet-stream";
+        }
+        return it->second;
+    }
+
+    void send_file(const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            status(404);
+            json_raw("{\"error\":\"Not Found\"}");
+            return;
+        }
+
+        response.body.assign(
+            std::istreambuf_iterator<char>(in),
+            std::istreambuf_iterator<char>());
+        if (!has_response_header("Content-Type")) {
+            content_type(mime_type(path.string()));
+        }
+    }
+
+    void download(const std::filesystem::path& path, std::string_view filename = {}) {
+        send_file(path);
+        if (response.status_code >= 400) {
+            return;
+        }
+
+        std::string out_name = filename.empty() ? path.filename().string() : std::string(filename);
+        set("Content-Disposition", "attachment; filename=\"" + out_name + "\"");
     }
 
     void stream(StreamHandler handler) {
@@ -181,20 +259,35 @@ struct Context : http::ServerRequest {
 
     std::optional<std::string> header(std::string_view name) const {
         for (const auto& h : headers) {
-            if (h.name.size() == name.size()) {
-                bool match = true;
-                for (size_t i = 0; i < name.size(); ++i) {
-                    char a = std::tolower(static_cast<unsigned char>(h.name[i]));
-                    char b = std::tolower(static_cast<unsigned char>(name[i]));
-                    if (a != b) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return h.value;
+            if (iequals_ascii(h.name, name)) {
+                return h.value;
             }
         }
         return std::nullopt;
+    }
+
+private:
+    static bool iequals_ascii(std::string_view a, std::string_view b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); ++i) {
+            const char x = static_cast<char>(std::tolower(static_cast<unsigned char>(a[i])));
+            const char y = static_cast<char>(std::tolower(static_cast<unsigned char>(b[i])));
+            if (x != y) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool has_response_header(std::string_view name) const {
+        for (const auto& h : response.headers) {
+            if (iequals_ascii(h.name, name)) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 

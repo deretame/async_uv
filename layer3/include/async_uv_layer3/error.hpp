@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -23,6 +25,29 @@ enum class ErrorCode {
     NotImplemented = 501,
     ServiceUnavailable = 503,
     GatewayTimeout = 504,
+};
+
+enum class HttpError : int {
+    BadRequest = 400,
+    Unauthorized = 401,
+    Forbidden = 403,
+    NotFound = 404,
+    MethodNotAllowed = 405,
+    PayloadTooLarge = 413,
+    UnsupportedMediaType = 415,
+    TooManyRequests = 429,
+    InternalServerError = 500,
+};
+
+enum class BizError : int {
+    InvalidJson = 10001,
+    MissingField = 10002,
+    InvalidField = 10003,
+    InvalidToken = 11001,
+    TokenExpired = 11002,
+    ResourceNotFound = 14001,
+    DatabaseError = 15001,
+    ExternalServiceError = 15002,
 };
 
 struct Error {
@@ -96,6 +121,48 @@ struct Error {
     }
 };
 
+inline std::string error_code_name(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::Ok: return "OK";
+        case ErrorCode::BadRequest: return "BAD_REQUEST";
+        case ErrorCode::Unauthorized: return "UNAUTHORIZED";
+        case ErrorCode::Forbidden: return "FORBIDDEN";
+        case ErrorCode::NotFound: return "ROUTE_NOT_FOUND";
+        case ErrorCode::MethodNotAllowed: return "METHOD_NOT_ALLOWED";
+        case ErrorCode::Conflict: return "CONFLICT";
+        case ErrorCode::PayloadTooLarge: return "PAYLOAD_TOO_LARGE";
+        case ErrorCode::UnsupportedMediaType: return "UNSUPPORTED_MEDIA_TYPE";
+        case ErrorCode::UnprocessableEntity: return "INVALID_FIELD";
+        case ErrorCode::TooManyRequests: return "TOO_MANY_REQUESTS";
+        case ErrorCode::InternalServerError: return "INTERNAL_ERROR";
+        case ErrorCode::NotImplemented: return "NOT_IMPLEMENTED";
+        case ErrorCode::ServiceUnavailable: return "SERVICE_UNAVAILABLE";
+        case ErrorCode::GatewayTimeout: return "GATEWAY_TIMEOUT";
+    }
+    return "INTERNAL_ERROR";
+}
+
+inline std::optional<int> error_biz_code(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::BadRequest:
+            return static_cast<int>(BizError::InvalidJson);
+        case ErrorCode::UnprocessableEntity:
+            return static_cast<int>(BizError::InvalidField);
+        case ErrorCode::Unauthorized:
+            return static_cast<int>(BizError::InvalidToken);
+        default:
+            return std::nullopt;
+    }
+}
+
+struct AppError {
+    HttpError http_error;
+    std::string code;
+    std::optional<BizError> biz_error;
+    std::string message;
+    std::optional<std::string> detail;
+};
+
 namespace errors {
 
 inline Error bad_request(std::string message = "", std::string details = "") {
@@ -164,4 +231,12 @@ struct FrameworkError : public std::runtime_error {
         , error(std::move(err)) {}
 };
 
-}
+struct AppErrorException : public std::runtime_error {
+    AppError error;
+
+    explicit AppErrorException(AppError err)
+        : std::runtime_error(err.message.empty() ? "Application error" : err.message)
+        , error(std::move(err)) {}
+};
+
+} // namespace async_uv::layer3

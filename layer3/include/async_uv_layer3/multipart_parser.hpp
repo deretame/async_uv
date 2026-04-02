@@ -80,6 +80,10 @@ inline std::unordered_map<std::string, std::string> parse_content_disposition(st
     
     while (!rest.empty()) {
         rest = trim_space(rest);
+        while (!rest.empty() && rest.front() == ';') {
+            rest = rest.substr(1);
+            rest = trim_space(rest);
+        }
         if (rest.empty()) break;
         
         pos = rest.find('=');
@@ -90,7 +94,7 @@ inline std::unordered_map<std::string, std::string> parse_content_disposition(st
             continue;
         }
         
-        std::string key(rest.substr(0, pos));
+        std::string key(trim_space(rest.substr(0, pos)));
         rest = rest.substr(pos + 1);
         rest = trim_space(rest);
         

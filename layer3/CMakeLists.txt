@@ -22,6 +22,8 @@ if(NOT TARGET reflectcpp::reflectcpp)
     endif()
 endif()
 
+find_package(ZLIB QUIET)
+
 add_library(async_uv_layer3
     src/router.cpp
     src/app.cpp
@@ -41,21 +43,32 @@ target_link_libraries(async_uv_layer3
         reflectcpp::reflectcpp
 )
 
+if(ZLIB_FOUND)
+    target_link_libraries(async_uv_layer3 PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(async_uv_layer3 PUBLIC ASYNC_UV_LAYER3_HAS_ZLIB=1)
+else()
+    target_compile_definitions(async_uv_layer3 PUBLIC ASYNC_UV_LAYER3_HAS_ZLIB=0)
+endif()
+
 target_compile_features(async_uv_layer3 PUBLIC cxx_std_23)
 
 # Tests
 if(ASYNC_UV_BUILD_TESTS)
     add_executable(router_test tests/router_test.cpp)
     target_link_libraries(router_test PRIVATE async_uv_layer3)
+    target_compile_options(router_test PRIVATE -UNDEBUG)
     
     add_executable(form_parser_test tests/form_parser_test.cpp)
     target_link_libraries(form_parser_test PRIVATE async_uv_layer3)
+    target_compile_options(form_parser_test PRIVATE -UNDEBUG)
     
     add_executable(multipart_parser_test tests/multipart_parser_test.cpp)
     target_link_libraries(multipart_parser_test PRIVATE async_uv_layer3)
+    target_compile_options(multipart_parser_test PRIVATE -UNDEBUG)
     
     add_executable(integration_test tests/integration_test.cpp)
     target_link_libraries(integration_test PRIVATE async_uv_layer3)
+    target_compile_options(integration_test PRIVATE -UNDEBUG)
     
     enable_testing()
     add_test(NAME RouterTest COMMAND router_test)

@@ -41,7 +41,7 @@ inline bool is_origin_allowed(std::string_view origin, const std::vector<std::st
 
 } // namespace detail
 
-inline Middleware cors(CorsOptions options = {}) {
+inline auto cors(CorsOptions options = {}) {
     return [opts = std::move(options)](Context& ctx, Next next) -> Task<void> {
         auto origin = ctx.header("Origin");
         
@@ -49,19 +49,29 @@ inline Middleware cors(CorsOptions options = {}) {
             co_await next();
             co_return;
         }
+
+        const bool wildcard_origin = (opts.allow_origins.size() == 1 && opts.allow_origins[0] == "*");
         
         if (!detail::is_origin_allowed(*origin, opts.allow_origins)) {
             co_await next();
             co_return;
         }
-        
-        ctx.set("Access-Control-Allow-Origin", *origin);
-        
+
+        ctx.set("Vary", "Origin");
+
+        if (opts.allow_credentials) {
+            // Credentials + wildcard is invalid in CORS; echo request origin instead.
+            ctx.set("Access-Control-Allow-Origin", *origin);
+        } else {
+            ctx.set("Access-Control-Allow-Origin", wildcard_origin ? "*" : *origin);
+        }
+
         if (opts.allow_credentials) {
             ctx.set("Access-Control-Allow-Credentials", "true");
         }
         
         if (ctx.method == "OPTIONS") {
+            ctx.set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
             ctx.set("Access-Control-Allow-Methods", detail::join_strings(opts.allow_methods, ", "));
             ctx.set("Access-Control-Allow-Headers", detail::join_strings(opts.allow_headers, ", "));
             ctx.set("Access-Control-Max-Age", std::to_string(opts.max_age));

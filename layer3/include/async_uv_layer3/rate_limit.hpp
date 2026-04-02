@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -33,6 +34,7 @@ public:
     bool try_consume(const std::string& key) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::steady_clock::now();
+        cleanup_expired_locked(now);
         auto it = entries_.find(key);
         
         if (it == entries_.end() || now >= it->second.reset_time) {
@@ -49,8 +51,13 @@ public:
     }
     
     std::size_t remaining(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(key);
         if (it == entries_.end()) {
+            return options_.max_requests;
+        }
+        auto now = std::chrono::steady_clock::now();
+        if (now >= it->second.reset_time) {
             return options_.max_requests;
         }
         if (options_.max_requests <= it->second.count) {
@@ -60,6 +67,7 @@ public:
     }
     
     std::chrono::milliseconds reset_after(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(key);
         if (it == entries_.end()) {
             return options_.window;
@@ -74,6 +82,11 @@ public:
     void cleanup() {
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mutex_);
+        cleanup_expired_locked(now);
+    }
+
+private:
+    void cleanup_expired_locked(std::chrono::steady_clock::time_point now) {
         for (auto it = entries_.begin(); it != entries_.end();) {
             if (now >= it->second.reset_time) {
                 it = entries_.erase(it);
@@ -83,7 +96,6 @@ public:
         }
     }
 
-private:
     RateLimitOptions options_;
     std::map<std::string, Entry> entries_;
     mutable std::mutex mutex_;
@@ -120,6 +132,8 @@ inline std::string extract_user(Context& ctx) {
 
 inline Task<void> rate_limit(Context& ctx, std::shared_ptr<detail::RateLimiter> limiter, 
                             RateLimitOptions options, Next next) {
+    limiter->cleanup();
+
     std::string key;
     if (options.key_extractor == "user") {
         key = detail::extract_user(ctx);
@@ -138,7 +152,7 @@ inline Task<void> rate_limit(Context& ctx, std::shared_ptr<detail::RateLimiter> 
             ctx.set("Retry-After", std::to_string(reset_ms.count() / 1000));
         }
         
-        throw HttpError(ErrorCode::TooManyRequests, options.message);
+        throw FrameworkError(ErrorCode::TooManyRequests, options.message);
     }
     
     if (options.include_headers) {
