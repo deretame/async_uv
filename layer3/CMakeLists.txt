@@ -40,6 +40,7 @@ target_include_directories(async_uv_layer3
 target_link_libraries(async_uv_layer3
     PUBLIC
         async_uv_http
+        async_uv_sql
         reflectcpp::reflectcpp
 )
 

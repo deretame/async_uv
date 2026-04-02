@@ -1964,7 +1964,241 @@ app.get("/users/{id}", get_user_handler, {
 });
 ```
 
-### 13.7 不做的功能 ❌
+### 13.7 ORM（SQLite + AST）✅（基础版）
+
+```cpp
+#include <async_uv_layer3/orm.hpp>
+
+struct User {
+    static constexpr std::string_view table_name = "users";
+
+    orm::AutoId<std::int64_t> id = 0;          // 主键 + 自增
+    std::string name;
+    orm::Unique<std::string> email;            // 唯一约束
+    std::string role;
+    std::string status;
+    int age = 0;
+    std::int64_t create_time = 0;
+};
+
+async_uv::sql::Connection conn;
+co_await conn.open(async_uv::sql::ConnectionOptions::builder()
+                       .driver(async_uv::sql::Driver::sqlite)
+                       .file(":memory:")
+                       .build());
+
+orm::Mapper<User> user_mapper(conn);
+co_await user_mapper.sync_schema();
+
+auto users = co_await user_mapper.selectList(
+    orm::Query<User>()
+        .eq(&User::role, "ADMIN")
+        .ne(&User::status, "DELETED")
+        .like(&User::name, "zh")
+        .gt(&User::age, 18)
+        .orderByDesc(&User::create_time)
+        .last("LIMIT 10"));
+
+// 连表查询（支持别名）
+auto admin_posts = co_await post_mapper.selectList(
+    orm::Query<Post>()
+        .join<Author>(&Post::author_id, &Author::id)
+        .eq<Author>(&Author::role, "ADMIN")
+        .orderByAsc(&Post::id));
+```
+
+关系查询（One-to-Many / Many-to-One / Many-to-Many）：
+
+```cpp
+struct Author {
+    static constexpr std::string_view table_name = "authors";
+    orm::AutoId<std::int64_t> id = 0;
+    std::string name;
+};
+
+struct Post {
+    static constexpr std::string_view table_name = "posts";
+    orm::AutoId<std::int64_t> id = 0;
+    std::int64_t author_id = 0;
+    std::string title;
+};
+
+struct Tag {
+    static constexpr std::string_view table_name = "tags";
+    orm::AutoId<std::int64_t> id = 0;
+    orm::Unique<std::string> name;
+};
+
+struct PostTag {
+    static constexpr std::string_view table_name = "post_tags";
+    orm::AutoId<std::int64_t> id = 0;
+    std::int64_t post_id = 0;
+    std::int64_t tag_id = 0;
+};
+
+orm::Mapper<Author> author_mapper(conn);
+orm::Mapper<Post> post_mapper(conn);
+orm::Mapper<Tag> tag_mapper(conn);
+orm::Mapper<PostTag> post_tag_mapper(conn);
+
+auto authors = co_await author_mapper.selectList(orm::Query<Author>().orderByAsc(&Author::id));
+auto posts = co_await post_mapper.selectList(orm::Query<Post>().orderByAsc(&Post::id));
+
+// 1) 一对多：Author -> Post
+auto posts_by_author = co_await author_mapper.load_one_to_many(
+    authors, &Author::id, post_mapper, &Post::author_id);
+
+// 2) 多对一：Post -> Author
+auto author_by_fk = co_await post_mapper.load_many_to_one(
+    posts, &Post::author_id, author_mapper, &Author::id);
+
+// 3) 多对多：Post <-> Tag（通过 PostTag）
+auto tags_by_post = co_await post_mapper.load_many_to_many(
+    posts,
+    &Post::id,
+    post_tag_mapper,
+    &PostTag::post_id,
+    &PostTag::tag_id,
+    tag_mapper,
+    &Tag::id);
+```
+
+当前能力（基础版，已完成）：
+
+1. 支持链式条件 AST（强类型优先）：`eq/ne/gt/ge/lt/le/between/like/notLike/likeLeft/likeRight/in/notIn/inSql/isNull/isNotNull/groupBy/having/orderByAsc/orderByDesc/and_/or_/nested/limit/offset/last`。
+2. 支持实体反射映射：`selectList/selectOne/selectById` 自动完成行到对象填充。
+3. 支持基础 CRUD：`insert/updateById/removeById/upsert`。
+4. 支持基于 reflect-cpp 包装类型的 schema 元信息：`AutoId<T>`、`Id<T>`、`Unique<T>`、`Indexed<T>`。
+5. 支持强类型连表：`join/leftJoin`（成员指针），并保留 `whereRaw/joinRaw` 作为原生 SQL 兜底。
+6. 支持关系加载：`load_one_to_many / load_many_to_one / load_many_to_many`（同时提供 camelCase 别名）。
+7. 支持事务：`tx(...)`（默认 required）与嵌套事务（`TxPropagation::nested`，基于 savepoint）。
+8. 当前先以 SQLite 作为默认验证路径，其他驱动可沿用同一 AST/Mapper 模型扩展。
+
+链式查询 TODO 清单（文档对齐版）：
+
+状态说明：`✅ 已完成` / `⏳ 未完成`
+
+| 分类 | API | 状态 | 备注 |
+|------|-----|------|------|
+| 比较操作 | `eq/ne/gt/ge/lt/le` | ✅ | 已支持强类型成员指针写法 |
+| 比较操作 | `between` | ✅ | 已支持 |
+| 模糊匹配 | `like` | ✅ | 默认 `%val%` |
+| 模糊匹配 | `notLike` | ✅ | 已支持 |
+| 模糊匹配 | `likeLeft` | ✅ | 已支持 |
+| 模糊匹配 | `likeRight` | ✅ | 已支持 |
+| 判空 / 范围 | `isNull/isNotNull` | ✅ | 已支持（含连表类型参数） |
+| 判空 / 范围 | `in` | ✅ | 已支持 |
+| 判空 / 范围 | `notIn` | ✅ | 已支持 |
+| 判空 / 范围 | `inSql` | ✅ | 已支持 |
+| 排序 / 分组 | `orderByAsc/orderByDesc` | ✅ | 已支持 |
+| 排序 / 分组 | `groupBy` | ✅ | 已支持 |
+| 排序 / 分组 | `having` | ✅ | 已支持 |
+| 逻辑组合 | `.or_()` | ✅ | C++ 关键字限制，使用 `or_` |
+| 逻辑组合 | `.and_(consumer)` | ✅ | C++ 关键字限制，使用 `and_` |
+| 逻辑组合 | `.nested(consumer)` | ✅ | 已支持 |
+
+服务层链式执行（基础版，已完成）：
+
+| 能力 | 状态 | 说明 |
+|------|------|------|
+| 查询链（`query().eq(...).list()`） | ✅ | 已支持 `list/one/count` 终结器 |
+| 更新链（`update().set(...).eq(...).execute()`） | ✅ | 已支持 `set / setIf / setIfAbsent / setSql` |
+| 计数链（`query().count()`） | ✅ | 通过子查询 `COUNT(*)` 执行 |
+
+```cpp
+orm::Mapper<User> mapper(conn);
+orm::Service<User> service(mapper);
+
+auto users = co_await service.query()
+    .eq(&User::role, "ADMIN")
+    .list();
+
+auto count = co_await service.query()
+    .eq(&User::status, "ACTIVE")
+    .count();
+
+auto affected = co_await service.update()
+    .set(&User::status, "LOCKED")
+    .eq(&User::role, "ADMIN")
+    .execute();
+
+// 表达式更新 + 条件化更新
+auto affected2 = co_await service.update()
+    .setSql(&User::age, "\"age\" + ?", {async_uv::sql::SqlParam(1)})
+    .setIfAbsent(&User::status, "PENDING")
+    .eq(&User::role, "USER")
+    .execute();
+
+// 事务（默认 required）
+co_await service.tx([&](auto& tx) -> Task<void> {
+    (void)co_await tx.update()
+        .set(&User::status, "ACTIVE")
+        .eq(&User::id, 1001)
+        .execute();
+    co_return;
+});
+
+// 嵌套事务（savepoint）
+co_await service.tx([&](auto& outer) -> Task<void> {
+    try {
+        co_await outer.tx(
+            {.propagation = orm::TxPropagation::nested},
+            [&](auto& nested) -> Task<void> {
+                (void)co_await nested.update()
+                    .set(&User::status, "PENDING")
+                    .eq(&User::id, 1001)
+                    .execute();
+                throw std::runtime_error("inner fail");
+                co_return;
+            });
+    } catch (...) {}
+    co_return;
+});
+```
+
+类型转换（可自定义转换器）：
+
+1. 库内不再写死某种类型转换（例如 `chrono -> long`），避免绑定单一数据库行为。
+2. 可通过特化 `orm::TypeConverter<T>` 实现全局转换逻辑（入库 + 出库 + 列类型）。
+3. 可通过字段包装 `orm::As<T, Converter>` 做字段级转换（同类型不同字段可使用不同策略）。
+4. 字段数据库名可通过 `rfl::Rename<"...", T>` 定义（与转换器可组合使用）。
+
+```cpp
+namespace async_uv::layer3::orm {
+template <>
+struct TypeConverter<MyMoney> {
+    static async_uv::sql::SqlParam to_sql_param(const MyMoney& value) {
+        return async_uv::sql::SqlParam(static_cast<std::int64_t>(value.cents));
+    }
+
+    static void from_sql_text(std::string_view text, MyMoney& out) {
+        out.cents = static_cast<std::int64_t>(std::stoll(std::string(text)));
+    }
+
+    static std::string_view sql_type() {
+        return "INTEGER";
+    }
+};
+} // namespace async_uv::layer3::orm
+```
+
+```cpp
+// 字段级转换 + 字段重命名（例如 pg 用 ISO8601，sqlite 用 epoch_ms）
+struct EpochMsConverter {
+    static async_uv::sql::SqlParam to_sql_param(const std::chrono::system_clock::time_point& value);
+    static void from_sql_text(std::string_view text, std::chrono::system_clock::time_point& out);
+    static std::string_view sql_type() { return "INTEGER"; }
+};
+
+struct AuditLog {
+    static constexpr std::string_view table_name = "audit_logs";
+
+    orm::AutoId<std::int64_t> id = 0;
+    rfl::Rename<"created_at", orm::As<std::chrono::system_clock::time_point, EpochMsConverter>> createdAt{};
+};
+```
+
+### 13.8 不做的功能 ❌
 
 | 功能 | 原因 | 替代方案 |
 |------|------|---------|
@@ -1991,6 +2225,7 @@ layer3/
 │       ├── router_node.hpp        # ✅ Radix Tree
 │       ├── middleware.hpp         # ✅ 内置中间件
 │       ├── di.hpp                 # ✅ 简易依赖注入容器
+│       ├── orm.hpp                # ✅ 轻量 ORM（SQLite + AST）
 │       ├── body_limit.hpp         # ✅ 请求体大小限制
 │       ├── multipart_parser.hpp   # ✅ Multipart 解析
 │       └── error.hpp              # ✅ 错误定义
@@ -2042,6 +2277,7 @@ target_link_libraries(your_app PRIVATE async_uv::layer3)
 #include <async_uv_layer3/context.hpp>
 #include <async_uv_layer3/middleware.hpp>
 #include <async_uv_layer3/di.hpp>
+#include <async_uv_layer3/orm.hpp>
 ```
 
 ---
