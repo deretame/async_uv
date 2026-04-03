@@ -3058,71 +3058,400 @@ public:
         co_return result.affected_rows;
     }
 
-    Task<std::uint64_t> batch_insert(const List<Model>& models) {
+    Task<std::uint64_t> batch_insert(const List<Model>& models, std::size_t batch_size = 0) {
         if (models.empty()) {
             co_return 0;
         }
 
         if (!in_transaction()) {
             co_return co_await tx([&](Mapper<Model>& scoped) -> Task<std::uint64_t> {
-                co_return co_await scoped.batch_insert(models);
+                co_return co_await scoped.batch_insert(models, batch_size);
             });
         }
 
+        const auto& meta = detail::model_meta<Model>();
+        std::vector<std::size_t> include_indexes;
+        include_indexes.reserve(meta.columns.size());
+        for (std::size_t col_idx = 0; col_idx < meta.columns.size(); ++col_idx) {
+            const auto& col = meta.columns[col_idx];
+            bool include = !col.is_auto_increment;
+            if (!include) {
+                for (const auto& model : models) {
+                    if (!col.is_default(model)) {
+                        include = true;
+                        break;
+                    }
+                }
+            }
+            if (include) {
+                include_indexes.push_back(col_idx);
+            }
+        }
+
+        if (include_indexes.empty()) {
+            std::uint64_t inserted = 0;
+            for (const auto& model : models) {
+                (void)co_await insert(model);
+                ++inserted;
+            }
+            co_return inserted;
+        }
+
+        const auto driver = connection_->options().driver;
+        const std::size_t max_params =
+            (driver == async_uv::sql::Driver::sqlite) ? static_cast<std::size_t>(900) : static_cast<std::size_t>(32000);
+
+        auto row_param_count = [&](const Model& model) -> std::size_t {
+            std::size_t count = 0;
+            for (const auto col_idx : include_indexes) {
+                const auto& col = meta.columns[col_idx];
+                if (col.is_auto_increment && col.is_default(model)) {
+                    continue;
+                }
+                ++count;
+            }
+            return count;
+        };
+
         std::uint64_t inserted = 0;
-        for (const auto& model : models) {
-            (void)co_await insert(model);
-            ++inserted;
+        for (std::size_t begin = 0; begin < models.size();) {
+            std::size_t end = begin;
+            std::size_t param_count = 0;
+            while (end < models.size()) {
+                if (batch_size > 0 && (end - begin) >= batch_size) {
+                    break;
+                }
+                const std::size_t row_params = row_param_count(models[end]);
+                if (end > begin && param_count + row_params > max_params) {
+                    break;
+                }
+                param_count += row_params;
+                ++end;
+            }
+            if (end == begin) {
+                end = begin + 1;
+            }
+
+            std::string sql = "INSERT INTO ";
+            sql += detail::quote_ident(table_);
+            sql += " (";
+            for (std::size_t idx = 0; idx < include_indexes.size(); ++idx) {
+                if (idx > 0) {
+                    sql += ", ";
+                }
+                sql += detail::quote_ident(meta.columns[include_indexes[idx]].name);
+            }
+            sql += ") VALUES ";
+
+            std::vector<async_uv::sql::SqlParam> params;
+            params.reserve(param_count);
+            for (std::size_t i = begin; i < end; ++i) {
+                if (i > begin) {
+                    sql += ", ";
+                }
+                sql += "(";
+                for (std::size_t col_pos = 0; col_pos < include_indexes.size(); ++col_pos) {
+                    if (col_pos > 0) {
+                        sql += ", ";
+                    }
+                    const auto& col = meta.columns[include_indexes[col_pos]];
+                    if (col.is_auto_increment && col.is_default(models[i])) {
+                        if (driver == async_uv::sql::Driver::sqlite) {
+                            sql += "NULL";
+                        } else {
+                            sql += "DEFAULT";
+                        }
+                    } else {
+                        sql += "?";
+                        params.push_back(col.read_param(models[i]));
+                    }
+                }
+                sql += ")";
+            }
+
+            const auto result = co_await execute_sql(std::move(sql), std::move(params));
+            inserted += result.affected_rows;
+            begin = end;
         }
         co_return inserted;
     }
 
-    Task<std::uint64_t> batchInsert(const List<Model>& models) {
-        co_return co_await batch_insert(models);
+    Task<std::uint64_t> batchInsert(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await batch_insert(models, batch_size);
     }
 
-    Task<std::uint64_t> batch_upsert(const List<Model>& models) {
+    Task<std::uint64_t> batch_upsert(const List<Model>& models, std::size_t batch_size = 0) {
         if (models.empty()) {
             co_return 0;
         }
 
         if (!in_transaction()) {
             co_return co_await tx([&](Mapper<Model>& scoped) -> Task<std::uint64_t> {
-                co_return co_await scoped.batch_upsert(models);
+                co_return co_await scoped.batch_upsert(models, batch_size);
             });
         }
 
+        const auto& meta = detail::model_meta<Model>();
+
+        std::optional<std::size_t> conflict_index;
+        if (meta.id_index.has_value()) {
+            conflict_index = meta.id_index;
+        } else if (!meta.unique_indexes.empty()) {
+            conflict_index = meta.unique_indexes.front();
+        }
+        if (!conflict_index.has_value()) {
+            co_return co_await batch_insert(models, batch_size);
+        }
+
+        const auto& conflict_col = meta.columns[*conflict_index];
+        if (conflict_col.is_auto_increment) {
+            bool all_default_conflict = true;
+            for (const auto& model : models) {
+                if (!conflict_col.is_default(model)) {
+                    all_default_conflict = false;
+                    break;
+                }
+            }
+            if (all_default_conflict) {
+                co_return co_await batch_insert(models, batch_size);
+            }
+        }
+
+        std::vector<std::size_t> include_indexes;
+        include_indexes.reserve(meta.columns.size());
+        for (std::size_t col_idx = 0; col_idx < meta.columns.size(); ++col_idx) {
+            const auto& col = meta.columns[col_idx];
+            bool include = !col.is_auto_increment;
+            if (!include) {
+                for (const auto& model : models) {
+                    if (!col.is_default(model)) {
+                        include = true;
+                        break;
+                    }
+                }
+            }
+            if (include) {
+                include_indexes.push_back(col_idx);
+            }
+        }
+        if (include_indexes.empty()) {
+            std::uint64_t affected = 0;
+            for (const auto& model : models) {
+                affected += co_await upsert(model);
+            }
+            co_return affected;
+        }
+
+        const auto driver = connection_->options().driver;
+        const std::size_t max_params =
+            (driver == async_uv::sql::Driver::sqlite) ? static_cast<std::size_t>(900) : static_cast<std::size_t>(32000);
+
+        auto row_param_count = [&](const Model& model) -> std::size_t {
+            std::size_t count = 0;
+            for (const auto col_idx : include_indexes) {
+                const auto& col = meta.columns[col_idx];
+                if (col.is_auto_increment && col.is_default(model)) {
+                    continue;
+                }
+                ++count;
+            }
+            return count;
+        };
+
+        std::vector<std::size_t> update_indexes;
+        update_indexes.reserve(meta.columns.size());
+        for (std::size_t col_idx = 0; col_idx < meta.columns.size(); ++col_idx) {
+            const auto& col = meta.columns[col_idx];
+            if (col.name == conflict_col.name || col.is_id) {
+                continue;
+            }
+            update_indexes.push_back(col_idx);
+        }
+
         std::uint64_t affected = 0;
-        for (const auto& model : models) {
-            affected += co_await upsert(model);
+        for (std::size_t begin = 0; begin < models.size();) {
+            std::size_t end = begin;
+            std::size_t param_count = 0;
+            while (end < models.size()) {
+                if (batch_size > 0 && (end - begin) >= batch_size) {
+                    break;
+                }
+                const std::size_t row_params = row_param_count(models[end]);
+                if (end > begin && param_count + row_params > max_params) {
+                    break;
+                }
+                param_count += row_params;
+                ++end;
+            }
+            if (end == begin) {
+                end = begin + 1;
+            }
+
+            std::string sql = "INSERT INTO ";
+            sql += detail::quote_ident(table_);
+            sql += " (";
+            for (std::size_t idx = 0; idx < include_indexes.size(); ++idx) {
+                if (idx > 0) {
+                    sql += ", ";
+                }
+                sql += detail::quote_ident(meta.columns[include_indexes[idx]].name);
+            }
+            sql += ") VALUES ";
+
+            std::vector<async_uv::sql::SqlParam> params;
+            params.reserve(param_count);
+            for (std::size_t i = begin; i < end; ++i) {
+                if (i > begin) {
+                    sql += ", ";
+                }
+                sql += "(";
+                for (std::size_t col_pos = 0; col_pos < include_indexes.size(); ++col_pos) {
+                    if (col_pos > 0) {
+                        sql += ", ";
+                    }
+                    const auto& col = meta.columns[include_indexes[col_pos]];
+                    if (col.is_auto_increment && col.is_default(models[i])) {
+                        if (driver == async_uv::sql::Driver::sqlite) {
+                            sql += "NULL";
+                        } else {
+                            sql += "DEFAULT";
+                        }
+                    } else {
+                        sql += "?";
+                        params.push_back(col.read_param(models[i]));
+                    }
+                }
+                sql += ")";
+            }
+
+            sql += " ON CONFLICT(";
+            sql += detail::quote_ident(conflict_col.name);
+            sql += ") DO ";
+
+            if (update_indexes.empty()) {
+                sql += "NOTHING";
+            } else {
+                sql += "UPDATE SET ";
+                for (std::size_t idx = 0; idx < update_indexes.size(); ++idx) {
+                    if (idx > 0) {
+                        sql += ", ";
+                    }
+                    const auto& col = meta.columns[update_indexes[idx]];
+                    sql += detail::quote_ident(col.name);
+                    sql += " = excluded.";
+                    sql += detail::quote_ident(col.name);
+                }
+            }
+
+            const auto result = co_await execute_sql(std::move(sql), std::move(params));
+            affected += result.affected_rows;
+            begin = end;
         }
         co_return affected;
     }
 
-    Task<std::uint64_t> batchUpsert(const List<Model>& models) {
-        co_return co_await batch_upsert(models);
+    Task<std::uint64_t> batchUpsert(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await batch_upsert(models, batch_size);
     }
 
-    Task<std::uint64_t> batch_update_by_id(const List<Model>& models) {
+    Task<std::uint64_t> batch_update_by_id(const List<Model>& models, std::size_t batch_size = 0) {
         if (models.empty()) {
             co_return 0;
         }
 
         if (!in_transaction()) {
             co_return co_await tx([&](Mapper<Model>& scoped) -> Task<std::uint64_t> {
-                co_return co_await scoped.batch_update_by_id(models);
+                co_return co_await scoped.batch_update_by_id(models, batch_size);
             });
         }
 
+        const auto& meta = detail::model_meta<Model>();
+        if (!meta.id_index.has_value()) {
+            throw Error("batch_update_by_id requires an id column");
+        }
+
+        std::vector<std::size_t> set_indexes;
+        set_indexes.reserve(meta.columns.size());
+        for (std::size_t i = 0; i < meta.columns.size(); ++i) {
+            if (i == *meta.id_index) {
+                continue;
+            }
+            set_indexes.push_back(i);
+        }
+        if (set_indexes.empty()) {
+            co_return 0;
+        }
+
+        const auto& id_col = meta.columns[*meta.id_index];
+        const auto driver = connection_->options().driver;
+        const std::size_t max_params =
+            (driver == async_uv::sql::Driver::sqlite) ? static_cast<std::size_t>(900) : static_cast<std::size_t>(32000);
+        const std::size_t params_per_row = set_indexes.size() * 2 + 1;
+
+        if (params_per_row > max_params) {
+            // Fallback for very wide tables where a single-row CASE update would exceed parameter limits.
+            std::uint64_t affected = 0;
+            for (const auto& model : models) {
+                affected += co_await update_by_id(model);
+            }
+            co_return affected;
+        }
+
+        const std::size_t auto_chunk_size = std::max<std::size_t>(1, max_params / params_per_row);
+        const std::size_t chunk_size =
+            batch_size > 0 ? std::min(auto_chunk_size, batch_size) : auto_chunk_size;
         std::uint64_t affected = 0;
-        for (const auto& model : models) {
-            affected += co_await update_by_id(model);
+        for (std::size_t begin = 0; begin < models.size(); begin += chunk_size) {
+            const std::size_t end = std::min(models.size(), begin + chunk_size);
+
+            std::string sql = "UPDATE ";
+            sql += detail::quote_ident(table_);
+            sql += " SET ";
+
+            std::vector<async_uv::sql::SqlParam> params;
+            params.reserve((end - begin) * params_per_row);
+
+            for (std::size_t col_pos = 0; col_pos < set_indexes.size(); ++col_pos) {
+                if (col_pos > 0) {
+                    sql += ", ";
+                }
+
+                const auto& col = meta.columns[set_indexes[col_pos]];
+                sql += detail::quote_ident(col.name);
+                sql += " = CASE ";
+                sql += detail::quote_ident(id_col.name);
+
+                for (std::size_t i = begin; i < end; ++i) {
+                    sql += " WHEN ? THEN ?";
+                    params.push_back(id_col.read_param(models[i]));
+                    params.push_back(col.read_param(models[i]));
+                }
+
+                sql += " ELSE ";
+                sql += detail::quote_ident(col.name);
+                sql += " END";
+            }
+
+            sql += " WHERE ";
+            sql += detail::quote_ident(id_col.name);
+            sql += " IN (";
+            for (std::size_t i = begin; i < end; ++i) {
+                if (i > begin) {
+                    sql += ", ";
+                }
+                sql += "?";
+                params.push_back(id_col.read_param(models[i]));
+            }
+            sql += ")";
+
+            const auto result = co_await execute_sql(std::move(sql), std::move(params));
+            affected += result.affected_rows;
         }
         co_return affected;
     }
 
-    Task<std::uint64_t> batchUpdateById(const List<Model>& models) {
-        co_return co_await batch_update_by_id(models);
+    Task<std::uint64_t> batchUpdateById(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await batch_update_by_id(models, batch_size);
     }
 
     Task<std::uint64_t> delete_by_query(const Query<Model>& query, bool allow_full_table = false) {
@@ -4190,28 +4519,28 @@ public:
         co_return co_await mapper_->upsert(model);
     }
 
-    Task<std::uint64_t> batch_insert(const List<Model>& models) {
-        co_return co_await mapper_->batch_insert(models);
+    Task<std::uint64_t> batch_insert(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await mapper_->batch_insert(models, batch_size);
     }
 
-    Task<std::uint64_t> batchInsert(const List<Model>& models) {
-        co_return co_await mapper_->batch_insert(models);
+    Task<std::uint64_t> batchInsert(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await mapper_->batch_insert(models, batch_size);
     }
 
-    Task<std::uint64_t> batch_upsert(const List<Model>& models) {
-        co_return co_await mapper_->batch_upsert(models);
+    Task<std::uint64_t> batch_upsert(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await mapper_->batch_upsert(models, batch_size);
     }
 
-    Task<std::uint64_t> batchUpsert(const List<Model>& models) {
-        co_return co_await mapper_->batch_upsert(models);
+    Task<std::uint64_t> batchUpsert(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await mapper_->batch_upsert(models, batch_size);
     }
 
-    Task<std::uint64_t> batch_update_by_id(const List<Model>& models) {
-        co_return co_await mapper_->batch_update_by_id(models);
+    Task<std::uint64_t> batch_update_by_id(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await mapper_->batch_update_by_id(models, batch_size);
     }
 
-    Task<std::uint64_t> batchUpdateById(const List<Model>& models) {
-        co_return co_await mapper_->batch_update_by_id(models);
+    Task<std::uint64_t> batchUpdateById(const List<Model>& models, std::size_t batch_size = 0) {
+        co_return co_await mapper_->batch_update_by_id(models, batch_size);
     }
 
     Task<std::uint64_t> delete_by_query(const Query<Model>& query_model, bool allow_full_table = false) {
