@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <concepts>
 #include <exception>
@@ -9,6 +10,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -22,6 +24,8 @@
 #include <vector>
 
 #include <async_uv_sql/sql.h>
+#include <async_uv/cancel.h>
+#include <async_uv/error.h>
 #include <rfl/Attribute.hpp>
 #include <rfl/json/read.hpp>
 #include <rfl/to_view.hpp>
@@ -35,11 +39,41 @@ using List = std::vector<T>;
 enum class TxPropagation {
     required,
     nested,
+    requires_new,
+};
+
+enum class TxIsolation {
+    default_level,
+    read_uncommitted,
+    read_committed,
+    repeatable_read,
+    serializable,
 };
 
 struct TxOptions {
     TxPropagation propagation = TxPropagation::required;
+    TxIsolation isolation = TxIsolation::default_level;
+    bool read_only = false;
+    int timeout_ms = 0;
 };
+
+enum class CountMode {
+    filtered,
+    window,
+};
+
+enum class RawSqlPolicy {
+    permissive,
+    require_unsafe_marker,
+};
+
+struct UnsafeSql {
+    std::string sql;
+};
+
+inline UnsafeSql unsafe_sql(std::string sql) {
+    return UnsafeSql{.sql = std::move(sql)};
+}
 
 template <class Model>
 class Mapper;
@@ -64,6 +98,10 @@ class Error : public std::runtime_error {
 public:
     explicit Error(std::string message) : std::runtime_error(std::move(message)) {}
 };
+
+using RawSqlAuditHook = std::function<void(std::string_view api,
+                                           std::string_view sql,
+                                           bool unsafe_marked)>;
 
 template <class T>
 struct TypeConverter {};
@@ -117,6 +155,48 @@ struct always_false : std::false_type {};
 
 template <class T>
 inline constexpr bool always_false_v = always_false<T>::value;
+
+inline RawSqlPolicy& raw_sql_policy_ref() {
+    static RawSqlPolicy policy = RawSqlPolicy::permissive;
+    return policy;
+}
+
+inline RawSqlAuditHook& raw_sql_audit_hook_ref() {
+    static RawSqlAuditHook hook;
+    return hook;
+}
+
+inline std::mutex& raw_sql_guard_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline void validate_raw_sql(
+    std::string_view api,
+    std::string_view sql_fragment,
+    bool unsafe_marked) {
+    if (sql_fragment.empty()) {
+        throw Error(std::string(api) + " SQL fragment cannot be empty");
+    }
+
+    RawSqlPolicy policy = RawSqlPolicy::permissive;
+    RawSqlAuditHook hook;
+    {
+        std::lock_guard<std::mutex> lock(raw_sql_guard_mutex());
+        policy = raw_sql_policy_ref();
+        hook = raw_sql_audit_hook_ref();
+    }
+
+    if (policy == RawSqlPolicy::require_unsafe_marker && !unsafe_marked) {
+        throw Error(
+            std::string(api)
+            + " requires explicit unsafe marker; wrap SQL with orm::unsafe_sql(...)");
+    }
+
+    if (hook) {
+        hook(api, sql_fragment, unsafe_marked);
+    }
+}
 
 template <class T, class = void>
 struct has_type_converter : std::false_type {};
@@ -239,7 +319,7 @@ decltype(auto) unwrap_attr(const T& value) {
     }
 }
 
-std::string to_snake_case(std::string name) {
+inline std::string to_snake_case(std::string name) {
     std::string out;
     out.reserve(name.size() + 8);
     for (std::size_t i = 0; i < name.size(); ++i) {
@@ -530,6 +610,26 @@ std::string sql_type_name() {
 
 } // namespace detail
 
+inline void set_raw_sql_policy(RawSqlPolicy policy) {
+    std::lock_guard<std::mutex> lock(detail::raw_sql_guard_mutex());
+    detail::raw_sql_policy_ref() = policy;
+}
+
+inline RawSqlPolicy raw_sql_policy() {
+    std::lock_guard<std::mutex> lock(detail::raw_sql_guard_mutex());
+    return detail::raw_sql_policy_ref();
+}
+
+inline void set_raw_sql_audit_hook(RawSqlAuditHook hook) {
+    std::lock_guard<std::mutex> lock(detail::raw_sql_guard_mutex());
+    detail::raw_sql_audit_hook_ref() = std::move(hook);
+}
+
+inline void clear_raw_sql_audit_hook() {
+    std::lock_guard<std::mutex> lock(detail::raw_sql_guard_mutex());
+    detail::raw_sql_audit_hook_ref() = RawSqlAuditHook{};
+}
+
 namespace detail {
 
 template <class Model>
@@ -794,6 +894,45 @@ std::vector<async_uv::sql::SqlParam> keys_to_sql_params(const std::vector<Key>& 
     return params;
 }
 
+struct TxFrame {
+    std::optional<std::string> savepoint;
+    bool rollback_only = false;
+    int timeout_ms = 0;
+    bool sqlite_query_only_enabled = false;
+    bool sqlite_read_uncommitted_enabled = false;
+};
+
+struct TxState {
+    std::vector<TxFrame> frames;
+    std::size_t savepoint_seq = 0;
+};
+
+inline std::shared_ptr<TxState> shared_tx_state(async_uv::sql::Connection* connection) {
+    static std::mutex mutex;
+    static std::unordered_map<async_uv::sql::Connection*, std::weak_ptr<TxState>> states;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto it = states.find(connection); it != states.end()) {
+        if (auto alive = it->second.lock()) {
+            return alive;
+        }
+    }
+
+    auto created = std::make_shared<TxState>();
+    states[connection] = created;
+
+    if (states.size() > 128) {
+        for (auto it = states.begin(); it != states.end();) {
+            if (it->second.expired()) {
+                it = states.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return created;
+}
+
 } // namespace detail
 
 template <class Model>
@@ -1046,20 +1185,60 @@ public:
 
     template <class Member>
         requires(kIsMemberSelector<Member>)
+    Query& in_sql(Member member, UnsafeSql sql_fragment) {
+        return add_in_sql(
+            resolve_member_column(std::move(member)),
+            std::move(sql_fragment.sql),
+            "IN",
+            true);
+    }
+
+    template <class Member>
+        requires(kIsMemberSelector<Member>)
     Query& in_sql(Member member, std::string sql_fragment) {
-        return add_in_sql(resolve_member_column(std::move(member)), std::move(sql_fragment), "IN");
+        return add_in_sql(
+            resolve_member_column(std::move(member)),
+            std::move(sql_fragment),
+            "IN",
+            false);
+    }
+
+    template <class Member>
+        requires(kIsMemberSelector<Member>)
+    Query& not_in_sql(Member member, UnsafeSql sql_fragment) {
+        return add_in_sql(
+            resolve_member_column(std::move(member)),
+            std::move(sql_fragment.sql),
+            "NOT IN",
+            true);
     }
 
     template <class Member>
         requires(kIsMemberSelector<Member>)
     Query& not_in_sql(Member member, std::string sql_fragment) {
-        return add_in_sql(resolve_member_column(std::move(member)), std::move(sql_fragment), "NOT IN");
+        return add_in_sql(
+            resolve_member_column(std::move(member)),
+            std::move(sql_fragment),
+            "NOT IN",
+            false);
+    }
+
+    template <class Member>
+        requires(kIsMemberSelector<Member>)
+    Query& inSql(Member member, UnsafeSql sql_fragment) {
+        return in_sql(std::move(member), std::move(sql_fragment));
     }
 
     template <class Member>
         requires(kIsMemberSelector<Member>)
     Query& inSql(Member member, std::string sql_fragment) {
         return in_sql(std::move(member), std::move(sql_fragment));
+    }
+
+    template <class Member>
+        requires(kIsMemberSelector<Member>)
+    Query& notInSql(Member member, UnsafeSql sql_fragment) {
+        return not_in_sql(std::move(member), std::move(sql_fragment));
     }
 
     template <class Member>
@@ -1284,11 +1463,32 @@ public:
 
     template <class Joined, class Member>
         requires(kIsMemberSelector<Member>)
+    Query& in_sql(Member member, UnsafeSql sql_fragment) {
+        return add_in_sql(
+            resolve_joined_member_column_ref<Joined>(std::move(member)),
+            std::move(sql_fragment.sql),
+            "IN",
+            true);
+    }
+
+    template <class Joined, class Member>
+        requires(kIsMemberSelector<Member>)
     Query& in_sql(Member member, std::string sql_fragment) {
         return add_in_sql(
             resolve_joined_member_column_ref<Joined>(std::move(member)),
             std::move(sql_fragment),
-            "IN");
+            "IN",
+            false);
+    }
+
+    template <class Joined, class Member>
+        requires(kIsMemberSelector<Member>)
+    Query& not_in_sql(Member member, UnsafeSql sql_fragment) {
+        return add_in_sql(
+            resolve_joined_member_column_ref<Joined>(std::move(member)),
+            std::move(sql_fragment.sql),
+            "NOT IN",
+            true);
     }
 
     template <class Joined, class Member>
@@ -1297,13 +1497,26 @@ public:
         return add_in_sql(
             resolve_joined_member_column_ref<Joined>(std::move(member)),
             std::move(sql_fragment),
-            "NOT IN");
+            "NOT IN",
+            false);
+    }
+
+    template <class Joined, class Member>
+        requires(kIsMemberSelector<Member>)
+    Query& inSql(Member member, UnsafeSql sql_fragment) {
+        return in_sql<Joined>(std::move(member), std::move(sql_fragment));
     }
 
     template <class Joined, class Member>
         requires(kIsMemberSelector<Member>)
     Query& inSql(Member member, std::string sql_fragment) {
         return in_sql<Joined>(std::move(member), std::move(sql_fragment));
+    }
+
+    template <class Joined, class Member>
+        requires(kIsMemberSelector<Member>)
+    Query& notInSql(Member member, UnsafeSql sql_fragment) {
+        return not_in_sql<Joined>(std::move(member), std::move(sql_fragment));
     }
 
     template <class Joined, class Member>
@@ -1325,16 +1538,52 @@ public:
         return from_alias(std::move(alias));
     }
 
+    Query& join_raw(std::string table, UnsafeSql on_sql, std::string alias = {}) {
+        return add_join_raw(
+            JoinKind::Inner,
+            std::move(table),
+            std::move(on_sql.sql),
+            std::move(alias),
+            true);
+    }
+
     Query& join_raw(std::string table, std::string on_sql, std::string alias = {}) {
-        return add_join_raw(JoinKind::Inner, std::move(table), std::move(on_sql), std::move(alias));
+        return add_join_raw(
+            JoinKind::Inner,
+            std::move(table),
+            std::move(on_sql),
+            std::move(alias),
+            false);
+    }
+
+    Query& left_join_raw(std::string table, UnsafeSql on_sql, std::string alias = {}) {
+        return add_join_raw(
+            JoinKind::Left,
+            std::move(table),
+            std::move(on_sql.sql),
+            std::move(alias),
+            true);
     }
 
     Query& left_join_raw(std::string table, std::string on_sql, std::string alias = {}) {
-        return add_join_raw(JoinKind::Left, std::move(table), std::move(on_sql), std::move(alias));
+        return add_join_raw(
+            JoinKind::Left,
+            std::move(table),
+            std::move(on_sql),
+            std::move(alias),
+            false);
+    }
+
+    Query& joinRaw(std::string table, UnsafeSql on_sql, std::string alias = {}) {
+        return join_raw(std::move(table), std::move(on_sql), std::move(alias));
     }
 
     Query& joinRaw(std::string table, std::string on_sql, std::string alias = {}) {
         return join_raw(std::move(table), std::move(on_sql), std::move(alias));
+    }
+
+    Query& leftJoinRaw(std::string table, UnsafeSql on_sql, std::string alias = {}) {
+        return left_join_raw(std::move(table), std::move(on_sql), std::move(alias));
     }
 
     Query& leftJoinRaw(std::string table, std::string on_sql, std::string alias = {}) {
@@ -1507,7 +1756,40 @@ public:
         return *this;
     }
 
+    Query& where_raw(UnsafeSql sql_fragment, std::vector<async_uv::sql::SqlParam> params = {}) {
+        return where_raw(std::move(sql_fragment.sql), std::move(params), true);
+    }
+
     Query& where_raw(std::string sql_fragment, std::vector<async_uv::sql::SqlParam> params = {}) {
+        return where_raw(std::move(sql_fragment), std::move(params), false);
+    }
+
+    Query& whereRaw(UnsafeSql sql_fragment, std::vector<async_uv::sql::SqlParam> params = {}) {
+        return where_raw(std::move(sql_fragment), std::move(params));
+    }
+
+    Query& whereRaw(std::string sql_fragment, std::vector<async_uv::sql::SqlParam> params = {}) {
+        return where_raw(std::move(sql_fragment), std::move(params));
+    }
+
+    Query without_window_clauses() const {
+        Query copy = *this;
+        copy.orders_.clear();
+        copy.limit_.reset();
+        copy.offset_.reset();
+        copy.sql_tail_.clear();
+        return copy;
+    }
+
+private:
+    Query& where_raw(
+        std::string sql_fragment,
+        std::vector<async_uv::sql::SqlParam> params,
+        bool unsafe_marked) {
+        if (sql_fragment.empty()) {
+            return *this;
+        }
+        detail::validate_raw_sql("Query::whereRaw", sql_fragment, unsafe_marked);
         Predicate p;
         p.kind = PredicateKind::Raw;
         p.connector = consume_next_connector();
@@ -1516,12 +1798,6 @@ public:
         predicates_.push_back(std::move(p));
         return *this;
     }
-
-    Query& whereRaw(std::string sql_fragment, std::vector<async_uv::sql::SqlParam> params = {}) {
-        return where_raw(std::move(sql_fragment), std::move(params));
-    }
-
-private:
     BoolConnector consume_next_connector() {
         const auto c = next_connector_;
         next_connector_ = BoolConnector::And;
@@ -1566,10 +1842,15 @@ private:
         return *this;
     }
 
-    Query& add_in_sql(std::string column, std::string sql_fragment, std::string op) {
+    Query& add_in_sql(
+        std::string column,
+        std::string sql_fragment,
+        std::string op,
+        bool unsafe_marked) {
         if (sql_fragment.empty()) {
             return *this;
         }
+        detail::validate_raw_sql("Query::inSql", sql_fragment, unsafe_marked);
         Predicate p;
         p.kind = PredicateKind::InSql;
         p.connector = consume_next_connector();
@@ -1621,13 +1902,19 @@ private:
         return *this;
     }
 
-    Query& add_join_raw(JoinKind kind, std::string table, std::string on_sql, std::string alias) {
+    Query& add_join_raw(
+        JoinKind kind,
+        std::string table,
+        std::string on_sql,
+        std::string alias,
+        bool unsafe_marked) {
         if (table.empty()) {
             throw Error("join table cannot be empty");
         }
         if (on_sql.empty()) {
             throw Error("join ON SQL cannot be empty");
         }
+        detail::validate_raw_sql("Query::joinRaw", on_sql, unsafe_marked);
         Join join;
         join.kind = kind;
         join.table = std::move(table);
@@ -1943,17 +2230,21 @@ template <class Model>
 class Mapper {
 public:
     explicit Mapper(async_uv::sql::Connection& connection)
-        : connection_(&connection), table_(detail::model_meta<Model>().table) {}
+        : connection_(&connection),
+          table_(detail::model_meta<Model>().table),
+          tx_state_(detail::shared_tx_state(&connection)) {}
 
     Mapper(async_uv::sql::Connection& connection, std::string table_name)
-        : connection_(&connection), table_(std::move(table_name)) {}
+        : connection_(&connection),
+          table_(std::move(table_name)),
+          tx_state_(detail::shared_tx_state(&connection)) {}
 
     const std::string& table() const noexcept {
         return table_;
     }
 
     bool in_transaction() const noexcept {
-        return !tx_state_->frames.empty();
+        return tx_state_ != nullptr && !tx_state_->frames.empty();
     }
 
     bool rollback_only() const noexcept {
@@ -1976,114 +2267,10 @@ public:
     template <class Func>
     auto tx(TxOptions options, Func&& func)
         -> Task<async_uv::TaskValue<std::invoke_result_t<Func, Mapper&>>> {
-        using Awaitable = std::invoke_result_t<Func, Mapper&>;
-        using ReturnType = async_uv::TaskValue<Awaitable>;
-
-        const bool create_root = tx_state_->frames.empty();
-        const bool create_savepoint =
-            !create_root && options.propagation == TxPropagation::nested;
-
-        if (create_root) {
-            co_await connection_->begin();
-            tx_state_->frames.push_back(TxFrame{});
-        } else if (create_savepoint) {
-            TxFrame frame;
-            frame.savepoint = "sp_" + std::to_string(++tx_state_->savepoint_seq);
-            std::string save_sql = "SAVEPOINT ";
-            save_sql += detail::quote_ident(*frame.savepoint);
-            co_await connection_->execute(std::move(save_sql));
-            tx_state_->frames.push_back(std::move(frame));
+        if (options.propagation == TxPropagation::requires_new) {
+            co_return co_await tx_requires_new(options, std::forward<Func>(func));
         }
-
-        auto finalize_boundary = [&](TxFrame frame) -> Task<void> {
-            const bool is_root = !frame.savepoint.has_value();
-            if (frame.rollback_only) {
-                if (is_root) {
-                    co_await connection_->rollback();
-                } else {
-                    std::string rollback_sql = "ROLLBACK TO SAVEPOINT ";
-                    rollback_sql += detail::quote_ident(*frame.savepoint);
-                    co_await connection_->execute(std::move(rollback_sql));
-
-                    std::string release_sql = "RELEASE SAVEPOINT ";
-                    release_sql += detail::quote_ident(*frame.savepoint);
-                    co_await connection_->execute(std::move(release_sql));
-                }
-            } else {
-                if (is_root) {
-                    co_await connection_->commit();
-                } else {
-                    std::string release_sql = "RELEASE SAVEPOINT ";
-                    release_sql += detail::quote_ident(*frame.savepoint);
-                    co_await connection_->execute(std::move(release_sql));
-                }
-            }
-        };
-
-        std::exception_ptr body_error;
-        bool body_failed = false;
-        bool boundary_rollback = false;
-
-        if constexpr (std::is_void_v<ReturnType>) {
-            try {
-                co_await std::invoke(std::forward<Func>(func), *this);
-            } catch (...) {
-                body_failed = true;
-                body_error = std::current_exception();
-            }
-
-            if (create_root || create_savepoint) {
-                if (!tx_state_->frames.empty() && body_failed) {
-                    tx_state_->frames.back().rollback_only = true;
-                }
-                if (!tx_state_->frames.empty()) {
-                    auto frame = std::move(tx_state_->frames.back());
-                    tx_state_->frames.pop_back();
-                    boundary_rollback = frame.rollback_only;
-                    co_await finalize_boundary(std::move(frame));
-                }
-            } else if (body_failed && !tx_state_->frames.empty()) {
-                tx_state_->frames.back().rollback_only = true;
-            }
-
-            if (body_failed) {
-                std::rethrow_exception(body_error);
-            }
-            if (boundary_rollback) {
-                throw Error("transaction marked rollback_only");
-            }
-            co_return;
-        } else {
-            std::optional<ReturnType> result;
-            try {
-                result = co_await std::invoke(std::forward<Func>(func), *this);
-            } catch (...) {
-                body_failed = true;
-                body_error = std::current_exception();
-            }
-
-            if (create_root || create_savepoint) {
-                if (!tx_state_->frames.empty() && body_failed) {
-                    tx_state_->frames.back().rollback_only = true;
-                }
-                if (!tx_state_->frames.empty()) {
-                    auto frame = std::move(tx_state_->frames.back());
-                    tx_state_->frames.pop_back();
-                    boundary_rollback = frame.rollback_only;
-                    co_await finalize_boundary(std::move(frame));
-                }
-            } else if (body_failed && !tx_state_->frames.empty()) {
-                tx_state_->frames.back().rollback_only = true;
-            }
-
-            if (body_failed) {
-                std::rethrow_exception(body_error);
-            }
-            if (boundary_rollback) {
-                throw Error("transaction marked rollback_only");
-            }
-            co_return std::move(*result);
-        }
+        co_return co_await tx_local(options, std::forward<Func>(func));
     }
 
     Task<void> sync_schema() {
@@ -2115,7 +2302,7 @@ public:
         }
 
         sql += ")";
-        co_await connection_->execute(std::move(sql));
+        co_await execute_sql(std::move(sql));
 
         for (const auto& col : meta.columns) {
             if (!col.is_indexed || col.is_unique || col.is_id) {
@@ -2128,14 +2315,14 @@ public:
             idx_sql += "(";
             idx_sql += detail::quote_ident(col.name);
             idx_sql += ")";
-            co_await connection_->execute(std::move(idx_sql));
+            co_await execute_sql(std::move(idx_sql));
         }
     }
 
     Task<List<Model>> select_list(const Query<Model>& query) {
         const auto& meta = detail::model_meta<Model>();
         const auto plan = query.build_select_plan(table_, meta.columns);
-        const auto result = co_await connection_->query(plan.sql, plan.params);
+        const auto result = co_await query_sql(plan.sql, plan.params);
         co_return decode_rows(result, meta);
     }
 
@@ -2144,6 +2331,38 @@ public:
     }
 
     Task<std::uint64_t> count(const Query<Model>& query = {}) {
+        co_return co_await count_filtered(query);
+    }
+
+    Task<std::uint64_t> count(const Query<Model>& query, CountMode mode) {
+        switch (mode) {
+            case CountMode::filtered:
+                co_return co_await count_filtered(query);
+            case CountMode::window:
+                co_return co_await count_window(query);
+        }
+        co_return co_await count_filtered(query);
+    }
+
+    Task<std::uint64_t> count_filtered(const Query<Model>& query = {}) {
+        const auto normalized = query.without_window_clauses();
+        co_return co_await count_from_query(normalized);
+    }
+
+    Task<std::uint64_t> countFiltered(const Query<Model>& query = {}) {
+        co_return co_await count_filtered(query);
+    }
+
+    Task<std::uint64_t> count_window(const Query<Model>& query = {}) {
+        co_return co_await count_from_query(query);
+    }
+
+    Task<std::uint64_t> countWindow(const Query<Model>& query = {}) {
+        co_return co_await count_window(query);
+    }
+
+private:
+    Task<std::uint64_t> count_from_query(const Query<Model>& query) {
         const auto& meta = detail::model_meta<Model>();
         const auto plan = query.build_select_plan(table_, meta.columns);
 
@@ -2154,7 +2373,7 @@ public:
         sql += ") AS ";
         sql += detail::quote_ident("__orm_count_sub");
 
-        const auto result = co_await connection_->query(std::move(sql), plan.params);
+        const auto result = co_await query_sql(std::move(sql), plan.params);
         if (result.rows.empty() || result.rows.front().values.empty() || !result.rows.front().values.front().has_value()) {
             co_return 0;
         }
@@ -2165,6 +2384,8 @@ public:
             throw Error("failed to parse COUNT(*) result");
         }
     }
+
+public:
 
     Task<std::optional<Model>> select_one(const Query<Model>& query) {
         const auto limited = query.with_limit_if_absent(1);
@@ -2639,7 +2860,7 @@ public:
             sql += ")";
         }
 
-        const auto result = co_await connection_->execute(std::move(sql), std::move(params));
+        const auto result = co_await execute_sql(std::move(sql), std::move(params));
         co_return result.last_insert_id;
     }
 
@@ -2689,7 +2910,7 @@ public:
             }
         }
 
-        const auto result = co_await connection_->execute(std::move(sql), std::move(params));
+        const auto result = co_await execute_sql(std::move(sql), std::move(params));
         co_return result.affected_rows;
     }
 
@@ -2736,7 +2957,7 @@ public:
         sql += " = ?";
         params.push_back(id_col.read_param(model));
 
-        const auto result = co_await connection_->execute(std::move(sql), std::move(params));
+        const auto result = co_await execute_sql(std::move(sql), std::move(params));
         co_return result.affected_rows;
     }
 
@@ -2756,7 +2977,7 @@ public:
         sql += detail::quote_ident(meta.columns[*meta.id_index].name);
         sql += " = ?";
 
-        const auto result = co_await connection_->execute(std::move(sql), {std::move(id)});
+        const auto result = co_await execute_sql(std::move(sql), {std::move(id)});
         co_return result.affected_rows;
     }
 
@@ -2833,8 +3054,109 @@ public:
             sql += "NOTHING";
         }
 
-        const auto result = co_await connection_->execute(std::move(sql), std::move(params));
+        const auto result = co_await execute_sql(std::move(sql), std::move(params));
         co_return result.affected_rows;
+    }
+
+    Task<std::uint64_t> batch_insert(const List<Model>& models) {
+        if (models.empty()) {
+            co_return 0;
+        }
+
+        if (!in_transaction()) {
+            co_return co_await tx([&](Mapper<Model>& scoped) -> Task<std::uint64_t> {
+                co_return co_await scoped.batch_insert(models);
+            });
+        }
+
+        std::uint64_t inserted = 0;
+        for (const auto& model : models) {
+            (void)co_await insert(model);
+            ++inserted;
+        }
+        co_return inserted;
+    }
+
+    Task<std::uint64_t> batchInsert(const List<Model>& models) {
+        co_return co_await batch_insert(models);
+    }
+
+    Task<std::uint64_t> batch_upsert(const List<Model>& models) {
+        if (models.empty()) {
+            co_return 0;
+        }
+
+        if (!in_transaction()) {
+            co_return co_await tx([&](Mapper<Model>& scoped) -> Task<std::uint64_t> {
+                co_return co_await scoped.batch_upsert(models);
+            });
+        }
+
+        std::uint64_t affected = 0;
+        for (const auto& model : models) {
+            affected += co_await upsert(model);
+        }
+        co_return affected;
+    }
+
+    Task<std::uint64_t> batchUpsert(const List<Model>& models) {
+        co_return co_await batch_upsert(models);
+    }
+
+    Task<std::uint64_t> batch_update_by_id(const List<Model>& models) {
+        if (models.empty()) {
+            co_return 0;
+        }
+
+        if (!in_transaction()) {
+            co_return co_await tx([&](Mapper<Model>& scoped) -> Task<std::uint64_t> {
+                co_return co_await scoped.batch_update_by_id(models);
+            });
+        }
+
+        std::uint64_t affected = 0;
+        for (const auto& model : models) {
+            affected += co_await update_by_id(model);
+        }
+        co_return affected;
+    }
+
+    Task<std::uint64_t> batchUpdateById(const List<Model>& models) {
+        co_return co_await batch_update_by_id(models);
+    }
+
+    Task<std::uint64_t> delete_by_query(const Query<Model>& query, bool allow_full_table = false) {
+        if (!query.joins_.empty() || !query.group_by_columns_.empty() || !query.having_clauses_.empty()) {
+            throw Error("delete_by_query does not support join/group/having");
+        }
+        if (!query.orders_.empty() || query.limit_.has_value() || query.offset_.has_value()) {
+            throw Error("delete_by_query does not support order/limit/offset");
+        }
+        if (!query.sql_tail_.empty()) {
+            throw Error("delete_by_query does not support SQL tail");
+        }
+
+        std::string sql = "DELETE FROM ";
+        sql += detail::quote_ident(table_);
+
+        std::vector<async_uv::sql::SqlParam> params;
+        if (!query.predicates_.empty()) {
+            std::string where_sql;
+            if (query.append_predicates_sql(where_sql, params, table_, query.predicates_)) {
+                sql += " WHERE ";
+                sql += where_sql;
+            }
+        } else if (!allow_full_table) {
+            throw Error(
+                "delete_by_query without predicate is blocked; pass allow_full_table=true to delete all rows");
+        }
+
+        const auto result = co_await execute_sql(std::move(sql), std::move(params));
+        co_return result.affected_rows;
+    }
+
+    Task<std::uint64_t> deleteByQuery(const Query<Model>& query, bool allow_full_table = false) {
+        co_return co_await delete_by_query(query, allow_full_table);
     }
 
     QueryChain<Model> query_chain() {
@@ -2854,6 +3176,398 @@ public:
     }
 
 private:
+    template <class Func>
+    auto tx_requires_new(TxOptions options, Func&& func)
+        -> Task<async_uv::TaskValue<std::invoke_result_t<Func, Mapper&>>> {
+        using Awaitable = std::invoke_result_t<Func, Mapper&>;
+        using ReturnType = async_uv::TaskValue<Awaitable>;
+
+        const auto conn_options = connection_->options();
+        if (conn_options.driver == async_uv::sql::Driver::sqlite
+            && (conn_options.file.empty() || conn_options.file == ":memory:")) {
+            throw Error("requires_new needs a file-backed sqlite connection");
+        }
+
+        async_uv::sql::Connection isolated_conn;
+        co_await isolated_conn.open(conn_options);
+        Mapper<Model> isolated_mapper(isolated_conn, table_);
+
+        TxOptions isolated_options = options;
+        isolated_options.propagation = TxPropagation::required;
+
+        std::exception_ptr op_error;
+        if constexpr (std::is_void_v<ReturnType>) {
+            try {
+                co_await isolated_mapper.tx_local(
+                    isolated_options,
+                    [fn = std::forward<Func>(func)](Mapper<Model>& m) mutable -> Awaitable {
+                        return std::invoke(std::move(fn), m);
+                    });
+            } catch (...) {
+                op_error = std::current_exception();
+            }
+
+            try {
+                co_await isolated_conn.close();
+            } catch (...) {
+                if (!op_error) {
+                    op_error = std::current_exception();
+                }
+            }
+
+            if (op_error) {
+                std::rethrow_exception(op_error);
+            }
+            co_return;
+        } else {
+            std::optional<ReturnType> isolated_result;
+            try {
+                isolated_result = co_await isolated_mapper.tx_local(
+                    isolated_options,
+                    [fn = std::forward<Func>(func)](Mapper<Model>& m) mutable -> Awaitable {
+                        return std::invoke(std::move(fn), m);
+                    });
+            } catch (...) {
+                op_error = std::current_exception();
+            }
+
+            try {
+                co_await isolated_conn.close();
+            } catch (...) {
+                if (!op_error) {
+                    op_error = std::current_exception();
+                }
+            }
+
+            if (op_error) {
+                std::rethrow_exception(op_error);
+            }
+            co_return std::move(*isolated_result);
+        }
+    }
+
+    template <class Func>
+    auto tx_local(TxOptions options, Func&& func)
+        -> Task<async_uv::TaskValue<std::invoke_result_t<Func, Mapper&>>> {
+        using Awaitable = std::invoke_result_t<Func, Mapper&>;
+        using ReturnType = async_uv::TaskValue<Awaitable>;
+
+        if (options.propagation == TxPropagation::requires_new) {
+            throw Error("requires_new is not allowed in local tx context");
+        }
+
+        const bool has_outer = !tx_state_->frames.empty();
+        const bool has_tx_flags =
+            options.read_only || options.isolation != TxIsolation::default_level;
+        if (has_outer && has_tx_flags) {
+            throw Error("cannot override isolation/read_only inside existing transaction; use requires_new");
+        }
+
+        const bool create_root = tx_state_->frames.empty();
+        const bool create_savepoint =
+            !create_root && options.propagation == TxPropagation::nested;
+        const int inherited_timeout =
+            tx_state_->frames.empty() ? 0 : tx_state_->frames.back().timeout_ms;
+        const int effective_timeout_ms =
+            options.timeout_ms > 0 ? options.timeout_ms : (create_savepoint ? inherited_timeout : 0);
+
+        bool boundary_opened = false;
+        if (create_root) {
+            detail::TxFrame frame;
+            frame.timeout_ms = effective_timeout_ms;
+
+            bool began = false;
+            std::exception_ptr begin_error;
+            try {
+                co_await execute_sql_with_timeout("BEGIN", frame.timeout_ms);
+                began = true;
+                co_await apply_root_tx_options(options, frame);
+            } catch (...) {
+                begin_error = std::current_exception();
+            }
+
+            if (begin_error) {
+                if (began) {
+                    try {
+                        co_await execute_sql_with_timeout("ROLLBACK", frame.timeout_ms);
+                    } catch (...) {
+                    }
+                }
+                try {
+                    co_await restore_root_tx_options(frame);
+                } catch (...) {
+                }
+                std::rethrow_exception(begin_error);
+            }
+
+            tx_state_->frames.push_back(std::move(frame));
+            boundary_opened = true;
+        } else if (create_savepoint) {
+            detail::TxFrame frame;
+            frame.timeout_ms = effective_timeout_ms;
+            frame.savepoint = "sp_" + std::to_string(++tx_state_->savepoint_seq);
+            std::string save_sql = "SAVEPOINT ";
+            save_sql += detail::quote_ident(*frame.savepoint);
+            co_await execute_sql_with_timeout(std::move(save_sql), frame.timeout_ms);
+            tx_state_->frames.push_back(std::move(frame));
+            boundary_opened = true;
+        }
+
+        auto finalize_boundary = [&](detail::TxFrame frame) -> Task<void> {
+            const bool is_root = !frame.savepoint.has_value();
+            if (frame.rollback_only) {
+                if (is_root) {
+                    co_await execute_sql_with_timeout("ROLLBACK", frame.timeout_ms);
+                } else {
+                    std::string rollback_sql = "ROLLBACK TO SAVEPOINT ";
+                    rollback_sql += detail::quote_ident(*frame.savepoint);
+                    co_await execute_sql_with_timeout(std::move(rollback_sql), frame.timeout_ms);
+
+                    std::string release_sql = "RELEASE SAVEPOINT ";
+                    release_sql += detail::quote_ident(*frame.savepoint);
+                    co_await execute_sql_with_timeout(std::move(release_sql), frame.timeout_ms);
+                }
+            } else {
+                if (is_root) {
+                    co_await execute_sql_with_timeout("COMMIT", frame.timeout_ms);
+                } else {
+                    std::string release_sql = "RELEASE SAVEPOINT ";
+                    release_sql += detail::quote_ident(*frame.savepoint);
+                    co_await execute_sql_with_timeout(std::move(release_sql), frame.timeout_ms);
+                }
+            }
+
+            if (is_root) {
+                co_await restore_root_tx_options(frame);
+            }
+        };
+
+        std::exception_ptr body_error;
+        bool body_failed = false;
+        bool boundary_rollback = false;
+        const int body_timeout_ms = boundary_opened ? effective_timeout_ms : options.timeout_ms;
+
+        if constexpr (std::is_void_v<ReturnType>) {
+            try {
+                if (body_timeout_ms > 0) {
+                    co_await async_uv::with_timeout(
+                        std::chrono::milliseconds(body_timeout_ms),
+                        std::invoke(std::forward<Func>(func), *this));
+                } else {
+                    co_await std::invoke(std::forward<Func>(func), *this);
+                }
+            } catch (...) {
+                body_failed = true;
+                try {
+                    throw;
+                } catch (const async_uv::Error& err) {
+                    if (err.code() == UV_ETIMEDOUT) {
+                        body_error = std::make_exception_ptr(Error("transaction timeout"));
+                    } else {
+                        body_error = std::current_exception();
+                    }
+                } catch (...) {
+                    body_error = std::current_exception();
+                }
+            }
+
+            if (boundary_opened) {
+                if (!tx_state_->frames.empty() && body_failed) {
+                    tx_state_->frames.back().rollback_only = true;
+                }
+                if (!tx_state_->frames.empty()) {
+                    auto frame = std::move(tx_state_->frames.back());
+                    tx_state_->frames.pop_back();
+                    boundary_rollback = frame.rollback_only;
+                    co_await finalize_boundary(std::move(frame));
+                }
+            } else if (body_failed && !tx_state_->frames.empty()) {
+                tx_state_->frames.back().rollback_only = true;
+            }
+
+            if (body_failed) {
+                std::rethrow_exception(body_error);
+            }
+            if (boundary_rollback) {
+                throw Error("transaction marked rollback_only");
+            }
+            co_return;
+        } else {
+            std::optional<ReturnType> result;
+            try {
+                if (body_timeout_ms > 0) {
+                    result = co_await async_uv::with_timeout(
+                        std::chrono::milliseconds(body_timeout_ms),
+                        std::invoke(std::forward<Func>(func), *this));
+                } else {
+                    result = co_await std::invoke(std::forward<Func>(func), *this);
+                }
+            } catch (...) {
+                body_failed = true;
+                try {
+                    throw;
+                } catch (const async_uv::Error& err) {
+                    if (err.code() == UV_ETIMEDOUT) {
+                        body_error = std::make_exception_ptr(Error("transaction timeout"));
+                    } else {
+                        body_error = std::current_exception();
+                    }
+                } catch (...) {
+                    body_error = std::current_exception();
+                }
+            }
+
+            if (boundary_opened) {
+                if (!tx_state_->frames.empty() && body_failed) {
+                    tx_state_->frames.back().rollback_only = true;
+                }
+                if (!tx_state_->frames.empty()) {
+                    auto frame = std::move(tx_state_->frames.back());
+                    tx_state_->frames.pop_back();
+                    boundary_rollback = frame.rollback_only;
+                    co_await finalize_boundary(std::move(frame));
+                }
+            } else if (body_failed && !tx_state_->frames.empty()) {
+                tx_state_->frames.back().rollback_only = true;
+            }
+
+            if (body_failed) {
+                std::rethrow_exception(body_error);
+            }
+            if (boundary_rollback) {
+                throw Error("transaction marked rollback_only");
+            }
+            co_return std::move(*result);
+        }
+    }
+
+    static async_uv::sql::QueryOptions make_query_options(int timeout_ms) {
+        return async_uv::sql::QueryOptions::builder().timeout_ms(timeout_ms).build();
+    }
+
+    static std::string isolation_sql(TxIsolation isolation) {
+        switch (isolation) {
+            case TxIsolation::default_level:
+                return "";
+            case TxIsolation::read_uncommitted:
+                return "READ UNCOMMITTED";
+            case TxIsolation::read_committed:
+                return "READ COMMITTED";
+            case TxIsolation::repeatable_read:
+                return "REPEATABLE READ";
+            case TxIsolation::serializable:
+                return "SERIALIZABLE";
+        }
+        return "";
+    }
+
+    std::optional<int> current_tx_timeout_ms() const noexcept {
+        if (!in_transaction()) {
+            return std::nullopt;
+        }
+        const int timeout_ms = tx_state_->frames.back().timeout_ms;
+        if (timeout_ms <= 0) {
+            return std::nullopt;
+        }
+        return timeout_ms;
+    }
+
+    Task<async_uv::sql::QueryResult> execute_sql(std::string sql) {
+        if (const auto timeout_ms = current_tx_timeout_ms(); timeout_ms.has_value()) {
+            co_return co_await connection_->execute(
+                std::move(sql), make_query_options(*timeout_ms));
+        }
+        co_return co_await connection_->execute(std::move(sql));
+    }
+
+    Task<async_uv::sql::QueryResult> execute_sql(
+        std::string sql, std::vector<async_uv::sql::SqlParam> params) {
+        if (const auto timeout_ms = current_tx_timeout_ms(); timeout_ms.has_value()) {
+            co_return co_await connection_->execute(
+                std::move(sql), std::move(params), make_query_options(*timeout_ms));
+        }
+        co_return co_await connection_->execute(std::move(sql), std::move(params));
+    }
+
+    Task<async_uv::sql::QueryResult> execute_sql_with_timeout(std::string sql, int timeout_ms) {
+        if (timeout_ms > 0) {
+            co_return co_await connection_->execute(
+                std::move(sql), make_query_options(timeout_ms));
+        }
+        co_return co_await connection_->execute(std::move(sql));
+    }
+
+    Task<async_uv::sql::QueryResult> query_sql(
+        std::string sql, std::vector<async_uv::sql::SqlParam> params) {
+        if (const auto timeout_ms = current_tx_timeout_ms(); timeout_ms.has_value()) {
+            co_return co_await connection_->query(
+                std::move(sql), std::move(params), make_query_options(*timeout_ms));
+        }
+        co_return co_await connection_->query(std::move(sql), std::move(params));
+    }
+
+    Task<void> apply_root_tx_options(TxOptions options, detail::TxFrame& frame) {
+        if (!options.read_only && options.isolation == TxIsolation::default_level) {
+            co_return;
+        }
+
+        const auto conn_options = connection_->options();
+        const auto driver = conn_options.driver;
+
+        if (driver == async_uv::sql::Driver::sqlite) {
+            if (options.read_only) {
+                co_await execute_sql_with_timeout("PRAGMA query_only = ON", frame.timeout_ms);
+                frame.sqlite_query_only_enabled = true;
+            }
+
+            switch (options.isolation) {
+                case TxIsolation::default_level:
+                case TxIsolation::serializable:
+                    break;
+                case TxIsolation::read_uncommitted:
+                    co_await execute_sql_with_timeout("PRAGMA read_uncommitted = 1", frame.timeout_ms);
+                    frame.sqlite_read_uncommitted_enabled = true;
+                    break;
+                case TxIsolation::read_committed:
+                case TxIsolation::repeatable_read:
+                    throw Error("sqlite does not support requested transaction isolation level");
+            }
+            co_return;
+        }
+
+        if (options.isolation != TxIsolation::default_level) {
+            auto iso = isolation_sql(options.isolation);
+            if (iso.empty()) {
+                throw Error("invalid transaction isolation level");
+            }
+            std::string sql = "SET TRANSACTION ISOLATION LEVEL ";
+            sql += iso;
+            co_await execute_sql_with_timeout(std::move(sql), frame.timeout_ms);
+        }
+
+        if (options.read_only) {
+            co_await execute_sql_with_timeout("SET TRANSACTION READ ONLY", frame.timeout_ms);
+        }
+    }
+
+    Task<void> restore_root_tx_options(const detail::TxFrame& frame) {
+        if (!frame.sqlite_query_only_enabled && !frame.sqlite_read_uncommitted_enabled) {
+            co_return;
+        }
+
+        const auto conn_options = connection_->options();
+        if (conn_options.driver != async_uv::sql::Driver::sqlite) {
+            co_return;
+        }
+
+        if (frame.sqlite_query_only_enabled) {
+            co_await execute_sql_with_timeout("PRAGMA query_only = OFF", frame.timeout_ms);
+        }
+        if (frame.sqlite_read_uncommitted_enabled) {
+            co_await execute_sql_with_timeout("PRAGMA read_uncommitted = 0", frame.timeout_ms);
+        }
+    }
+
     static List<Model> decode_rows(
         const async_uv::sql::QueryResult& result,
         const detail::ModelMeta<Model>& meta) {
@@ -2885,19 +3599,9 @@ private:
     }
 
 private:
-    struct TxFrame {
-        std::optional<std::string> savepoint;
-        bool rollback_only = false;
-    };
-
-    struct TxState {
-        std::vector<TxFrame> frames;
-        std::size_t savepoint_seq = 0;
-    };
-
     async_uv::sql::Connection* connection_ = nullptr;
     std::string table_;
-    std::shared_ptr<TxState> tx_state_ = std::make_shared<TxState>();
+    std::shared_ptr<detail::TxState> tx_state_;
 };
 
 template <class Model>
@@ -3101,7 +3805,15 @@ public:
     }
 
     Task<std::uint64_t> count() const {
-        co_return co_await mapper_->count(query_);
+        co_return co_await mapper_->count_filtered(query_);
+    }
+
+    Task<std::uint64_t> countFiltered() const {
+        co_return co_await mapper_->count_filtered(query_);
+    }
+
+    Task<std::uint64_t> countWindow() const {
+        co_return co_await mapper_->count_window(query_);
     }
 
     const Query<Model>& raw_query() const noexcept {
@@ -3158,18 +3870,39 @@ public:
         requires(std::is_member_object_pointer_v<std::remove_cvref_t<Member>>)
     UpdateChain& setSql(
         Member member,
+        UnsafeSql sql_expression,
+        std::vector<async_uv::sql::SqlParam> params = {}) {
+        return setSql(
+            std::move(member),
+            std::move(sql_expression.sql),
+            std::move(params),
+            true);
+    }
+
+    template <class Member>
+        requires(std::is_member_object_pointer_v<std::remove_cvref_t<Member>>)
+    UpdateChain& setSql(
+        Member member,
         std::string sql_expression,
         std::vector<async_uv::sql::SqlParam> params = {}) {
-        if (sql_expression.empty()) {
-            throw Error("setSql expression cannot be empty");
-        }
-        auto column = detail::resolve_column_name<Model>(member);
-        assignments_.push_back({
-            .column = std::move(column),
-            .sql_expression = std::move(sql_expression),
-            .params = std::move(params)});
-        assigned_columns_.insert(assignments_.back().column);
-        return *this;
+        return setSql(
+            std::move(member),
+            std::move(sql_expression),
+            std::move(params),
+            false);
+    }
+
+    template <class Member>
+        requires(std::is_member_object_pointer_v<std::remove_cvref_t<Member>>)
+    UpdateChain& setSql(
+        Member member,
+        UnsafeSql sql_expression,
+        std::initializer_list<async_uv::sql::SqlParam> params) {
+        return setSql(
+            std::move(member),
+            std::move(sql_expression.sql),
+            std::vector<async_uv::sql::SqlParam>(params.begin(), params.end()),
+            true);
     }
 
     template <class Member>
@@ -3181,9 +3914,32 @@ public:
         return setSql(
             std::move(member),
             std::move(sql_expression),
-            std::vector<async_uv::sql::SqlParam>(params.begin(), params.end()));
+            std::vector<async_uv::sql::SqlParam>(params.begin(), params.end()),
+            false);
     }
 
+private:
+    template <class Member>
+        requires(std::is_member_object_pointer_v<std::remove_cvref_t<Member>>)
+    UpdateChain& setSql(
+        Member member,
+        std::string sql_expression,
+        std::vector<async_uv::sql::SqlParam> params,
+        bool unsafe_marked) {
+        if (sql_expression.empty()) {
+            throw Error("setSql expression cannot be empty");
+        }
+        detail::validate_raw_sql("UpdateChain::setSql", sql_expression, unsafe_marked);
+        auto column = detail::resolve_column_name<Model>(member);
+        assignments_.push_back({
+            .column = std::move(column),
+            .sql_expression = std::move(sql_expression),
+            .params = std::move(params)});
+        assigned_columns_.insert(assignments_.back().column);
+        return *this;
+    }
+
+public:
     template <class... Args>
     UpdateChain& eq(Args&&... args) {
         query_.eq(std::forward<Args>(args)...);
@@ -3367,15 +4123,20 @@ public:
         using ReturnType = async_uv::TaskValue<Awaitable>;
 
         if constexpr (std::is_void_v<ReturnType>) {
-            co_await mapper_->tx(options, [this, fn = std::forward<Func>(func)](Mapper<Model>&) mutable -> Awaitable {
-                return std::invoke(std::move(fn), *this);
-            });
+            co_await mapper_->tx(
+                options,
+                [fn = std::forward<Func>(func)](Mapper<Model>& active_mapper) mutable -> Awaitable {
+                    Service<Model> scoped(active_mapper);
+                    co_await std::invoke(std::move(fn), scoped);
+                    co_return;
+                });
             co_return;
         } else {
             ReturnType result = co_await mapper_->tx(
                 options,
-                [this, fn = std::forward<Func>(func)](Mapper<Model>&) mutable -> Awaitable {
-                    return std::invoke(std::move(fn), *this);
+                [fn = std::forward<Func>(func)](Mapper<Model>& active_mapper) mutable -> Awaitable {
+                    Service<Model> scoped(active_mapper);
+                    co_return co_await std::invoke(std::move(fn), scoped);
                 });
             co_return result;
         }
@@ -3398,7 +4159,27 @@ public:
     }
 
     Task<std::uint64_t> count(const Query<Model>& query_model = {}) {
-        co_return co_await mapper_->count(query_model);
+        co_return co_await mapper_->count_filtered(query_model);
+    }
+
+    Task<std::uint64_t> count(const Query<Model>& query_model, CountMode mode) {
+        co_return co_await mapper_->count(query_model, mode);
+    }
+
+    Task<std::uint64_t> count_filtered(const Query<Model>& query_model = {}) {
+        co_return co_await mapper_->count_filtered(query_model);
+    }
+
+    Task<std::uint64_t> countFiltered(const Query<Model>& query_model = {}) {
+        co_return co_await mapper_->count_filtered(query_model);
+    }
+
+    Task<std::uint64_t> count_window(const Query<Model>& query_model = {}) {
+        co_return co_await mapper_->count_window(query_model);
+    }
+
+    Task<std::uint64_t> countWindow(const Query<Model>& query_model = {}) {
+        co_return co_await mapper_->count_window(query_model);
     }
 
     Task<std::uint64_t> insert(const Model& model) {
@@ -3407,6 +4188,38 @@ public:
 
     Task<std::uint64_t> upsert(const Model& model) {
         co_return co_await mapper_->upsert(model);
+    }
+
+    Task<std::uint64_t> batch_insert(const List<Model>& models) {
+        co_return co_await mapper_->batch_insert(models);
+    }
+
+    Task<std::uint64_t> batchInsert(const List<Model>& models) {
+        co_return co_await mapper_->batch_insert(models);
+    }
+
+    Task<std::uint64_t> batch_upsert(const List<Model>& models) {
+        co_return co_await mapper_->batch_upsert(models);
+    }
+
+    Task<std::uint64_t> batchUpsert(const List<Model>& models) {
+        co_return co_await mapper_->batch_upsert(models);
+    }
+
+    Task<std::uint64_t> batch_update_by_id(const List<Model>& models) {
+        co_return co_await mapper_->batch_update_by_id(models);
+    }
+
+    Task<std::uint64_t> batchUpdateById(const List<Model>& models) {
+        co_return co_await mapper_->batch_update_by_id(models);
+    }
+
+    Task<std::uint64_t> delete_by_query(const Query<Model>& query_model, bool allow_full_table = false) {
+        co_return co_await mapper_->delete_by_query(query_model, allow_full_table);
+    }
+
+    Task<std::uint64_t> deleteByQuery(const Query<Model>& query_model, bool allow_full_table = false) {
+        co_return co_await mapper_->delete_by_query(query_model, allow_full_table);
     }
 
 private:

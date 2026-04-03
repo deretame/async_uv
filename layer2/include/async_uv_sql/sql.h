@@ -182,6 +182,7 @@ public:
     Task<void> open(ConnectionOptions options);
     Task<void> close();
     Task<bool> is_open() const;
+    ConnectionOptions options() const;
     Task<void> cancel();
 
     Task<QueryResult> query(std::string sql);

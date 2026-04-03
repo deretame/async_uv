@@ -67,7 +67,12 @@ if(ASYNC_UV_BUILD_TESTS)
     target_link_libraries(multipart_parser_test PRIVATE async_uv_layer3)
     target_compile_options(multipart_parser_test PRIVATE -UNDEBUG)
     
-    add_executable(integration_test tests/integration_test.cpp)
+    add_executable(integration_test
+        tests/integration_test_main.cpp
+        tests/integration_test_http.cpp
+        tests/integration_test_di.cpp
+        tests/integration_test_orm.cpp
+    )
     target_link_libraries(integration_test PRIVATE async_uv_layer3)
     target_compile_options(integration_test PRIVATE -UNDEBUG)
     

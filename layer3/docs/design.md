@@ -2067,12 +2067,15 @@ auto tags_by_post = co_await post_mapper.load_many_to_many(
 
 1. 支持链式条件 AST（强类型优先）：`eq/ne/gt/ge/lt/le/between/like/notLike/likeLeft/likeRight/in/notIn/inSql/isNull/isNotNull/groupBy/having/orderByAsc/orderByDesc/and_/or_/nested/limit/offset/last`。
 2. 支持实体反射映射：`selectList/selectOne/selectById` 自动完成行到对象填充。
-3. 支持基础 CRUD：`insert/updateById/removeById/upsert`。
+3. 支持基础 CRUD：`insert/updateById/removeById/upsert/deleteByQuery`。
 4. 支持基于 reflect-cpp 包装类型的 schema 元信息：`AutoId<T>`、`Id<T>`、`Unique<T>`、`Indexed<T>`。
 5. 支持强类型连表：`join/leftJoin`（成员指针），并保留 `whereRaw/joinRaw` 作为原生 SQL 兜底。
 6. 支持关系加载：`load_one_to_many / load_many_to_one / load_many_to_many`（同时提供 camelCase 别名）。
-7. 支持事务：`tx(...)`（默认 required）与嵌套事务（`TxPropagation::nested`，基于 savepoint）。
-8. 当前先以 SQLite 作为默认验证路径，其他驱动可沿用同一 AST/Mapper 模型扩展。
+7. 支持事务传播：`required` / `nested`（savepoint）/ `requires_new`（独立连接事务）。
+8. 同一 `Connection` 下多 `Mapper/Service` 共享事务上下文（`required` 传播行为一致）。
+9. 支持事务选项：`isolation`、`read_only`、`timeout_ms`（驱动相关能力按可用性生效）。
+10. 支持批量能力：`batchInsert/batchUpsert/batchUpdateById`（`Mapper` 与 `Service` 均可用）。
+11. 当前先以 SQLite 作为默认验证路径，其他驱动可沿用同一 AST/Mapper 模型扩展。
 
 链式查询 TODO 清单（文档对齐版）：
 
@@ -2090,6 +2093,7 @@ auto tags_by_post = co_await post_mapper.load_many_to_many(
 | 判空 / 范围 | `in` | ✅ | 已支持 |
 | 判空 / 范围 | `notIn` | ✅ | 已支持 |
 | 判空 / 范围 | `inSql` | ✅ | 已支持 |
+| 判空 / 范围 | `notInSql` | ✅ | 已支持 |
 | 排序 / 分组 | `orderByAsc/orderByDesc` | ✅ | 已支持 |
 | 排序 / 分组 | `groupBy` | ✅ | 已支持 |
 | 排序 / 分组 | `having` | ✅ | 已支持 |
@@ -2101,9 +2105,11 @@ auto tags_by_post = co_await post_mapper.load_many_to_many(
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
-| 查询链（`query().eq(...).list()`） | ✅ | 已支持 `list/one/count` 终结器 |
+| 查询链（`query().eq(...).list()`） | ✅ | 已支持 `list/one/count/countFiltered/countWindow` 终结器 |
 | 更新链（`update().set(...).eq(...).execute()`） | ✅ | 已支持 `set / setIf / setIfAbsent / setSql` |
-| 计数链（`query().count()`） | ✅ | 通过子查询 `COUNT(*)` 执行 |
+| 计数链（`query().count()`） | ✅ | 默认是“过滤后总数”（忽略 `order/limit/offset/last`） |
+| 窗口计数（`query().countWindow()`） | ✅ | 统计当前窗口（包含 `limit/offset`） |
+| 批量写入 | ✅ | `batchInsert/batchUpsert/batchUpdateById` |
 
 ```cpp
 orm::Mapper<User> mapper(conn);
@@ -2117,6 +2123,13 @@ auto count = co_await service.query()
     .eq(&User::status, "ACTIVE")
     .count();
 
+auto count_window = co_await service.query()
+    .eq(&User::status, "ACTIVE")
+    .orderByDesc(&User::id)
+    .limit(20)
+    .offset(20)
+    .countWindow();
+
 auto affected = co_await service.update()
     .set(&User::status, "LOCKED")
     .eq(&User::role, "ADMIN")
@@ -2124,7 +2137,7 @@ auto affected = co_await service.update()
 
 // 表达式更新 + 条件化更新
 auto affected2 = co_await service.update()
-    .setSql(&User::age, "\"age\" + ?", {async_uv::sql::SqlParam(1)})
+    .setSql(&User::age, orm::unsafe_sql("\"age\" + ?"), {async_uv::sql::SqlParam(1)})
     .setIfAbsent(&User::status, "PENDING")
     .eq(&User::role, "USER")
     .execute();
@@ -2154,7 +2167,30 @@ co_await service.tx([&](auto& outer) -> Task<void> {
     } catch (...) {}
     co_return;
 });
+
+// requires_new（独立连接事务）+ 事务选项
+co_await service.tx([&](auto& outer) -> Task<void> {
+    co_await outer.tx(
+        {
+            .propagation = orm::TxPropagation::requires_new,
+            .isolation = orm::TxIsolation::read_uncommitted,
+            .read_only = true,
+            .timeout_ms = 1000
+        },
+        [&](auto& isolated) -> Task<void> {
+            auto c = co_await isolated.query().count();
+            (void)c;
+            co_return;
+        });
+    co_return;
+});
 ```
+
+事务语义备注（SQLite）：
+
+1. `requires_new` 需要“可复用连接配置”来新建连接；对 `:memory:` sqlite 不可用。
+2. sqlite 在外层事务已持有写锁时，内层 `requires_new` 写入可能被锁阻塞/失败。
+3. sqlite 的 `read_only` / `read_uncommitted` 通过 `PRAGMA` 实现；其他隔离级别按驱动能力支持。
 
 类型转换（可自定义转换器）：
 
@@ -2162,6 +2198,55 @@ co_await service.tx([&](auto& outer) -> Task<void> {
 2. 可通过特化 `orm::TypeConverter<T>` 实现全局转换逻辑（入库 + 出库 + 列类型）。
 3. 可通过字段包装 `orm::As<T, Converter>` 做字段级转换（同类型不同字段可使用不同策略）。
 4. 字段数据库名可通过 `rfl::Rename<"...", T>` 定义（与转换器可组合使用）。
+
+JSON 字段操作（链式 + Raw SQL）：
+
+> 说明：不扩展 ORM DSL 时，可通过 `whereRaw` / `setSql` 直接嵌入数据库原生 JSON 函数。  
+> 建议统一使用 `orm::unsafe_sql(...)` 标注原生片段；可通过 `orm::set_raw_sql_policy(orm::RawSqlPolicy::require_unsafe_marker)` 强制要求显式标注。
+
+```cpp
+struct JsonDoc {
+    static constexpr std::string_view table_name = "json_docs";
+    orm::AutoId<std::int64_t> id = 0;
+    std::string biz_key;
+    std::string payload; // TEXT: 存放 JSON 字符串
+};
+
+orm::Mapper<JsonDoc> mapper(conn);
+co_await mapper.sync_schema();
+
+// 查询：按 JSON 字段过滤
+auto docs = co_await mapper.query()
+    .whereRaw(
+        orm::unsafe_sql(
+            "json_extract(\"payload\", '$.level') = ? "
+            "AND json_extract(\"payload\", '$.meta.env') = ?"),
+        {async_uv::sql::SqlParam("INFO"), async_uv::sql::SqlParam("prod")})
+    .orderByAsc(&JsonDoc::id)
+    .list();
+
+// 查询：JSON 数组包含（json_each）
+auto with_boot_tag = co_await mapper.query()
+    .whereRaw(
+        orm::unsafe_sql(
+            "EXISTS (SELECT 1 FROM json_each(\"payload\", '$.tags') t WHERE t.value = ?)"),
+        {async_uv::sql::SqlParam("boot")})
+    .list();
+
+// 更新：原地更新 JSON 字段（json_set）
+auto affected = co_await mapper.update()
+    .setSql(
+        &JsonDoc::payload,
+        orm::unsafe_sql(
+            "json_set("
+            "\"payload\", '$.count', "
+            "COALESCE(CAST(json_extract(\"payload\", '$.count') AS INTEGER), 0) + ?)"),
+        {async_uv::sql::SqlParam(1)})
+    .whereRaw(
+        orm::unsafe_sql("json_extract(\"payload\", '$.level') = ?"),
+        {async_uv::sql::SqlParam("INFO")})
+    .execute();
+```
 
 ```cpp
 namespace async_uv::layer3::orm {

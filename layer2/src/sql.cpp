@@ -1384,6 +1384,10 @@ Task<bool> Connection::is_open() const {
     co_return impl_->is_open();
 }
 
+ConnectionOptions Connection::options() const {
+    return impl_->options_;
+}
+
 Task<QueryResult> Connection::query(std::string sql) {
     co_return co_await query(std::move(sql), {}, QueryOptions{});
 }
