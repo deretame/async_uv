@@ -1,14 +1,16 @@
 #pragma once
 
-#include <cstddef>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <uv.h>
+#include <netdb.h>
+#include <sys/socket.h>
 
 #include "async_uv/cancel.h"
 #include "async_uv/runtime.h"
@@ -83,9 +85,6 @@ private:
 
     sockaddr_storage storage_{};
     int length_ = 0;
-
-    friend Task<std::vector<SocketAddress>>
-    resolve(std::string host, int port, ResolveOptions options);
 };
 
 using Endpoint = SocketAddress;
@@ -125,11 +124,13 @@ public:
     static Task<TcpClient> connect(std::string host, int port);
     static Task<TcpClient> connect(std::string host, int port, TcpConnectOptions options);
     static Task<TcpClient> connect(SocketAddress endpoint);
+
     template <typename Rep, typename Period>
     static Task<TcpClient>
     connect_for(std::string host, int port, std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, connect(std::move(host), port));
     }
+
     template <typename Rep, typename Period>
     static Task<TcpClient> connect_for(std::string host,
                                        int port,
@@ -137,16 +138,19 @@ public:
                                        std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, connect(std::move(host), port, options));
     }
+
     template <typename Rep, typename Period>
     static Task<TcpClient> connect_for(SocketAddress endpoint,
                                        std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, connect(std::move(endpoint)));
     }
+
     template <typename Clock, typename Duration>
     static Task<TcpClient>
     connect_until(std::string host, int port, std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, connect(std::move(host), port));
     }
+
     template <typename Clock, typename Duration>
     static Task<TcpClient> connect_until(std::string host,
                                          int port,
@@ -155,6 +159,7 @@ public:
         co_return co_await async_uv::with_deadline(deadline,
                                                    connect(std::move(host), port, options));
     }
+
     template <typename Clock, typename Duration>
     static Task<TcpClient> connect_until(SocketAddress endpoint,
                                          std::chrono::time_point<Clock, Duration> deadline) {
@@ -179,77 +184,93 @@ public:
     Task<void> set_keepalive(bool enable = true, unsigned int delay_seconds = 60);
     Task<void> shutdown();
     Task<void> close();
+
     template <typename Rep, typename Period>
     Task<std::size_t> write_for(std::string_view data, std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, write(data));
     }
+
     template <typename Rep, typename Period>
     Task<std::size_t> write_all_for(std::string_view data,
                                     std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, write_all(data));
     }
+
     template <typename Rep, typename Period>
     Task<std::string> read_once_for(std::chrono::duration<Rep, Period> timeout,
                                     std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_timeout(timeout, read_once(max_bytes));
     }
+
     template <typename Rep, typename Period>
     Task<std::string> read_some_for(std::chrono::duration<Rep, Period> timeout,
                                     std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_timeout(timeout, read_some(max_bytes));
     }
+
     template <typename Rep, typename Period>
     Task<std::string> read_exactly_for(std::size_t bytes,
                                        std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, read_exactly(bytes));
     }
+
     template <typename Rep, typename Period>
     Task<std::string> read_all_for(std::chrono::duration<Rep, Period> timeout,
                                    std::size_t chunk_size = 64 * 1024) {
         co_return co_await async_uv::with_timeout(timeout, read_all(chunk_size));
     }
+
     template <typename Clock, typename Duration>
     Task<std::size_t> write_until(std::string_view data,
                                   std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, write(data));
     }
+
     template <typename Clock, typename Duration>
     Task<std::size_t> write_all_until(std::string_view data,
                                       std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, write_all(data));
     }
+
     template <typename Clock, typename Duration>
     Task<std::string> read_once_until(std::chrono::time_point<Clock, Duration> deadline,
                                       std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_deadline(deadline, read_once(max_bytes));
     }
+
     template <typename Clock, typename Duration>
     Task<std::string> read_some_until(std::chrono::time_point<Clock, Duration> deadline,
                                       std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_deadline(deadline, read_some(max_bytes));
     }
+
     template <typename Clock, typename Duration>
     Task<std::string> read_exactly_until(std::size_t bytes,
                                          std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, read_exactly(bytes));
     }
+
     template <typename Clock, typename Duration>
     Task<std::string> read_all_until(std::chrono::time_point<Clock, Duration> deadline,
                                      std::size_t chunk_size = 64 * 1024) {
         co_return co_await async_uv::with_deadline(deadline, read_all(chunk_size));
     }
+
     template <typename Rep, typename Period>
     Task<void> shutdown_for(std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, shutdown());
     }
+
     template <typename Rep, typename Period>
     Task<void> close_for(std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, close());
     }
+
     template <typename Clock, typename Duration>
     Task<void> shutdown_until(std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, shutdown());
     }
+
     template <typename Clock, typename Duration>
     Task<void> close_until(std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, close());
@@ -275,55 +296,6 @@ public:
     }
     stream_type receive_chunks(std::size_t max_bytes = 64 * 1024) {
         return chunks(max_bytes);
-    }
-    template <typename Rep, typename Period>
-    Task<std::size_t> send_for(std::string_view data, std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await write_for(data, timeout);
-    }
-    template <typename Rep, typename Period>
-    Task<std::size_t> send_all_for(std::string_view data,
-                                   std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await write_all_for(data, timeout);
-    }
-    template <typename Rep, typename Period>
-    Task<std::string> receive_for(std::chrono::duration<Rep, Period> timeout,
-                                  std::size_t max_bytes = 64 * 1024) {
-        co_return co_await read_some_for(timeout, max_bytes);
-    }
-    template <typename Rep, typename Period>
-    Task<std::string> receive_exactly_for(std::size_t bytes,
-                                          std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await read_exactly_for(bytes, timeout);
-    }
-    template <typename Rep, typename Period>
-    Task<std::string> receive_all_for(std::chrono::duration<Rep, Period> timeout,
-                                      std::size_t chunk_size = 64 * 1024) {
-        co_return co_await read_all_for(timeout, chunk_size);
-    }
-    template <typename Clock, typename Duration>
-    Task<std::size_t> send_until(std::string_view data,
-                                 std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await write_until(data, deadline);
-    }
-    template <typename Clock, typename Duration>
-    Task<std::size_t> send_all_until(std::string_view data,
-                                     std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await write_all_until(data, deadline);
-    }
-    template <typename Clock, typename Duration>
-    Task<std::string> receive_until(std::chrono::time_point<Clock, Duration> deadline,
-                                    std::size_t max_bytes = 64 * 1024) {
-        co_return co_await read_some_until(deadline, max_bytes);
-    }
-    template <typename Clock, typename Duration>
-    Task<std::string> receive_exactly_until(std::size_t bytes,
-                                            std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await read_exactly_until(bytes, deadline);
-    }
-    template <typename Clock, typename Duration>
-    Task<std::string> receive_all_until(std::chrono::time_point<Clock, Duration> deadline,
-                                        std::size_t chunk_size = 64 * 1024) {
-        co_return co_await read_all_until(deadline, chunk_size);
     }
     Task<SocketAddress> local_endpoint() {
         return local_address();
@@ -365,18 +337,22 @@ public:
     Task<void> set_simultaneous_accepts(bool enable = true);
     Task<TcpClient> accept();
     Task<void> close();
+
     template <typename Rep, typename Period>
     Task<TcpClient> accept_for(std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, accept());
     }
+
     template <typename Clock, typename Duration>
     Task<TcpClient> accept_until(std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, accept());
     }
+
     template <typename Rep, typename Period>
     Task<void> close_for(std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, close());
     }
+
     template <typename Clock, typename Duration>
     Task<void> close_until(std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, close());
@@ -394,3 +370,4 @@ using TcpSocket = TcpClient;
 using TcpAcceptor = TcpListener;
 
 } // namespace async_uv
+

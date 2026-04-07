@@ -36,6 +36,4 @@ private:
     std::shared_ptr<State> state_;
 };
 
-Task<void> sleep_until(std::chrono::steady_clock::time_point deadline);
-
 } // namespace async_uv

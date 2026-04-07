@@ -1,22 +1,27 @@
 #pragma once
 
-#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <concepts>
-#include <condition_variable>
-#include <cstddef>
-#include <deque>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <async_simple/Promise.h>
-#include <async_simple/util/Queue.h>
+#include <asio/experimental/channel_error.hpp>
+#include <asio/experimental/concurrent_channel.hpp>
+#include <asio/bind_executor.hpp>
+#include <asio/strand.hpp>
 
-#include "async_uv/error.h"
 #include "async_uv/cancel.h"
 #include "async_uv/runtime.h"
 #include "async_uv/stream.h"
@@ -24,695 +29,669 @@
 namespace async_uv {
 
 template <typename T>
-concept MovableToChannel = std::move_constructible<std::decay_t<T>>;
+concept MyConstraint = std::is_trivial_v<T> && std::is_copy_constructible_v<T>;
 
-template <typename T>
-concept MoveOnlyMessage = MovableToChannel<T> && !std::copy_constructible<std::decay_t<T>>;
+namespace message_detail {
+namespace asio = exec::asio::asio_impl;
 
-struct MailboxOptions {
-    enum class OverflowPolicy {
-        reject_new,
-        drop_oldest,
-    };
+inline std::error_code make_aborted_error() {
+    return std::make_error_code(std::errc::operation_canceled);
+}
 
-    // 可选上限；未设置时为无界队列。
-    std::optional<std::size_t> max_buffered_messages = std::nullopt;
-    // 队列满时的策略。
-    OverflowPolicy overflow_policy = OverflowPolicy::reject_new;
-};
+} // namespace message_detail
 
-template <MoveOnlyMessage T>
-class MessageSender;
-
-template <MoveOnlyMessage T>
-class Mailbox {
+template <MyConstraint T>
+class MessageBus {
 public:
     using value_type = T;
-    using next_type = std::optional<T>;
-    using task_type = Task<next_type>;
-    using stream_type = Stream<T>;
 
-    Mailbox() = default;
-    ~Mailbox() {
-        request_close();
-    }
+    struct Options {
+        std::size_t topic_capacity = 1024;
+        std::size_t subscription_capacity = 1024;
+    };
 
-    Mailbox(const Mailbox &) = delete;
-    Mailbox &operator=(const Mailbox &) = delete;
-    Mailbox(Mailbox &&) noexcept = default;
-    Mailbox &operator=(Mailbox &&) noexcept = default;
+    class IoPublisher;
+    class ThreadPublisher;
+    class Subscription;
 
-    static Task<Mailbox> create(MailboxOptions options = {}) {
+    MessageBus() = default;
+
+    static Task<MessageBus> create(Options options = {}) {
         auto *runtime = co_await get_current_runtime();
-        co_return co_await create(*runtime, options);
+        co_return MessageBus(std::make_shared<State>(runtime, std::move(options)));
     }
 
-    static Task<Mailbox> create(Runtime &runtime, MailboxOptions options = {}) {
-        if (options.max_buffered_messages.has_value() && *options.max_buffered_messages == 0) {
-            throw std::invalid_argument("mailbox max_buffered_messages must be greater than zero");
-        }
-
-        auto state = std::make_shared<State>(&runtime, options);
-        auto promise = std::make_shared<async_simple::Promise<void>>();
-        auto future = promise->getFuture().via(&runtime);
-
-        runtime.post([state, promise]() mutable {
-            const int rc =
-                uv_async_init(state->runtime->loop(), &state->async, [](uv_async_t *handle) {
-                    static_cast<State *>(handle->data)->drain();
-                });
-
-            if (rc < 0) {
-                promise->setException(std::make_exception_ptr(Error("uv_async_init", rc)));
-                return;
-            }
-
-            state->async.data = state.get();
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->initialized = true;
-            }
-            promise->setValue();
-        });
-
-        co_await std::move(future);
-        co_return Mailbox(std::move(state));
+    static MessageBus create(Runtime &runtime, Options options = {}) {
+        return MessageBus(std::make_shared<State>(&runtime, std::move(options)));
     }
 
-    bool valid() const noexcept {
+    [[nodiscard]] bool valid() const noexcept {
         return state_ != nullptr;
     }
 
-    std::size_t buffered_size() const noexcept {
+    [[nodiscard]] bool is_open() const noexcept {
+        return state_ != nullptr && state_->is_open();
+    }
+
+    IoPublisher io_publisher(std::string topic) const {
+        return IoPublisher(state_, std::move(topic));
+    }
+
+    ThreadPublisher thread_publisher(std::string topic) const {
+        Runtime *runtime = state_ ? state_->runtime : nullptr;
+        return ThreadPublisher(state_, std::move(topic), runtime);
+    }
+
+    Subscription subscribe(std::string topic) const {
         if (!state_) {
-            return 0;
+            return Subscription{};
         }
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        return state_->queued_messages;
+        state_->require_io_thread("MessageBus::subscribe");
+        return state_->subscribe(std::move(topic));
     }
 
-    bool is_bounded() const noexcept {
-        return max_buffered_messages().has_value();
-    }
-
-    std::optional<std::size_t> max_buffered_messages() const noexcept {
+    void close_topic(std::string_view topic) const {
         if (!state_) {
-            return std::nullopt;
+            return;
         }
-        return state_->max_buffered_messages;
-    }
-
-    MessageSender<T> sender() const {
-        return MessageSender<T>(state_);
-    }
-
-    task_type recv() const {
-        if (!state_) {
-            throw std::runtime_error("mailbox is empty");
-        }
-        co_return co_await recv_impl(state_);
-    }
-
-    template <typename Rep, typename Period>
-    task_type recv_for(std::chrono::duration<Rep, Period> timeout) const {
-        if (!state_) {
-            throw std::runtime_error("mailbox is empty");
-        }
-        co_return co_await async_uv::with_timeout(timeout, recv_impl(state_));
-    }
-
-    template <typename Clock, typename Duration>
-    task_type recv_until(std::chrono::time_point<Clock, Duration> deadline) const {
-        if (!state_) {
-            throw std::runtime_error("mailbox is empty");
-        }
-        co_return co_await async_uv::with_deadline(deadline, recv_impl(state_));
-    }
-
-    stream_type messages() const {
-        auto state = state_;
-        if (!state) {
-            return {};
-        }
-
-        return stream_type([state = std::move(state)]() -> task_type {
-            co_return co_await recv_impl(state);
-        });
-    }
-
-    Task<void> close() {
-        if (!state_) {
-            co_return;
-        }
-
-        auto state = state_;
-        auto promise = std::make_shared<async_simple::Promise<void>>();
-        auto future = promise->getFuture().via(state->runtime);
-
-        state->runtime->post([state, promise]() mutable {
-            bool complete_now = false;
-            bool need_notify = false;
-
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->closed) {
-                    complete_now = true;
-                } else {
-                    state->close_waiters.push_back(promise);
-                    if (!state->close_requested) {
-                        state->close_requested = true;
-                        state->self_keepalive = state;
-                        need_notify = state->initialized && !state->closing;
-                    }
-                }
-            }
-
-            if (complete_now) {
-                promise->setValue();
-                return;
-            }
-
-            if (need_notify) {
-                uv_async_send(&state->async);
-            }
-        });
-
-        co_await std::move(future);
-    }
-
-    template <typename Rep, typename Period>
-    Task<void> close_for(std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await async_uv::with_timeout(timeout, close());
-    }
-
-    template <typename Clock, typename Duration>
-    Task<void> close_until(std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await async_uv::with_deadline(deadline, close());
-    }
-
-private:
-    struct ReceiveWaiter {
-        std::shared_ptr<async_simple::Promise<next_type>> promise;
-        std::unique_ptr<async_simple::Slot> slot;
-        bool completed = false;
-    };
-
-    static std::exception_ptr make_recv_cancel_error() {
-        return std::make_exception_ptr(
-            async_simple::SignalException(async_simple::Terminate, "mailbox receive canceled"));
-    }
-
-    struct State : std::enable_shared_from_this<State> {
-        enum class PushStatus {
-            sent,
-            closed,
-            full,
-            dropped_oldest,
-            async_error,
-        };
-
-        State(Runtime *runtime_in, MailboxOptions options_in)
-            : runtime(runtime_in), max_buffered_messages(options_in.max_buffered_messages),
-              overflow_policy(options_in.overflow_policy) {}
-
-        PushStatus push_with_status(T &&value) {
-            std::size_t queued_after = 0;
-            std::size_t queued_snapshot = 0;
-            bool closed = false;
-            bool full = false;
-            bool dropped_oldest = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                queued_snapshot = queued_messages;
-                if (!initialized || close_requested || closing || this->closed) {
-                    closed = true;
-                } else if (max_buffered_messages.has_value() &&
-                           queued_messages >= *max_buffered_messages) {
-                    if (overflow_policy == MailboxOptions::OverflowPolicy::drop_oldest) {
-                        next_type dropped;
-                        if (messages.try_pop(dropped)) {
-                            if (queued_messages > 0) {
-                                --queued_messages;
-                            }
-                            dropped_oldest = true;
-                        } else {
-                            full = true;
-                        }
-                    } else {
-                        full = true;
-                    }
-                }
-
-                if (!closed && !full) {
-                    messages.push(next_type{std::move(value)});
-                    ++queued_messages;
-                    queued_after = queued_messages;
-                } else {
-                    queued_after = queued_messages;
-                }
-            }
-
-            if (closed) {
-                emit_trace_event({"mailbox", "send_rejected_closed", 0, queued_snapshot});
-                return PushStatus::closed;
-            }
-            if (full) {
-                emit_trace_event({"mailbox", "send_rejected_full", 0, queued_snapshot});
-                return PushStatus::full;
-            }
-
-            if (dropped_oldest) {
-                emit_trace_event({"mailbox", "send_drop_oldest", 0, queued_snapshot});
-            }
-
-            const int rc = uv_async_send(&async);
-            if (rc < 0) {
-                emit_trace_event({"mailbox", "send_async_error", rc, queued_after});
-                return PushStatus::async_error;
-            }
-
-            emit_trace_event({"mailbox", "send", 0, queued_after});
-            return dropped_oldest ? PushStatus::dropped_oldest : PushStatus::sent;
-        }
-
-        bool push(T &&value) {
-            const auto status = push_with_status(std::move(value));
-            return status == PushStatus::sent || status == PushStatus::dropped_oldest;
-        }
-
-        template <typename Clock, typename Duration>
-        bool push_until(T &&value, std::chrono::time_point<Clock, Duration> deadline) {
-            if (runtime != nullptr && runtime->currentThreadInExecutor()) {
-                return push(std::move(value));
-            }
-
-            std::unique_lock<std::mutex> lock(mutex);
-            while (true) {
-                if (!initialized || close_requested || closing || closed) {
-                    const std::size_t queued = queued_messages;
-                    lock.unlock();
-                    emit_trace_event({"mailbox", "send_rejected_closed", 0, queued});
-                    return false;
-                }
-
-                if (!max_buffered_messages.has_value() ||
-                    queued_messages < *max_buffered_messages) {
-                    messages.push(next_type{std::move(value)});
-                    ++queued_messages;
-                    const std::size_t queued_after = queued_messages;
-                    lock.unlock();
-
-                    const int rc = uv_async_send(&async);
-                    if (rc < 0) {
-                        emit_trace_event({"mailbox", "send_async_error", rc, queued_after});
-                        return false;
-                    }
-
-                    emit_trace_event({"mailbox", "send", 0, queued_after});
-                    return true;
-                }
-
-                if (overflow_policy == MailboxOptions::OverflowPolicy::drop_oldest) {
-                    next_type dropped;
-                    if (messages.try_pop(dropped)) {
-                        if (queued_messages > 0) {
-                            --queued_messages;
-                        }
-
-                        messages.push(next_type{std::move(value)});
-                        ++queued_messages;
-                        const std::size_t queued_after = queued_messages;
-                        lock.unlock();
-
-                        emit_trace_event({"mailbox", "send_drop_oldest", 0, queued_after});
-
-                        const int rc = uv_async_send(&async);
-                        if (rc < 0) {
-                            emit_trace_event({"mailbox", "send_async_error", rc, queued_after});
-                            return false;
-                        }
-
-                        emit_trace_event({"mailbox", "send", 0, queued_after});
-                        return true;
-                    }
-                }
-
-                if (space_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
-                    const std::size_t queued = queued_messages;
-                    lock.unlock();
-                    emit_trace_event({"mailbox", "send_timeout", 0, queued});
-                    return false;
-                }
-            }
-        }
-
-        void request_close() {
-            bool need_notify = false;
-
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                if (close_requested || closed) {
-                    return;
-                }
-                close_requested = true;
-                self_keepalive = this->shared_from_this();
-                need_notify = initialized && !closing;
-            }
-
-            if (need_notify) {
-                uv_async_send(&async);
-            }
-
-            space_cv.notify_all();
-        }
-
-        void drain() {
-            std::vector<std::pair<std::shared_ptr<ReceiveWaiter>, next_type>> ready_messages;
-            std::vector<std::shared_ptr<ReceiveWaiter>> ready_closes;
-            bool should_close_handle = false;
-            bool freed_space = false;
-
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-
-                while (!waiters.empty()) {
-                    next_type message;
-                    if (!messages.try_pop(message)) {
-                        break;
-                    }
-                    if (queued_messages > 0) {
-                        --queued_messages;
-                        freed_space = true;
-                    }
-                    waiters.front()->completed = true;
-                    ready_messages.emplace_back(waiters.front(), std::move(message));
-                    waiters.pop_front();
-                }
-
-                if (close_requested) {
-                    while (!waiters.empty()) {
-                        waiters.front()->completed = true;
-                        ready_closes.push_back(waiters.front());
-                        waiters.pop_front();
-                    }
-
-                    if (initialized && !closing && !closed) {
-                        closing = true;
-                        should_close_handle = true;
-                    }
-                }
-            }
-
-            if (freed_space || !ready_closes.empty()) {
-                space_cv.notify_all();
-            }
-
-            for (auto &ready : ready_messages) {
-                ready.first->promise->setValue(std::move(ready.second));
-            }
-
-            for (auto &waiter : ready_closes) {
-                waiter->promise->setValue(next_type{});
-            }
-
-            if (should_close_handle) {
-                uv_close(reinterpret_cast<uv_handle_t *>(&async), [](uv_handle_t *handle) {
-                    auto *state = static_cast<State *>(handle->data);
-                    std::vector<std::shared_ptr<async_simple::Promise<void>>> close_waiters;
-                    std::shared_ptr<State> keepalive;
-
-                    {
-                        std::lock_guard<std::mutex> lock(state->mutex);
-                        state->initialized = false;
-                        state->closing = false;
-                        state->closed = true;
-                        close_waiters.assign(state->close_waiters.begin(),
-                                             state->close_waiters.end());
-                        state->close_waiters.clear();
-                        keepalive = std::move(state->self_keepalive);
-                    }
-
-                    for (auto &waiter : close_waiters) {
-                        waiter->setValue();
-                    }
-
-                    state->space_cv.notify_all();
-                });
-            }
-        }
-
-        Runtime *runtime = nullptr;
-        std::optional<std::size_t> max_buffered_messages;
-        MailboxOptions::OverflowPolicy overflow_policy = MailboxOptions::OverflowPolicy::reject_new;
-        uv_async_t async{};
-        std::mutex mutex;
-        std::condition_variable space_cv;
-        async_simple::util::Queue<next_type> messages;
-        std::deque<std::shared_ptr<ReceiveWaiter>> waiters;
-        std::deque<std::shared_ptr<async_simple::Promise<void>>> close_waiters;
-        std::shared_ptr<State> self_keepalive;
-        bool initialized = false;
-        bool close_requested = false;
-        bool closing = false;
-        bool closed = false;
-        std::size_t queued_messages = 0;
-    };
-
-    explicit Mailbox(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
-
-    static task_type recv_impl(const std::shared_ptr<State> &state) {
-        auto signal = co_await get_current_signal();
-        auto promise = std::make_shared<async_simple::Promise<next_type>>();
-        auto future = promise->getFuture().via(state->runtime);
-
-        state->runtime->post([state, signal = std::move(signal), promise]() mutable {
-            next_type ready;
-            bool canceled = false;
-            bool freed_space = false;
-
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                next_type message;
-                if (state->messages.try_pop(message)) {
-                    if (state->queued_messages > 0) {
-                        --state->queued_messages;
-                        freed_space = true;
-                    }
-                    ready = std::move(message);
-                } else if (state->close_requested || state->closed) {
-                } else {
-                    auto waiter = std::make_shared<ReceiveWaiter>();
-                    waiter->promise = promise;
-
-                    if (signal != nullptr) {
-                        waiter->slot = std::make_unique<async_simple::Slot>(signal.get());
-                        if (!async_simple::signalHelper{async_simple::Terminate}.tryEmplace(
-                                waiter->slot.get(),
-                                [runtime = state->runtime,
-                                 weak_state = std::weak_ptr<State>(state),
-                                 weak_waiter = std::weak_ptr<ReceiveWaiter>(waiter)](
-                                    async_simple::SignalType, async_simple::Signal *) mutable {
-                                    auto state = weak_state.lock();
-                                    auto waiter = weak_waiter.lock();
-                                    if (!state || !waiter) {
-                                        return;
-                                    }
-
-                                    runtime->post([state = std::move(state),
-                                                   waiter = std::move(waiter)]() mutable {
-                                        bool removed = false;
-                                        {
-                                            std::lock_guard<std::mutex> lock(state->mutex);
-                                            if (!waiter->completed) {
-                                                auto it = std::find(state->waiters.begin(),
-                                                                    state->waiters.end(),
-                                                                    waiter);
-                                                if (it != state->waiters.end()) {
-                                                    waiter->completed = true;
-                                                    state->waiters.erase(it);
-                                                    removed = true;
-                                                }
-                                            }
-                                        }
-
-                                        if (!removed) {
-                                            return;
-                                        }
-
-                                        waiter->promise->setException(make_recv_cancel_error());
-                                    });
-                                })) {
-                            canceled = true;
-                        }
-                    }
-
-                    if (!canceled) {
-                        state->waiters.push_back(std::move(waiter));
-                        return;
-                    }
-                }
-            }
-
-            if (canceled) {
-                promise->setException(make_recv_cancel_error());
-                return;
-            }
-
-            if (freed_space) {
-                state->space_cv.notify_all();
-            }
-
-            promise->setValue(std::move(ready));
-        });
-
-        auto result = co_await std::move(future);
-        emit_trace_event({"mailbox", result.has_value() ? "recv" : "recv_closed", 0, 0});
-        co_return result;
-    }
-
-    void request_close() {
-        if (state_) {
-            state_->request_close();
-        }
-    }
-
-    std::shared_ptr<State> state_;
-
-    friend class MessageSender<T>;
-};
-
-template <MoveOnlyMessage T>
-class MessageSender {
-public:
-    MessageSender() = default;
-
-    bool try_send(T &&value) const {
-        if (!state_) {
-            return false;
-        }
-        return state_->push(std::move(value));
-    }
-
-    bool try_send(T &value) const {
-        return try_send(std::move(value));
-    }
-
-    bool try_send(const T &) const = delete;
-
-    bool send(T &&value) const {
-        return try_send(std::move(value));
-    }
-
-    bool send(T &value) const {
-        return send(std::move(value));
-    }
-
-    bool send(const T &) const = delete;
-
-    template <typename Rep, typename Period>
-    // 异步等待容量（协程接口）。
-    Task<bool> send_for(T &&value, std::chrono::duration<Rep, Period> timeout) const {
-        co_return co_await send_until(std::move(value), std::chrono::steady_clock::now() + timeout);
-    }
-
-    template <typename Rep, typename Period>
-    Task<bool> send_for(T &value, std::chrono::duration<Rep, Period> timeout) const {
-        co_return co_await send_for(std::move(value), timeout);
-    }
-
-    template <typename Clock, typename Duration>
-    // 异步等待直到 deadline（协程接口）。
-    Task<bool> send_until(T &&value, std::chrono::time_point<Clock, Duration> deadline) const {
-        if (!state_) {
-            co_return false;
-        }
-
-        std::optional<T> pending;
-        pending.emplace(std::move(value));
-
-        using PushStatus = typename Mailbox<T>::State::PushStatus;
-        auto backoff = std::chrono::milliseconds(1);
-        while (true) {
-            const auto status = state_->push_with_status(std::move(*pending));
-            if (status == PushStatus::sent || status == PushStatus::dropped_oldest) {
-                co_return true;
-            }
-            if (status == PushStatus::closed || status == PushStatus::async_error) {
-                co_return false;
-            }
-
-            const auto now = Clock::now();
-            if (now >= deadline) {
-                emit_trace_event({"mailbox", "send_timeout", 0, snapshot_queue_size(state_)});
-                co_return false;
-            }
-
-            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-            auto sleep_duration = std::min(backoff, remaining);
-            if (sleep_duration <= std::chrono::milliseconds::zero()) {
-                sleep_duration = std::chrono::milliseconds(1);
-            }
-            co_await async_uv::sleep_for(sleep_duration);
-
-            if (backoff < std::chrono::milliseconds(8)) {
-                backoff *= 2;
-            }
-        }
-    }
-
-    template <typename Clock, typename Duration>
-    Task<bool> send_until(T &value, std::chrono::time_point<Clock, Duration> deadline) const {
-        co_return co_await send_until(std::move(value), deadline);
-    }
-
-    template <typename Rep, typename Period>
-    // 同步阻塞等待容量（建议只在外部线程调用）。
-    bool sync_send_for(T &&value, std::chrono::duration<Rep, Period> timeout) const {
-        return sync_send_until(std::move(value), std::chrono::steady_clock::now() + timeout);
-    }
-
-    template <typename Rep, typename Period>
-    bool sync_send_for(T &value, std::chrono::duration<Rep, Period> timeout) const {
-        return sync_send_for(std::move(value), timeout);
-    }
-
-    template <typename Clock, typename Duration>
-    // 同步阻塞等待直到 deadline（建议只在外部线程调用）。
-    bool sync_send_until(T &&value, std::chrono::time_point<Clock, Duration> deadline) const {
-        if (!state_) {
-            return false;
-        }
-        return state_->push_until(std::move(value), deadline);
-    }
-
-    template <typename Clock, typename Duration>
-    bool sync_send_until(T &value, std::chrono::time_point<Clock, Duration> deadline) const {
-        return sync_send_until(std::move(value), deadline);
+        state_->close_topic(topic);
     }
 
     void close() const {
-        if (state_) {
-            state_->request_close();
+        if (!state_) {
+            return;
         }
-    }
-
-    bool valid() const noexcept {
-        return state_ != nullptr;
+        state_->close();
     }
 
 private:
-    static std::size_t
-    snapshot_queue_size(const std::shared_ptr<typename Mailbox<T>::State> &state) {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        return state->queued_messages;
+    using Executor = message_detail::asio::any_io_executor;
+    using TopicStrand = message_detail::asio::strand<Executor>;
+    using IngressChannel =
+        message_detail::asio::experimental::concurrent_channel<Executor,
+                                                               void(std::error_code, value_type)>;
+    using EgressChannel =
+        message_detail::asio::experimental::concurrent_channel<Executor,
+                                                               void(std::error_code, value_type)>;
+
+    static bool is_channel_terminal_error(const std::error_code &ec) {
+        return ec == message_detail::asio::experimental::error::channel_closed ||
+               ec == message_detail::asio::experimental::error::channel_cancelled ||
+               ec == message_detail::asio::error::operation_aborted;
     }
 
-    explicit MessageSender(std::shared_ptr<typename Mailbox<T>::State> state) noexcept
+    static bool is_io_context_for_runtime(const Runtime *runtime) noexcept {
+        return runtime != nullptr && Runtime::current() == runtime &&
+               Runtime::current_thread_role() == Runtime::ThreadRole::io;
+    }
+
+    struct SubscriberState;
+
+    struct TopicState : std::enable_shared_from_this<TopicState> {
+        Runtime *runtime = nullptr;
+        std::string name;
+        TopicStrand strand;
+        IngressChannel ingress;
+        std::size_t subscription_capacity = 0;
+        std::atomic<bool> closed{false};
+        std::mutex subscribers_mutex;
+        std::unordered_map<std::uint64_t, std::weak_ptr<SubscriberState>> subscribers;
+        std::uint64_t next_subscriber_id = 1;
+        std::mutex dispatcher_mutex;
+        bool dispatcher_started = false;
+
+        TopicState(Runtime *rt,
+                   std::string topic_name,
+                   std::size_t topic_capacity,
+                   std::size_t per_sub_capacity)
+            : runtime(rt),
+              name(std::move(topic_name)),
+              strand(message_detail::asio::make_strand(rt->executor())),
+              ingress(strand, topic_capacity),
+              subscription_capacity(per_sub_capacity) {}
+
+        std::shared_ptr<SubscriberState> add_subscriber() {
+            auto self = this->shared_from_this();
+            auto subscriber = std::make_shared<SubscriberState>(
+                std::move(self), runtime, runtime->executor(), subscription_capacity);
+            std::lock_guard<std::mutex> lock(subscribers_mutex);
+            const auto id = next_subscriber_id++;
+            subscriber->id = id;
+            subscribers[id] = subscriber;
+            return subscriber;
+        }
+
+        void remove_subscriber(std::uint64_t id) {
+            std::lock_guard<std::mutex> lock(subscribers_mutex);
+            subscribers.erase(id);
+        }
+
+        std::vector<std::shared_ptr<SubscriberState>> collect_subscribers() {
+            std::vector<std::shared_ptr<SubscriberState>> alive;
+            std::lock_guard<std::mutex> lock(subscribers_mutex);
+            for (auto it = subscribers.begin(); it != subscribers.end();) {
+                if (auto subscriber = it->second.lock()) {
+                    alive.push_back(std::move(subscriber));
+                    ++it;
+                } else {
+                    it = subscribers.erase(it);
+                }
+            }
+            return alive;
+        }
+
+        void close_subscribers() {
+            std::vector<std::shared_ptr<SubscriberState>> alive;
+            {
+                std::lock_guard<std::mutex> lock(subscribers_mutex);
+                for (auto &[_, weak] : subscribers) {
+                    if (auto subscriber = weak.lock()) {
+                        alive.push_back(std::move(subscriber));
+                    }
+                }
+                subscribers.clear();
+            }
+            for (auto &subscriber : alive) {
+                subscriber->closed.store(true, std::memory_order_release);
+                subscriber->egress.close();
+            }
+        }
+
+        void close_topic() {
+            if (closed.exchange(true, std::memory_order_acq_rel)) {
+                return;
+            }
+            ingress.close();
+            close_subscribers();
+        }
+
+        bool mark_dispatcher_started() {
+            std::lock_guard<std::mutex> lock(dispatcher_mutex);
+            if (dispatcher_started) {
+                return false;
+            }
+            dispatcher_started = true;
+            return true;
+        }
+
+        void start_dispatch_loop() {
+            auto self = this->shared_from_this();
+            ingress.async_receive(message_detail::asio::bind_executor(
+                strand,
+                [self](std::error_code ec, value_type payload) mutable {
+                    if (MessageBus::is_channel_terminal_error(ec)) {
+                        self->close_topic();
+                        return;
+                    }
+                    if (ec) {
+                        self->close_topic();
+                        return;
+                    }
+
+                    auto subscribers =
+                        std::make_shared<std::vector<std::shared_ptr<SubscriberState>>>(
+                            self->collect_subscribers());
+                    self->fanout_next(std::move(payload), std::move(subscribers), 0);
+                }));
+        }
+
+        void fanout_next(value_type payload,
+                         std::shared_ptr<std::vector<std::shared_ptr<SubscriberState>>> subscribers,
+                         std::size_t index) {
+            while (index < subscribers->size()) {
+                auto &subscriber = (*subscribers)[index];
+                if (!subscriber ||
+                    subscriber->closed.load(std::memory_order_acquire) ||
+                    !subscriber->egress.is_open()) {
+                    if (subscriber) {
+                        subscriber->closed.store(true, std::memory_order_release);
+                        remove_subscriber(subscriber->id);
+                    }
+                    ++index;
+                    continue;
+                }
+
+                auto self = this->shared_from_this();
+                subscriber->egress.async_send(
+                    std::error_code{},
+                    payload,
+                    message_detail::asio::bind_executor(
+                        strand,
+                        [self,
+                         payload = std::move(payload),
+                         subscribers = std::move(subscribers),
+                         subscriber,
+                         index](std::error_code ec) mutable {
+                            if (ec) {
+                                subscriber->closed.store(true, std::memory_order_release);
+                                self->remove_subscriber(subscriber->id);
+                            }
+                            self->fanout_next(std::move(payload), std::move(subscribers), index + 1);
+                        }));
+                return;
+            }
+
+            start_dispatch_loop();
+        }
+    };
+
+    struct SubscriberState {
+        std::weak_ptr<TopicState> topic;
+        Runtime *runtime = nullptr;
+        std::uint64_t id = 0;
+        EgressChannel egress;
+        std::atomic<bool> closed{false};
+
+        SubscriberState(std::shared_ptr<TopicState> parent,
+                        Runtime *runtime_in,
+                        Executor executor,
+                        std::size_t capacity)
+            : topic(std::move(parent)),
+              runtime(runtime_in),
+              egress(std::move(executor), capacity) {}
+
+        void require_io_thread(std::string_view action) const {
+            if (MessageBus::is_io_context_for_runtime(runtime)) {
+                return;
+            }
+            throw std::runtime_error(std::string(action) + " requires current thread to be runtime IO thread");
+        }
+
+        void close() {
+            if (closed.exchange(true, std::memory_order_acq_rel)) {
+                return;
+            }
+            egress.close();
+            if (auto parent = topic.lock()) {
+                parent->remove_subscriber(id);
+            }
+        }
+    };
+
+    struct State : std::enable_shared_from_this<State> {
+        Runtime *runtime = nullptr;
+        Options options{};
+        std::atomic<bool> closed{false};
+        mutable std::mutex topics_mutex;
+        std::unordered_map<std::string, std::shared_ptr<TopicState>> topics;
+        std::unordered_set<std::string> closed_topics;
+
+        explicit State(Runtime *rt, Options in_options)
+            : runtime(rt),
+              options(std::move(in_options)) {
+            if (options.topic_capacity == 0) {
+                options.topic_capacity = 1;
+            }
+            if (options.subscription_capacity == 0) {
+                options.subscription_capacity = 1;
+            }
+        }
+
+        [[nodiscard]] bool is_open() const noexcept {
+            return !closed.load(std::memory_order_acquire);
+        }
+
+        void require_io_thread(std::string_view action) const {
+            if (MessageBus::is_io_context_for_runtime(runtime)) {
+                return;
+            }
+            throw std::runtime_error(std::string(action) + " requires current thread to be runtime IO thread");
+        }
+
+        Subscription subscribe(std::string topic_name) {
+            auto topic = get_or_create_topic(topic_name);
+            if (!topic || topic->closed.load(std::memory_order_acquire)) {
+                return Subscription{};
+            }
+            return Subscription(topic->add_subscriber());
+        }
+
+        Task<bool> publish_from_io(std::string topic_name, value_type value) {
+            co_return co_await publish(topic_name, std::move(value));
+        }
+
+        bool sync_publish(std::string_view topic_name, value_type value) {
+            if (runtime == nullptr || closed.load(std::memory_order_acquire)) {
+                return false;
+            }
+            if (MessageBus::is_io_context_for_runtime(runtime)) {
+                emit_trace_event({"message_bus", "sync_publish_on_io_thread", 0, 0});
+                return false;
+            }
+
+            try {
+                return runtime->block_on(publish(std::string(topic_name), std::move(value)));
+            } catch (...) {
+                return false;
+            }
+        }
+
+        template <typename Rep, typename Period>
+        bool sync_publish_for(std::string_view topic_name,
+                              value_type value,
+                              std::chrono::duration<Rep, Period> timeout) {
+            if (runtime == nullptr || closed.load(std::memory_order_acquire)) {
+                return false;
+            }
+            if (MessageBus::is_io_context_for_runtime(runtime)) {
+                emit_trace_event({"message_bus", "sync_publish_for_on_io_thread", 0, 0});
+                return false;
+            }
+
+            try {
+                return runtime->block_on(
+                    with_timeout(timeout, publish(std::string(topic_name), std::move(value))));
+            } catch (const Error &error) {
+                if (error.code() == ETIMEDOUT || error.code() == -ETIMEDOUT) {
+                    return false;
+                }
+                return false;
+            } catch (...) {
+                return false;
+            }
+        }
+
+        void async_publish(std::string_view topic_name,
+                           value_type value,
+                           std::function<void(std::error_code)> callback) {
+            if (runtime == nullptr || closed.load(std::memory_order_acquire)) {
+                dispatch_callback_on_io(std::move(callback), message_detail::make_aborted_error());
+                return;
+            }
+
+            auto topic = get_or_create_topic(topic_name);
+            if (!topic || topic->closed.load(std::memory_order_acquire)) {
+                dispatch_callback_on_io(std::move(callback), message_detail::make_aborted_error());
+                return;
+            }
+
+            try {
+                topic->ingress.async_send(
+                    std::error_code{},
+                    value,
+                    [runtime = runtime, callback = std::move(callback)](std::error_code ec) mutable {
+                        State::dispatch_callback_on_io(runtime, std::move(callback), ec);
+                    });
+            } catch (const std::system_error &error) {
+                dispatch_callback_on_io(std::move(callback), error.code());
+            } catch (...) {
+                dispatch_callback_on_io(std::move(callback), message_detail::make_aborted_error());
+            }
+        }
+
+        void close_topic(std::string_view topic_name) {
+            std::shared_ptr<TopicState> topic;
+            {
+                std::lock_guard<std::mutex> lock(topics_mutex);
+                const std::string key(topic_name);
+                closed_topics.insert(key);
+                const auto it = topics.find(key);
+                if (it == topics.end()) {
+                    return;
+                }
+                topic = it->second;
+                topics.erase(it);
+            }
+            topic->close_topic();
+        }
+
+        void close() {
+            if (closed.exchange(true, std::memory_order_acq_rel)) {
+                return;
+            }
+
+            std::vector<std::shared_ptr<TopicState>> active_topics;
+            {
+                std::lock_guard<std::mutex> lock(topics_mutex);
+                for (auto &[_, topic] : topics) {
+                    active_topics.push_back(topic);
+                }
+                topics.clear();
+                closed_topics.clear();
+            }
+            for (auto &topic : active_topics) {
+                topic->close_topic();
+            }
+        }
+
+    private:
+        static void dispatch_callback_on_io(Runtime *runtime,
+                                            std::function<void(std::error_code)> callback,
+                                            std::error_code ec) {
+            if (!callback) {
+                return;
+            }
+            if (runtime == nullptr) {
+                callback(ec);
+                return;
+            }
+            runtime->post([callback = std::move(callback), ec]() mutable {
+                callback(ec);
+            });
+        }
+
+        void dispatch_callback_on_io(std::function<void(std::error_code)> callback,
+                                     std::error_code ec) {
+            dispatch_callback_on_io(runtime, std::move(callback), ec);
+        }
+
+        Task<bool> publish(std::string topic_name, value_type value) {
+            auto topic = get_or_create_topic(topic_name);
+            if (!topic || topic->closed.load(std::memory_order_acquire)) {
+                co_return false;
+            }
+
+            try {
+                co_await topic->ingress.async_send(std::error_code{}, value, exec::asio::use_sender);
+                co_return true;
+            } catch (const std::system_error &error) {
+                if (MessageBus::is_channel_terminal_error(error.code())) {
+                    co_return false;
+                }
+                throw;
+            }
+        }
+
+        std::shared_ptr<TopicState> get_or_create_topic(std::string_view topic_name) {
+            if (closed.load(std::memory_order_acquire)) {
+                return nullptr;
+            }
+
+            std::shared_ptr<TopicState> topic;
+            {
+                std::lock_guard<std::mutex> lock(topics_mutex);
+                if (closed.load(std::memory_order_acquire)) {
+                    return nullptr;
+                }
+
+                const std::string key(topic_name);
+                if (closed_topics.contains(key)) {
+                    return nullptr;
+                }
+                if (const auto it = topics.find(key); it != topics.end()) {
+                    topic = it->second;
+                } else {
+                    topic = std::make_shared<TopicState>(
+                        runtime, key, options.topic_capacity, options.subscription_capacity);
+                    topics.emplace(key, topic);
+                }
+            }
+
+            start_dispatcher_if_needed(topic);
+            return topic;
+        }
+
+        void start_dispatcher_if_needed(std::shared_ptr<TopicState> topic) {
+            if (!topic || !topic->mark_dispatcher_started()) {
+                return;
+            }
+            topic->start_dispatch_loop();
+        }
+    };
+
+public:
+    class IoPublisher {
+    public:
+        IoPublisher() = default;
+
+        [[nodiscard]] bool valid() const noexcept {
+            return !topic_.empty() && !state_.expired();
+        }
+
+        Task<bool> publish(value_type value) const {
+            auto state = state_.lock();
+            if (!state) {
+                co_return false;
+            }
+            state->require_io_thread("MessageBus::IoPublisher::publish");
+            co_return co_await state->publish_from_io(topic_, value);
+        }
+
+        void close_topic() const {
+            auto state = state_.lock();
+            if (!state) {
+                return;
+            }
+            state->close_topic(topic_);
+        }
+
+    private:
+        friend class MessageBus;
+        IoPublisher(std::weak_ptr<State> state, std::string topic)
+            : state_(std::move(state)),
+              topic_(std::move(topic)) {}
+
+        std::weak_ptr<State> state_;
+        std::string topic_;
+    };
+
+    class ThreadPublisher {
+    public:
+        using Callback = std::function<void(std::error_code)>;
+
+        ThreadPublisher() = default;
+
+        [[nodiscard]] bool valid() const noexcept {
+            return !topic_.empty() && !state_.expired();
+        }
+
+        bool sync_publish(value_type value) const {
+            auto state = state_.lock();
+            if (!state) {
+                return false;
+            }
+            return state->sync_publish(topic_, value);
+        }
+
+        template <typename Rep, typename Period>
+        bool sync_publish_for(value_type value, std::chrono::duration<Rep, Period> timeout) const {
+            auto state = state_.lock();
+            if (!state) {
+                return false;
+            }
+            return state->sync_publish_for(topic_, value, timeout);
+        }
+
+        void async_publish(value_type value, Callback callback) const {
+            auto state = state_.lock();
+            if (!state) {
+                if (callback) {
+                    const auto ec = message_detail::make_aborted_error();
+                    if (runtime_ != nullptr) {
+                        runtime_->post([callback = std::move(callback), ec]() mutable {
+                            callback(ec);
+                        });
+                    } else {
+                        callback(ec);
+                    }
+                }
+                return;
+            }
+            state->async_publish(topic_, value, std::move(callback));
+        }
+
+        void close_topic() const {
+            auto state = state_.lock();
+            if (!state) {
+                return;
+            }
+            state->close_topic(topic_);
+        }
+
+    private:
+        friend class MessageBus;
+        ThreadPublisher(std::weak_ptr<State> state, std::string topic, Runtime *runtime)
+            : state_(std::move(state)),
+              topic_(std::move(topic)),
+              runtime_(runtime) {}
+
+        std::weak_ptr<State> state_;
+        std::string topic_;
+        Runtime *runtime_ = nullptr;
+    };
+
+    class Subscription {
+    public:
+        using next_type = std::optional<value_type>;
+        using task_type = Task<next_type>;
+        using stream_type = Stream<value_type>;
+
+        Subscription() = default;
+
+        [[nodiscard]] bool valid() const noexcept {
+            return state_ != nullptr;
+        }
+
+        task_type next() const {
+            if (!state_ || state_->closed.load(std::memory_order_acquire)) {
+                co_return std::nullopt;
+            }
+
+            state_->require_io_thread("MessageBus::Subscription::next");
+            try {
+                auto payload = co_await state_->egress.async_receive(exec::asio::use_sender);
+                co_return std::optional<value_type>(payload);
+            } catch (const std::system_error &error) {
+                if (MessageBus::is_channel_terminal_error(error.code())) {
+                    state_->closed.store(true, std::memory_order_release);
+                    co_return std::nullopt;
+                }
+                throw;
+            }
+        }
+
+        stream_type messages() const {
+            auto state = state_;
+            return stream_type([state = std::move(state)]() -> task_type {
+                if (!state || state->closed.load(std::memory_order_acquire)) {
+                    co_return std::nullopt;
+                }
+                Subscription sub(state);
+                co_return co_await sub.next();
+            });
+        }
+
+        Task<void> close() const {
+            if (!state_) {
+                co_return;
+            }
+            state_->require_io_thread("MessageBus::Subscription::close");
+            state_->close();
+        }
+
+    private:
+        friend class MessageBus;
+        explicit Subscription(std::shared_ptr<SubscriberState> state)
+            : state_(std::move(state)) {}
+
+        std::shared_ptr<SubscriberState> state_;
+    };
+
+private:
+    explicit MessageBus(std::shared_ptr<State> state)
         : state_(std::move(state)) {}
 
-    std::shared_ptr<typename Mailbox<T>::State> state_;
-
-    friend class Mailbox<T>;
+    std::shared_ptr<State> state_;
 };
 
 } // namespace async_uv

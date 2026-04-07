@@ -2,11 +2,9 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/async_uv_dependencies.cmake)
 
 add_library(async_uv
     cancel.cpp
-    runtime.cpp
-    scope.cpp
-    tls.cpp
     fd.cpp
     fs.cpp
+    runtime.cpp
     tcp.cpp
     timer.cpp
     udp.cpp
@@ -22,13 +20,10 @@ target_include_directories(async_uv
 
 target_link_libraries(async_uv
     PUBLIC
-        async_simple_headers
-        libuv::libuv
+        async_uv_stdexec_headers
+        async_uv_asio_headers
+        Threads::Threads
 )
-
-find_package(OpenSSL REQUIRED)
-
-target_link_libraries(async_uv PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 if(ASYNC_UV_USE_MIMALLOC)
     if(TARGET mimalloc-static)

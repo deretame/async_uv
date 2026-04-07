@@ -1,63 +1,99 @@
 #include "async_uv/runtime.h"
 
 #include <algorithm>
-#include <memory>
-#include <utility>
-
-#include <async_simple/coro/Sleep.h>
-
-#include "async_uv/error.h"
-#include "detail/bridge.h"
+#include <atomic>
+#include <future>
+#include <mutex>
+#include <thread>
 
 namespace async_uv {
 
 namespace {
 
 thread_local Runtime *tls_current_runtime = nullptr;
-std::mutex g_uv_threadpool_size_mutex;
-std::optional<unsigned int> g_uv_threadpool_size;
+thread_local Runtime::ThreadRole tls_thread_role = Runtime::ThreadRole::external;
 std::mutex g_trace_hook_mutex;
 TraceHook g_trace_hook;
 
-struct TimerOp {
-    Runtime::Func func;
-    uv_timer_t timer{};
-    bool completed = false;
-};
-
-void release_timer_holder(uv_handle_t *handle) {
-    delete static_cast<std::shared_ptr<TimerOp> *>(handle->data);
+std::size_t fallback_threads() {
+    const auto hc = std::thread::hardware_concurrency();
+    return hc == 0 ? 1u : static_cast<std::size_t>(hc);
 }
 
-void configure_uv_threadpool_size(std::optional<unsigned int> uv_threadpool_size) {
-    if (!uv_threadpool_size.has_value()) {
+std::size_t resolve_io_threads(const RuntimeOptions &options) {
+    return options.io_threads == 0 ? fallback_threads() : options.io_threads;
+}
+
+std::size_t resolve_blocking_threads(const RuntimeOptions &options) {
+    if (options.blocking_threads != 0) {
+        return options.blocking_threads;
+    }
+    return fallback_threads();
+}
+
+template <typename PostFn>
+void bind_runtime_to_pool_threads(std::size_t thread_count,
+                                  Runtime *runtime,
+                                  Runtime::ThreadRole role,
+                                  PostFn post_fn) {
+    if (thread_count == 0) {
         return;
     }
 
-    const unsigned int size = *uv_threadpool_size;
-    if (size == 0) {
-        throw std::invalid_argument("uv threadpool size must be greater than zero");
+    auto start_signal = std::make_shared<std::promise<void>>();
+    auto start_gate = std::make_shared<std::shared_future<void>>(start_signal->get_future().share());
+    auto done_signal = std::make_shared<std::promise<void>>();
+    auto done_future = done_signal->get_future();
+    auto ready_count = std::make_shared<std::atomic<std::size_t>>(0);
+    auto leave_count = std::make_shared<std::atomic<std::size_t>>(thread_count);
+
+    for (std::size_t i = 0; i < thread_count; ++i) {
+        post_fn([runtime,
+                 role,
+                 thread_count,
+                 start_signal,
+                 start_gate,
+                 done_signal,
+                 ready_count,
+                 leave_count] {
+            tls_current_runtime = runtime;
+            tls_thread_role = role;
+
+            const auto ready = ready_count->fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (ready == thread_count) {
+                try {
+                    start_signal->set_value();
+                } catch (...) {
+                }
+            }
+
+            start_gate->wait();
+            const auto remaining = leave_count->fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (remaining == 0) {
+                try {
+                    done_signal->set_value();
+                } catch (...) {
+                }
+            }
+        });
     }
 
-    std::lock_guard<std::mutex> lock(g_uv_threadpool_size_mutex);
-    if (g_uv_threadpool_size.has_value()) {
-        if (*g_uv_threadpool_size != size) {
-            throw std::runtime_error(
-                "uv threadpool size is process-wide and has already been configured");
-        }
-        return;
-    }
-
-    const std::string value = std::to_string(size);
-    const int rc = uv_os_setenv("UV_THREADPOOL_SIZE", value.c_str());
-    if (rc < 0) {
-        throw_uv_error("uv_os_setenv(UV_THREADPOOL_SIZE)", rc);
-    }
-
-    g_uv_threadpool_size = size;
+    done_future.wait();
 }
 
 } // namespace
+
+namespace detail {
+
+RuntimeGuard::RuntimeGuard(Runtime *runtime) noexcept : previous_(Runtime::current()) {
+    tls_current_runtime = runtime;
+}
+
+RuntimeGuard::~RuntimeGuard() {
+    tls_current_runtime = previous_;
+}
+
+} // namespace detail
 
 void set_trace_hook(TraceHook hook) {
     std::lock_guard<std::mutex> lock(g_trace_hook_mutex);
@@ -86,222 +122,230 @@ void emit_trace_event(TraceEvent event) noexcept {
     }
 }
 
-Runtime::Runtime(RuntimeOptions options) : async_simple::Executor(std::move(options.name)) {
-    configure_uv_threadpool_size(options.uv_threadpool_size);
-
-    throw_if_uv_error(uv_loop_init(&loop_), "uv_loop_init");
-
-    async_.data = this;
-    const int rc = uv_async_init(&loop_, &async_, [](uv_async_t *handle) {
-        static_cast<Runtime *>(handle->data)->drain();
-    });
-
-    if (rc < 0) {
-        uv_loop_close(&loop_);
-        throw_uv_error("uv_async_init", rc);
-    }
-
-    loop_thread_ = std::thread([this] {
-        loop_thread_id_ = std::this_thread::get_id();
-        tls_current_runtime = this;
-        uv_run(&loop_, UV_RUN_DEFAULT);
-        tls_current_runtime = nullptr;
-    });
+Runtime::Runtime(RuntimeOptions options)
+    : options_(std::move(options)),
+      io_pool_(static_cast<std::uint32_t>(resolve_io_threads(options_))),
+      blocking_pool_(resolve_blocking_threads(options_)) {
+    bind_runtime_to_pool_threads(
+        resolve_io_threads(options_), this, ThreadRole::io, [this](auto fn) {
+            exec::asio::asio_impl::post(io_pool_.get_executor(), std::move(fn));
+        });
+    bind_runtime_to_pool_threads(
+        resolve_blocking_threads(options_), this, ThreadRole::blocking, [this](auto fn) {
+            exec::asio::asio_impl::post(blocking_pool_, std::move(fn));
+        });
 }
 
 Runtime::~Runtime() {
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.emplace_back([this] {
-            uv_walk(
-                &loop_,
-                [](uv_handle_t *handle, void *) {
-                    if (!uv_is_closing(handle)) {
-                        uv_close(handle, nullptr);
-                    }
-                },
-                nullptr);
-        });
+    blocking_pool_.join();
+}
+
+exec::asio::asio_impl::any_io_executor Runtime::executor() noexcept {
+    return io_pool_.get_executor();
+}
+
+exec::asio::asio_impl::any_io_executor Runtime::executor() const noexcept {
+    return io_pool_.get_executor();
+}
+
+exec::asio::asio_impl::any_io_executor Runtime::blocking_executor() noexcept {
+    return blocking_pool_.get_executor();
+}
+
+exec::asio::asio_impl::any_io_executor Runtime::blocking_executor() const noexcept {
+    return const_cast<exec::asio::asio_impl::thread_pool &>(blocking_pool_).get_executor();
+}
+
+execution::AnyScheduler Runtime::io_scheduler() {
+    return static_cast<const Runtime &>(*this).io_scheduler();
+}
+
+execution::AnyScheduler Runtime::io_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    if (io_scheduler_override_) {
+        return *io_scheduler_override_;
+    }
+    return execution::AnyScheduler(
+        const_cast<exec::asio::asio_thread_pool &>(io_pool_).get_scheduler());
+}
+
+std::optional<execution::AnyScheduler> Runtime::custom_io_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    return io_scheduler_override_;
+}
+
+bool Runtime::has_custom_io_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    return io_scheduler_override_.has_value();
+}
+
+void Runtime::set_io_scheduler(execution::AnyScheduler scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    io_scheduler_override_ = std::move(scheduler);
+}
+
+void Runtime::reset_io_scheduler() {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    io_scheduler_override_.reset();
+}
+
+std::optional<execution::AnyScheduler> Runtime::cpu_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    return cpu_scheduler_;
+}
+
+std::optional<execution::AnyScheduler> Runtime::gpu_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    return gpu_scheduler_;
+}
+
+bool Runtime::has_cpu_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    return cpu_scheduler_.has_value();
+}
+
+bool Runtime::has_gpu_scheduler() const {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    return gpu_scheduler_.has_value();
+}
+
+void Runtime::set_cpu_scheduler(execution::AnyScheduler scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    cpu_scheduler_ = std::move(scheduler);
+}
+
+void Runtime::set_gpu_scheduler(execution::AnyScheduler scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    gpu_scheduler_ = std::move(scheduler);
+}
+
+void Runtime::reset_cpu_scheduler() {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    cpu_scheduler_.reset();
+}
+
+void Runtime::reset_gpu_scheduler() {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    gpu_scheduler_.reset();
+}
+
+void Runtime::register_scheduler(std::string name, execution::AnyScheduler scheduler) {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    named_schedulers_[std::move(name)] = std::move(scheduler);
+}
+
+void Runtime::unregister_scheduler(std::string_view name) {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    named_schedulers_.erase(std::string(name));
+}
+
+std::optional<execution::AnyScheduler> Runtime::find_scheduler(std::string_view name) const {
+    if (name == "io") {
+        return io_scheduler();
     }
 
-    uv_async_send(&async_);
-
-    if (loop_thread_.joinable()) {
-        loop_thread_.join();
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    if (name == "cpu") {
+        return cpu_scheduler_;
+    }
+    if (name == "gpu") {
+        return gpu_scheduler_;
     }
 
-    while (uv_loop_close(&loop_) == UV_EBUSY) {
-        uv_run(&loop_, UV_RUN_DEFAULT);
+    const auto it = named_schedulers_.find(std::string(name));
+    if (it == named_schedulers_.end()) {
+        return std::nullopt;
     }
+    return it->second;
 }
 
-bool Runtime::schedule(Func func) {
-    post(std::move(func));
-    return true;
-}
-
-bool Runtime::currentThreadInExecutor() const {
-    return std::this_thread::get_id() == loop_thread_id_;
-}
-
-async_simple::ExecutorStat Runtime::stat() const {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    async_simple::ExecutorStat stat;
-    stat.pendingTaskCount = queue_.size();
-    return stat;
-}
-
-size_t Runtime::currentContextId() const {
-    return currentThreadInExecutor() ? 1 : 0;
-}
-
-Runtime::Context Runtime::checkout() {
-    return currentThreadInExecutor() ? reinterpret_cast<Context>(this)
-                                     : async_simple::Executor::NULLCTX;
-}
-
-bool Runtime::checkin(Func func, Context ctx, async_simple::ScheduleOptions opts) {
-    if (ctx == reinterpret_cast<Context>(this) && currentThreadInExecutor() && opts.prompt) {
-        func();
-        return true;
+std::vector<std::string> Runtime::scheduler_names() const {
+    std::vector<std::string> names{"io"};
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
+    if (cpu_scheduler_) {
+        names.emplace_back("cpu");
     }
-    return schedule(std::move(func));
+    if (gpu_scheduler_) {
+        names.emplace_back("gpu");
+    }
+    for (const auto &[name, _] : named_schedulers_) {
+        if (name == "io" || name == "cpu" || name == "gpu") {
+            continue;
+        }
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 void Runtime::post(std::function<void()> fn) {
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.push_back(std::move(fn));
-    }
-
-    uv_async_send(&async_);
+    exec::asio::asio_impl::post(io_pool_.get_executor(), [this, fn = std::move(fn)]() mutable {
+        detail::RuntimeGuard guard(this);
+        fn();
+    });
 }
 
 Runtime *Runtime::current() noexcept {
     return tls_current_runtime;
 }
 
-uv_loop_t *Runtime::current_loop() noexcept {
+Runtime::ThreadRole Runtime::current_thread_role() noexcept {
+    return tls_thread_role;
+}
+
+bool Runtime::in_io_thread() const noexcept {
+    return Runtime::current() == this && Runtime::current_thread_role() == ThreadRole::io;
+}
+
+bool Runtime::in_blocking_thread() const noexcept {
+    return Runtime::current() == this && Runtime::current_thread_role() == ThreadRole::blocking;
+}
+
+exec::asio::asio_impl::any_io_executor Runtime::current_executor() {
     auto *runtime = current();
-    return runtime == nullptr ? nullptr : runtime->loop();
+    if (runtime == nullptr) {
+        throw std::runtime_error("async_uv::Runtime::current_executor requires a current runtime");
+    }
+    return runtime->executor();
 }
 
 Runtime *try_current_runtime() noexcept {
     return Runtime::current();
 }
 
-uv_loop_t *try_current_loop() noexcept {
-    return Runtime::current_loop();
-}
-
-void Runtime::schedule(Func func, Duration dur, uint64_t, async_simple::Slot *slot) {
-    auto op = std::make_shared<TimerOp>();
-    op->func = std::move(func);
-
-    if (slot != nullptr &&
-        !async_simple::signalHelper{async_simple::Terminate}.tryEmplace(
-            slot,
-            [this, weak = std::weak_ptr<TimerOp>(op)](async_simple::SignalType,
-                                                      async_simple::Signal *) mutable {
-                auto op = weak.lock();
-                if (op == nullptr) {
-                    return;
-                }
-
-                post([op = std::move(op)]() mutable {
-                    if (op->completed) {
-                        return;
-                    }
-
-                    op->completed = true;
-                    auto done = std::move(op->func);
-                    if (op->timer.data != nullptr) {
-                        uv_timer_stop(&op->timer);
-                        uv_close(reinterpret_cast<uv_handle_t *>(&op->timer), release_timer_holder);
-                    }
-                    done();
-                });
-            })) {
-        schedule(std::move(op->func));
-        return;
+exec::asio::asio_impl::any_io_executor try_current_executor() noexcept {
+    auto *runtime = Runtime::current();
+    if (runtime == nullptr) {
+        return {};
     }
-
-    post([this, op = std::move(op), dur]() mutable {
-        if (op->completed) {
-            return;
-        }
-
-        int rc = uv_timer_init(loop(), &op->timer);
-        if (rc < 0) {
-            op->completed = true;
-            auto done = std::move(op->func);
-            done();
-            return;
-        }
-
-        op->timer.data = new std::shared_ptr<TimerOp>(op);
-
-        const auto timeout = static_cast<uint64_t>(std::max<int64_t>(dur.count(), 0) / 1000);
-        rc = uv_timer_start(
-            &op->timer,
-            [](uv_timer_t *handle) {
-                auto holder = static_cast<std::shared_ptr<TimerOp> *>(handle->data);
-                auto op = *holder;
-                if (op->completed) {
-                    return;
-                }
-
-                op->completed = true;
-                auto done = std::move(op->func);
-                uv_timer_stop(handle);
-                uv_close(reinterpret_cast<uv_handle_t *>(handle), release_timer_holder);
-                done();
-            },
-            timeout,
-            0);
-
-        if (rc < 0) {
-            if (!op->completed) {
-                op->completed = true;
-                auto done = std::move(op->func);
-                uv_close(reinterpret_cast<uv_handle_t *>(&op->timer), release_timer_holder);
-                done();
-                return;
-            }
-
-            uv_close(reinterpret_cast<uv_handle_t *>(&op->timer), release_timer_holder);
-        }
-    });
-}
-
-void Runtime::drain() {
-    std::deque<std::function<void()>> pending;
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        pending.swap(queue_);
-    }
-
-    for (auto &fn : pending) {
-        fn();
-    }
+    return runtime->executor();
 }
 
 Task<Runtime *> get_current_runtime() {
-    auto *executor = co_await async_simple::CurrentExecutor{};
-    auto *runtime = dynamic_cast<Runtime *>(executor);
+    auto *runtime = Runtime::current();
     if (runtime == nullptr) {
-        throw std::runtime_error("current executor is not async_uv::Runtime");
+        throw std::runtime_error("no current async_uv::Runtime in this execution context");
     }
     co_return runtime;
 }
 
-Task<uv_loop_t *> get_current_loop() {
+Task<exec::asio::asio_impl::any_io_executor> get_current_loop() {
     auto *runtime = co_await get_current_runtime();
-    co_return runtime->loop();
+    co_return runtime->executor();
 }
 
 Task<void> sleep_for(std::chrono::milliseconds delay) {
-    co_await async_simple::coro::sleep(delay);
+    auto ex = co_await get_current_loop();
+    exec::asio::asio_impl::steady_timer timer(ex);
+    timer.expires_after(std::max(delay, std::chrono::milliseconds::zero()));
+    co_await timer.async_wait(exec::asio::use_sender);
+}
+
+Task<void> sleep_until(std::chrono::steady_clock::time_point deadline) {
+    auto ex = co_await get_current_loop();
+    exec::asio::asio_impl::steady_timer timer(ex);
+    timer.expires_at(deadline);
+    co_await timer.async_wait(exec::asio::use_sender);
 }
 
 } // namespace async_uv

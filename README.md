@@ -677,7 +677,7 @@ If you need strict lifetime guarantees, prefer `with_task_scope(...)`.
 
 ### Blocking Work
 
-`spawn_blocking(...)` uses `uv_queue_work`.
+`spawn_blocking(...)` runs on the runtime's blocking thread pool.
 
 Important behavior:
 
@@ -699,8 +699,7 @@ Examples:
 - `Fs::read_file_for(...)`
 - `File::read_all_for(...)`
 - `Mailbox<T>::recv_for(...)`
-- `FsEventWatcher::next_for(...)`
-- `FsPollWatcher::next_for(...)`
+- `FsWatcher::next_for(...)`
 
 These wrappers all forward to the same `with_timeout(...)` and `with_deadline(...)` behavior.
 
@@ -718,8 +717,7 @@ Available stream sources include:
 - `Mailbox<T>::messages()`
 - `TcpClient::receive_chunks()`
 - `UdpSocket::receive_packets()`
-- `FsEventWatcher::events()`
-- `FsPollWatcher::events()`
+- `FsWatcher::events()`
 
 ## Mailbox Backpressure
 
@@ -778,22 +776,20 @@ Typical usage:
 
 `tests/async_uv_tls_bio_test` uses mbedTLS as a lightweight reference implementation.
 
-## FD Watcher
+## File Watcher
 
-`FdWatcher` wraps `uv_poll_t` and provides readiness events as task/stream APIs.
+`FsWatcher` wraps Linux `inotify` and provides filesystem change events as task/stream APIs.
 
 ```cpp
-auto watcher = co_await async_uv::FdWatcher::watch(fd,
-    async_uv::FdEventFlags::readable | async_uv::FdEventFlags::writable);
+auto watcher = co_await async_uv::FsWatcher::watch("/tmp/demo.txt");
 
 auto event = co_await watcher.next_for(std::chrono::milliseconds(500));
-if (event && event->ok() && event->readable()) {
-    // fd becomes readable
+if (event && event->ok() && event->modified()) {
+    // file is modified
 }
 ```
 
-`tests/async_uv_fd_curl_test` uses libcurl (`CURLOPT_CONNECT_ONLY`) to obtain an active socket
-and validates `FdWatcher` behavior.
+`tests/async_uv_fs_watch_test` validates `FsWatcher` behavior.
 
 ## Behavior Contracts
 
@@ -896,7 +892,7 @@ build/async_uv_smoke_test
 build/async_uv_scope_test
 build/async_uv_constraints_test
 build/async_uv_tls_bio_test
-build/async_uv_fd_curl_test   # built when libcurl is available
+build/async_uv_fs_watch_test
 ```
 
 `async_uv_smoke_test` focuses on:
@@ -925,13 +921,10 @@ build/async_uv_fd_curl_test   # built when libcurl is available
 - TLS BIO interface contract
 - mbedTLS-based in-memory client/server handshake and encrypted payload exchange
 
-`async_uv_fd_curl_test` focuses on:
+`async_uv_fs_watch_test` focuses on:
 
-- `FdWatcher` readiness events
-- libcurl socket integration (`CURLINFO_ACTIVESOCKET`)
-- real-network HTTPS connectivity with fallback URLs (`https://example.com/`, `https://www.cloudflare.com/`, `https://www.wikipedia.org/`)
-- `ASYNC_UV_CURL_TEST_URL` can override candidates (single URL or comma-separated URL list)
-- when DNS/egress is unavailable, the test prints a skip diagnostic and exits without failing
+- `FsWatcher` change events (`modified`, `renamed`, `removed`)
+- filesystem change observation on native Linux paths
 
 Watcher note:
 

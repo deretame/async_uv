@@ -2,53 +2,59 @@
 
 namespace async_uv {
 
-CancellationSource::CancellationSource() : signal_(async_simple::Signal::create()) {}
+CancellationSource::CancellationSource()
+    : source_(std::make_shared<stdexec::inplace_stop_source>()) {}
 
-CancellationSource::CancellationSource(std::shared_ptr<async_simple::Signal> signal)
-    : signal_(std::move(signal)) {
-    if (!signal_) {
-        signal_ = async_simple::Signal::create();
-    }
+CancellationSource::CancellationSource(std::shared_ptr<stdexec::inplace_stop_source> source)
+    : source_(source ? std::move(source) : std::make_shared<stdexec::inplace_stop_source>()) {}
+
+stdexec::inplace_stop_source *CancellationSource::signal() const noexcept {
+    return source_.get();
 }
 
-async_simple::Signal *CancellationSource::signal() const noexcept {
-    return signal_.get();
+const std::shared_ptr<stdexec::inplace_stop_source> &
+CancellationSource::shared_signal() const noexcept {
+    return source_;
 }
 
-const std::shared_ptr<async_simple::Signal> &CancellationSource::shared_signal() const noexcept {
-    return signal_;
+stdexec::inplace_stop_token CancellationSource::token() const noexcept {
+    return source_ ? source_->get_token() : stdexec::inplace_stop_token{};
 }
 
 bool CancellationSource::cancellation_requested() const noexcept {
-    return signal_ != nullptr && signal_->state() != async_simple::None;
+    return source_ != nullptr && source_->stop_requested();
 }
 
-async_simple::SignalType CancellationSource::cancel(async_simple::SignalType type) const noexcept {
-    return signal_ == nullptr ? async_simple::None : signal_->emits(type);
-}
-
-Task<async_simple::Slot *> get_current_slot() {
-    co_return co_await async_simple::coro::CurrentSlot{};
-}
-
-Task<std::shared_ptr<async_simple::Signal>> get_current_signal() {
-    auto *slot = co_await get_current_slot();
-    if (slot == nullptr || slot->signal() == nullptr) {
-        co_return std::shared_ptr<async_simple::Signal>{};
+bool CancellationSource::cancel() const noexcept {
+    if (source_ == nullptr) {
+        return false;
     }
+    (void)source_->request_stop();
+    return source_->stop_requested();
+}
 
-    co_return slot->signal()->shared_from_this();
+Task<stdexec::inplace_stop_token> get_current_slot() {
+    co_return co_await stdexec::get_stop_token();
+}
+
+Task<std::shared_ptr<stdexec::inplace_stop_source>> get_current_signal() {
+    auto token = co_await get_current_slot();
+    auto source = std::make_shared<stdexec::inplace_stop_source>();
+    if (token.stop_requested()) {
+        source->request_stop();
+    }
+    co_return source;
 }
 
 Task<bool> cancellation_requested() {
-    auto *slot = co_await get_current_slot();
-    co_return async_simple::signalHelper{async_simple::Terminate}.hasCanceled(slot);
+    auto token = co_await get_current_slot();
+    co_return token.stop_requested();
 }
 
 Task<void> throw_if_cancelled(std::string message) {
-    auto *slot = co_await get_current_slot();
-    async_simple::signalHelper{async_simple::Terminate}.checkHasCanceled(slot, std::move(message));
-    co_return;
+    if (co_await cancellation_requested()) {
+        throw std::runtime_error(std::move(message));
+    }
 }
 
 } // namespace async_uv

@@ -1,25 +1,29 @@
 #pragma once
 
+#include <cerrno>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-
-#include <uv.h>
+#include <system_error>
 
 namespace async_uv {
 
 class Error : public std::runtime_error {
 public:
     Error(std::string where, int code)
-        : std::runtime_error(std::move(where) + ": " + uv_err_name(code) + " - " +
-                             uv_strerror(code)),
-          code_(code) {}
+        : std::runtime_error(std::move(where) + ": " + to_message(code)), code_(code) {}
 
     int code() const noexcept {
         return code_;
     }
 
 private:
+    static std::string to_message(int code) {
+        const int normalized = code < 0 ? -code : code;
+        return std::error_code(normalized, std::generic_category()).message();
+    }
+
     int code_;
 };
 
@@ -34,3 +38,4 @@ inline void throw_if_uv_error(int code, std::string_view where) {
 }
 
 } // namespace async_uv
+

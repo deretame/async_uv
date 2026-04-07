@@ -1,562 +1,270 @@
 #include "async_uv/watch.h"
 
-#include <algorithm>
-#include <cstdint>
-#include <deque>
-#include <memory>
+#include <array>
+#include <cerrno>
+#include <cstring>
 #include <mutex>
-#include <stdexcept>
-#include <utility>
+#include <system_error>
 #include <vector>
 
-#include <async_simple/Promise.h>
-
-#include "async_uv/error.h"
+#include <asio/posix/stream_descriptor.hpp>
+#include <unistd.h>
 
 namespace async_uv {
 
 namespace {
 
-FileInfo make_file_info(const uv_stat_t &stat) {
+namespace asio = exec::asio::asio_impl;
+
+struct Snapshot {
+    bool exists = false;
+    FileInfo info{};
+};
+
+std::optional<FileInfo> load_file_info(const std::filesystem::path &path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        if (ec) {
+            throw std::system_error(ec);
+        }
+        return std::nullopt;
+    }
+
     FileInfo info;
-    info.size = static_cast<std::uint64_t>(stat.st_size);
-    info.mode = stat.st_mode;
-    info.inode = static_cast<std::uint64_t>(stat.st_ino);
-    info.device = static_cast<std::uint64_t>(stat.st_dev);
-    info.uid = static_cast<int>(stat.st_uid);
-    info.gid = static_cast<int>(stat.st_gid);
-    info.access_time = stat.st_atim;
-    info.modify_time = stat.st_mtim;
-    info.change_time = stat.st_ctim;
-    info.birth_time = stat.st_birthtim;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec) {
+        throw std::system_error(ec);
+    }
+
+    info.regular_file = std::filesystem::is_regular_file(status);
+    info.directory = std::filesystem::is_directory(status);
+    info.symlink = std::filesystem::is_symlink(status);
+    if (info.regular_file) {
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            throw std::system_error(ec);
+        }
+        info.size = static_cast<std::uint64_t>(size);
+    }
+    info.last_write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        throw std::system_error(ec);
+    }
     return info;
+}
+
+Snapshot make_snapshot(const std::filesystem::path &path) {
+    Snapshot snap;
+    auto info = load_file_info(path);
+    snap.exists = info.has_value();
+    if (info) {
+        snap.info = *info;
+    }
+    return snap;
+}
+
+std::string normalize_inotify_name(const char *name, std::size_t len) {
+    if (name == nullptr || len == 0) {
+        return {};
+    }
+    const auto *end = static_cast<const char *>(memchr(name, '\0', len));
+    const auto n = end == nullptr ? len : static_cast<std::size_t>(end - name);
+    return std::string(name, n);
+}
+
+int default_watch_mask() {
+    return IN_ATTRIB | IN_MODIFY | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
+           IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF;
 }
 
 } // namespace
 
-bool FsEvent::ok() const noexcept {
-    return status >= 0;
-}
-
-bool FsEvent::renamed() const noexcept {
-    return (events & UV_RENAME) != 0;
-}
-
-bool FsEvent::changed() const noexcept {
-    return (events & UV_CHANGE) != 0;
-}
-
-bool FsPollEvent::ok() const noexcept {
-    return status >= 0;
-}
-
-struct FsEventWatcher::State : std::enable_shared_from_this<FsEventWatcher::State> {
-    State(Runtime *runtime_in, Mailbox<FsEvent> mailbox_in, std::string path_in, unsigned flags_in)
-        : runtime(runtime_in), mailbox(std::move(mailbox_in)), sender(mailbox.sender()),
-          watched_path(std::move(path_in)), watch_flags(flags_in) {
-        std::error_code error;
-        watched_is_directory =
-            std::filesystem::is_directory(std::filesystem::path(watched_path), error);
-    }
-
-    void request_stop() {
-        auto self = shared_from_this();
-        runtime->post([self]() mutable {
-            std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-            bool should_close = false;
-
-            {
-                std::lock_guard<std::mutex> lock(self->mutex);
-                if (self->closed) {
-                    stop_waiters.assign(self->stop_waiters.begin(), self->stop_waiters.end());
-                    self->stop_waiters.clear();
-                } else {
-                    if (!self->stop_requested) {
-                        self->stop_requested = true;
-                        self->self_keepalive = self;
-                        if (self->initialized && !self->closing) {
-                            self->closing = true;
-                            should_close = true;
-                        }
-                    }
-                }
-            }
-
-            self->sender.close();
-
-            for (auto &waiter : stop_waiters) {
-                waiter->setValue();
-            }
-
-            if (!should_close) {
-                return;
-            }
-
-            uv_fs_event_stop(&self->handle);
-            uv_close(reinterpret_cast<uv_handle_t *>(&self->handle), [](uv_handle_t *handle) {
-                auto *state = static_cast<State *>(handle->data);
-                std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-                std::shared_ptr<State> keepalive;
-
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->initialized = false;
-                    state->closing = false;
-                    state->closed = true;
-                    stop_waiters.assign(state->stop_waiters.begin(), state->stop_waiters.end());
-                    state->stop_waiters.clear();
-                    keepalive = std::move(state->self_keepalive);
-                }
-
-                for (auto &waiter : stop_waiters) {
-                    waiter->setValue();
-                }
-            });
-        });
-    }
-
+struct FsWatcher::State {
     Runtime *runtime = nullptr;
-    Mailbox<FsEvent> mailbox;
-    MessageSender<FsEvent> sender;
-    uv_fs_event_t handle{};
-    std::string watched_path;
-    unsigned watch_flags = 0;
-    bool watched_is_directory = false;
-    std::mutex mutex;
-    std::deque<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-    std::shared_ptr<State> self_keepalive;
-    bool initialized = false;
-    bool stop_requested = false;
-    bool closing = false;
-    bool closed = false;
+    std::filesystem::path watched_path;
+    int inotify_fd = -1;
+    int watch_fd = -1;
+    asio::posix::stream_descriptor descriptor;
+    std::vector<char> pending;
+    std::size_t pending_offset = 0;
+    Snapshot snapshot{};
+    bool running = true;
+    mutable std::mutex mutex;
+
+    explicit State(Runtime *rt)
+        : runtime(rt),
+          descriptor(rt->executor()) {}
+
+    ~State() {
+        close_all();
+    }
+
+    void close_all() {
+        std::lock_guard<std::mutex> lock(mutex);
+        running = false;
+
+        if (watch_fd >= 0 && inotify_fd >= 0) {
+            (void)::inotify_rm_watch(inotify_fd, watch_fd);
+            watch_fd = -1;
+        }
+
+        std::error_code ec;
+        descriptor.cancel(ec);
+        descriptor.close(ec);
+        inotify_fd = -1;
+    }
+
+    std::optional<FsWatchEvent> try_pop_event_locked() {
+        const auto available = pending.size() - pending_offset;
+        if (available < sizeof(inotify_event)) {
+            return std::nullopt;
+        }
+
+        const auto *base = pending.data() + pending_offset;
+        const auto *raw = reinterpret_cast<const inotify_event *>(base);
+        const std::size_t event_size = sizeof(inotify_event) + raw->len;
+        if (available < event_size) {
+            return std::nullopt;
+        }
+
+        FsWatchEvent event;
+        event.path = watched_path;
+        event.name = normalize_inotify_name(raw->name, raw->len);
+        event.mask = raw->mask;
+        if ((raw->mask & IN_Q_OVERFLOW) != 0U) {
+            event.status = ENOSPC;
+        } else {
+            event.status = 0;
+        }
+
+        if (snapshot.exists) {
+            event.previous = snapshot.info;
+        }
+
+        auto current = load_file_info(watched_path);
+        if (current) {
+            event.current = *current;
+            snapshot.exists = true;
+            snapshot.info = *current;
+        } else {
+            snapshot.exists = false;
+        }
+
+        pending_offset += event_size;
+        if (pending_offset >= pending.size()) {
+            pending.clear();
+            pending_offset = 0;
+        } else if (pending_offset > 2048) {
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(pending_offset));
+            pending_offset = 0;
+        }
+
+        if ((raw->mask & IN_IGNORED) != 0U) {
+            running = false;
+        }
+
+        return event;
+    }
 };
 
-FsEventWatcher::FsEventWatcher(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
+FsWatcher::FsWatcher(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
 
-FsEventWatcher::~FsEventWatcher() {
-    request_stop();
-}
-
-Task<FsEventWatcher> FsEventWatcher::watch(std::string path, unsigned flags) {
+Task<FsWatcher> FsWatcher::watch(std::filesystem::path path) {
     auto *runtime = co_await get_current_runtime();
-    auto mailbox = co_await Mailbox<FsEvent>::create(*runtime);
-    auto state = std::make_shared<State>(runtime, std::move(mailbox), std::move(path), flags);
-    auto promise = std::make_shared<async_simple::Promise<void>>();
-    auto future = promise->getFuture().via(runtime);
+    auto state = std::make_shared<State>(runtime);
+    state->watched_path = std::move(path);
+    state->snapshot = make_snapshot(state->watched_path);
 
-    runtime->post([state, promise]() mutable {
-        const int init_rc = uv_fs_event_init(state->runtime->loop(), &state->handle);
-        if (init_rc < 0) {
-            promise->setException(std::make_exception_ptr(Error("uv_fs_event_init", init_rc)));
-            return;
-        }
+    const int fd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd < 0) {
+        throw std::system_error(errno, std::generic_category(), "inotify_init1");
+    }
+    state->inotify_fd = fd;
 
-        state->handle.data = state.get();
-        const int start_rc = uv_fs_event_start(
-            &state->handle,
-            [](uv_fs_event_t *handle, const char *filename, int events, int status) {
-                auto *state = static_cast<State *>(handle->data);
-                auto name = filename == nullptr ? std::string{} : std::string(filename);
-                auto event_path = state->watched_is_directory && !name.empty()
-                                      ? path::join(state->watched_path, name)
-                                      : state->watched_path;
-                state->sender.send(FsEvent{std::move(event_path), std::move(name), events, status});
-                emit_trace_event({"watch", "fs_event", status, static_cast<std::size_t>(events)});
-            },
-            state->watched_path.c_str(),
-            state->watch_flags);
+    const int wd = ::inotify_add_watch(fd, state->watched_path.c_str(), default_watch_mask());
+    if (wd < 0) {
+        const int err = errno;
+        (void)::close(fd);
+        state->inotify_fd = -1;
+        throw std::system_error(err, std::generic_category(), "inotify_add_watch");
+    }
+    state->watch_fd = wd;
 
-        if (start_rc < 0) {
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->self_keepalive = state;
-                state->closing = true;
-            }
-
-            uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
-                auto *state = static_cast<State *>(handle->data);
-                std::shared_ptr<State> keepalive;
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->closed = true;
-                    state->closing = false;
-                    keepalive = std::move(state->self_keepalive);
-                }
-            });
-
-            promise->setException(std::make_exception_ptr(Error("uv_fs_event_start", start_rc)));
-            emit_trace_event({"watch", "fs_event_start_error", start_rc, 0});
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            state->initialized = true;
-        }
-        emit_trace_event({"watch", "fs_event_start", 0, 0});
-        promise->setValue();
-    });
-
-    co_await std::move(future);
-    co_return FsEventWatcher(std::move(state));
+    state->descriptor.assign(fd);
+    co_return FsWatcher(std::move(state));
 }
 
-Task<FsEventWatcher> FsEventWatcher::watch(std::string path, FsEventFlags flags) {
-    co_return co_await watch(std::move(path), std::to_underlying(flags));
-}
-
-bool FsEventWatcher::valid() const noexcept {
+bool FsWatcher::valid() const noexcept {
     return state_ != nullptr;
 }
 
-const std::string &FsEventWatcher::path() const noexcept {
-    static const std::string kEmpty;
-    return state_ == nullptr ? kEmpty : state_->watched_path;
+const std::filesystem::path &FsWatcher::path() const noexcept {
+    static const std::filesystem::path empty;
+    return state_ ? state_->watched_path : empty;
 }
 
-unsigned FsEventWatcher::flags() const noexcept {
-    return state_ == nullptr ? 0U : state_->watch_flags;
-}
-
-FsEventWatcher::task_type FsEventWatcher::next() const {
+FsWatcher::task_type FsWatcher::next() const {
     if (!state_) {
-        throw std::runtime_error("fs event watcher is empty");
-    }
-    return state_->mailbox.recv();
-}
-
-FsEventWatcher::stream_type FsEventWatcher::events() const {
-    if (!state_) {
-        return {};
+        co_return std::nullopt;
     }
 
-    return state_->mailbox.messages();
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (!state_->running) {
+                co_return std::nullopt;
+            }
+            if (auto ready = state_->try_pop_event_locked()) {
+                co_return ready;
+            }
+        }
+
+        std::array<char, 4096> chunk{};
+        std::size_t n = 0;
+        try {
+            n = co_await state_->descriptor.async_read_some(
+                asio::buffer(chunk.data(), chunk.size()), exec::asio::use_sender);
+        } catch (const std::system_error &error) {
+            if (error.code() == asio::error::operation_aborted ||
+                error.code() == asio::error::bad_descriptor) {
+                co_return std::nullopt;
+            }
+            throw;
+        }
+
+        if (n == 0) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (!state_->running) {
+                co_return std::nullopt;
+            }
+            state_->pending.insert(state_->pending.end(), chunk.begin(), chunk.begin() + n);
+            if (auto ready = state_->try_pop_event_locked()) {
+                co_return ready;
+            }
+        }
+    }
 }
 
-Task<void> FsEventWatcher::stop() {
+FsWatcher::stream_type FsWatcher::events() const {
+    auto state = state_;
+    return stream_type([state = std::move(state)]() -> task_type {
+        if (!state) {
+            co_return std::nullopt;
+        }
+        FsWatcher watcher(state);
+        co_return co_await watcher.next();
+    });
+}
+
+Task<void> FsWatcher::stop() {
     if (!state_) {
         co_return;
     }
-
-    auto state = state_;
-    auto promise = std::make_shared<async_simple::Promise<void>>();
-    auto future = promise->getFuture().via(state->runtime);
-
-    state->runtime->post([state, promise]() mutable {
-        bool complete_now = false;
-        bool should_close = false;
-
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->closed) {
-                complete_now = true;
-            } else {
-                state->stop_waiters.push_back(promise);
-                if (!state->stop_requested) {
-                    state->stop_requested = true;
-                    state->self_keepalive = state;
-                    if (state->initialized && !state->closing) {
-                        state->closing = true;
-                        should_close = true;
-                    }
-                }
-            }
-        }
-
-        state->sender.close();
-
-        if (complete_now) {
-            promise->setValue();
-            return;
-        }
-
-        if (!should_close) {
-            return;
-        }
-
-        uv_fs_event_stop(&state->handle);
-        emit_trace_event({"watch", "fs_event_stop", 0, 0});
-        uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
-            auto *state = static_cast<State *>(handle->data);
-            std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-            std::shared_ptr<State> keepalive;
-
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->initialized = false;
-                state->closing = false;
-                state->closed = true;
-                stop_waiters.assign(state->stop_waiters.begin(), state->stop_waiters.end());
-                state->stop_waiters.clear();
-                keepalive = std::move(state->self_keepalive);
-            }
-
-            for (auto &waiter : stop_waiters) {
-                waiter->setValue();
-            }
-        });
-    });
-
-    co_await std::move(future);
-}
-
-void FsEventWatcher::request_stop() {
-    if (state_) {
-        state_->request_stop();
-    }
-}
-
-struct FsPollWatcher::State : std::enable_shared_from_this<FsPollWatcher::State> {
-    State(Runtime *runtime_in,
-          Mailbox<FsPollEvent> mailbox_in,
-          std::string path_in,
-          std::chrono::milliseconds interval_in)
-        : runtime(runtime_in), mailbox(std::move(mailbox_in)), sender(mailbox.sender()),
-          watched_path(std::move(path_in)), poll_interval(interval_in) {}
-
-    void request_stop() {
-        auto self = shared_from_this();
-        runtime->post([self]() mutable {
-            std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-            bool should_close = false;
-
-            {
-                std::lock_guard<std::mutex> lock(self->mutex);
-                if (self->closed) {
-                    stop_waiters.assign(self->stop_waiters.begin(), self->stop_waiters.end());
-                    self->stop_waiters.clear();
-                } else {
-                    if (!self->stop_requested) {
-                        self->stop_requested = true;
-                        self->self_keepalive = self;
-                        if (self->initialized && !self->closing) {
-                            self->closing = true;
-                            should_close = true;
-                        }
-                    }
-                }
-            }
-
-            self->sender.close();
-
-            for (auto &waiter : stop_waiters) {
-                waiter->setValue();
-            }
-
-            if (!should_close) {
-                return;
-            }
-
-            uv_fs_poll_stop(&self->handle);
-            uv_close(reinterpret_cast<uv_handle_t *>(&self->handle), [](uv_handle_t *handle) {
-                auto *state = static_cast<State *>(handle->data);
-                std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-                std::shared_ptr<State> keepalive;
-
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->initialized = false;
-                    state->closing = false;
-                    state->closed = true;
-                    stop_waiters.assign(state->stop_waiters.begin(), state->stop_waiters.end());
-                    state->stop_waiters.clear();
-                    keepalive = std::move(state->self_keepalive);
-                }
-
-                for (auto &waiter : stop_waiters) {
-                    waiter->setValue();
-                }
-            });
-        });
-    }
-
-    Runtime *runtime = nullptr;
-    Mailbox<FsPollEvent> mailbox;
-    MessageSender<FsPollEvent> sender;
-    uv_fs_poll_t handle{};
-    std::string watched_path;
-    std::chrono::milliseconds poll_interval{};
-    std::mutex mutex;
-    std::deque<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-    std::shared_ptr<State> self_keepalive;
-    bool initialized = false;
-    bool stop_requested = false;
-    bool closing = false;
-    bool closed = false;
-};
-
-FsPollWatcher::FsPollWatcher(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
-
-FsPollWatcher::~FsPollWatcher() {
-    request_stop();
-}
-
-Task<FsPollWatcher> FsPollWatcher::watch(std::string path, std::chrono::milliseconds interval) {
-    auto *runtime = co_await get_current_runtime();
-    auto mailbox = co_await Mailbox<FsPollEvent>::create(*runtime);
-    auto state = std::make_shared<State>(runtime, std::move(mailbox), std::move(path), interval);
-    auto promise = std::make_shared<async_simple::Promise<void>>();
-    auto future = promise->getFuture().via(runtime);
-
-    runtime->post([state, promise]() mutable {
-        const int init_rc = uv_fs_poll_init(state->runtime->loop(), &state->handle);
-        if (init_rc < 0) {
-            promise->setException(std::make_exception_ptr(Error("uv_fs_poll_init", init_rc)));
-            return;
-        }
-
-        state->handle.data = state.get();
-        const int start_rc = uv_fs_poll_start(
-            &state->handle,
-            [](uv_fs_poll_t *handle, int status, const uv_stat_t *prev, const uv_stat_t *curr) {
-                auto *state = static_cast<State *>(handle->data);
-                FsPollEvent event;
-                event.path = state->watched_path;
-                event.status = status;
-                if (status >= 0) {
-                    event.previous = make_file_info(*prev);
-                    event.current = make_file_info(*curr);
-                }
-                state->sender.send(std::move(event));
-                emit_trace_event({"watch", "fs_poll", status, 0});
-            },
-            state->watched_path.c_str(),
-            static_cast<unsigned int>(std::max<std::int64_t>(state->poll_interval.count(), 1)));
-
-        if (start_rc < 0) {
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->self_keepalive = state;
-                state->closing = true;
-            }
-
-            uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
-                auto *state = static_cast<State *>(handle->data);
-                std::shared_ptr<State> keepalive;
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->closed = true;
-                    state->closing = false;
-                    keepalive = std::move(state->self_keepalive);
-                }
-            });
-
-            promise->setException(std::make_exception_ptr(Error("uv_fs_poll_start", start_rc)));
-            emit_trace_event({"watch", "fs_poll_start_error", start_rc, 0});
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            state->initialized = true;
-        }
-        emit_trace_event({"watch", "fs_poll_start", 0, 0});
-        promise->setValue();
-    });
-
-    co_await std::move(future);
-    co_return FsPollWatcher(std::move(state));
-}
-
-bool FsPollWatcher::valid() const noexcept {
-    return state_ != nullptr;
-}
-
-const std::string &FsPollWatcher::path() const noexcept {
-    static const std::string kEmpty;
-    return state_ == nullptr ? kEmpty : state_->watched_path;
-}
-
-std::chrono::milliseconds FsPollWatcher::interval() const noexcept {
-    return state_ == nullptr ? std::chrono::milliseconds::zero() : state_->poll_interval;
-}
-
-FsPollWatcher::task_type FsPollWatcher::next() const {
-    if (!state_) {
-        throw std::runtime_error("fs poll watcher is empty");
-    }
-    return state_->mailbox.recv();
-}
-
-FsPollWatcher::stream_type FsPollWatcher::events() const {
-    if (!state_) {
-        return {};
-    }
-
-    return state_->mailbox.messages();
-}
-
-Task<void> FsPollWatcher::stop() {
-    if (!state_) {
-        co_return;
-    }
-
-    auto state = state_;
-    auto promise = std::make_shared<async_simple::Promise<void>>();
-    auto future = promise->getFuture().via(state->runtime);
-
-    state->runtime->post([state, promise]() mutable {
-        bool complete_now = false;
-        bool should_close = false;
-
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->closed) {
-                complete_now = true;
-            } else {
-                state->stop_waiters.push_back(promise);
-                if (!state->stop_requested) {
-                    state->stop_requested = true;
-                    state->self_keepalive = state;
-                    if (state->initialized && !state->closing) {
-                        state->closing = true;
-                        should_close = true;
-                    }
-                }
-            }
-        }
-
-        state->sender.close();
-
-        if (complete_now) {
-            promise->setValue();
-            return;
-        }
-
-        if (!should_close) {
-            return;
-        }
-
-        uv_fs_poll_stop(&state->handle);
-        emit_trace_event({"watch", "fs_poll_stop", 0, 0});
-        uv_close(reinterpret_cast<uv_handle_t *>(&state->handle), [](uv_handle_t *handle) {
-            auto *state = static_cast<State *>(handle->data);
-            std::vector<std::shared_ptr<async_simple::Promise<void>>> stop_waiters;
-            std::shared_ptr<State> keepalive;
-
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->initialized = false;
-                state->closing = false;
-                state->closed = true;
-                stop_waiters.assign(state->stop_waiters.begin(), state->stop_waiters.end());
-                state->stop_waiters.clear();
-                keepalive = std::move(state->self_keepalive);
-            }
-
-            for (auto &waiter : stop_waiters) {
-                waiter->setValue();
-            }
-        });
-    });
-
-    co_await std::move(future);
-}
-
-void FsPollWatcher::request_stop() {
-    if (state_) {
-        state_->request_stop();
-    }
+    state_->close_all();
 }
 
 } // namespace async_uv

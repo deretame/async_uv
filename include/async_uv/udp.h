@@ -7,8 +7,6 @@
 #include <string>
 #include <string_view>
 
-#include <uv.h>
-
 #include "async_uv/cancel.h"
 #include "async_uv/stream.h"
 #include "async_uv/tcp.h"
@@ -32,7 +30,7 @@ struct UdpDatagram {
     unsigned flags = 0;
 
     bool partial() const noexcept {
-        return (flags & UV_UDP_PARTIAL) != 0;
+        return false;
     }
 };
 
@@ -61,11 +59,13 @@ public:
     static Task<UdpSocket> connect(std::string host, int port);
     static Task<UdpSocket> connect(std::string host, int port, UdpConnectOptions options);
     static Task<UdpSocket> connect(SocketAddress endpoint);
+
     template <typename Rep, typename Period>
     static Task<UdpSocket>
     connect_for(std::string host, int port, std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, connect(std::move(host), port));
     }
+
     template <typename Rep, typename Period>
     static Task<UdpSocket> connect_for(std::string host,
                                        int port,
@@ -73,16 +73,19 @@ public:
                                        std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, connect(std::move(host), port, options));
     }
+
     template <typename Rep, typename Period>
     static Task<UdpSocket> connect_for(SocketAddress endpoint,
                                        std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, connect(std::move(endpoint)));
     }
+
     template <typename Clock, typename Duration>
     static Task<UdpSocket>
     connect_until(std::string host, int port, std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, connect(std::move(host), port));
     }
+
     template <typename Clock, typename Duration>
     static Task<UdpSocket> connect_until(std::string host,
                                          int port,
@@ -91,6 +94,7 @@ public:
         co_return co_await async_uv::with_deadline(deadline,
                                                    connect(std::move(host), port, options));
     }
+
     template <typename Clock, typename Duration>
     static Task<UdpSocket> connect_until(SocketAddress endpoint,
                                          std::chrono::time_point<Clock, Duration> deadline) {
@@ -119,51 +123,61 @@ public:
     Task<void> leave_multicast_group(std::string multicast_address,
                                      std::string interface_address = {});
     Task<void> close();
+
     template <typename Rep, typename Period>
     Task<std::size_t> send_for(std::string_view data, std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, send(data));
     }
+
     template <typename Rep, typename Period>
     Task<std::size_t> send_to_for(std::string_view data,
                                   SocketAddress endpoint,
                                   std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, send_to(data, std::move(endpoint)));
     }
+
     template <typename Rep, typename Period>
     Task<UdpDatagram> receive_from_for(std::chrono::duration<Rep, Period> timeout,
                                        std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_timeout(timeout, receive_from(max_bytes));
     }
+
     template <typename Rep, typename Period>
     Task<std::string> receive_for(std::chrono::duration<Rep, Period> timeout,
                                   std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_timeout(timeout, receive(max_bytes));
     }
+
     template <typename Rep, typename Period>
     Task<void> close_for(std::chrono::duration<Rep, Period> timeout) {
         co_return co_await async_uv::with_timeout(timeout, close());
     }
+
     template <typename Clock, typename Duration>
     Task<std::size_t> send_until(std::string_view data,
                                  std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, send(data));
     }
+
     template <typename Clock, typename Duration>
     Task<std::size_t> send_to_until(std::string_view data,
                                     SocketAddress endpoint,
                                     std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, send_to(data, std::move(endpoint)));
     }
+
     template <typename Clock, typename Duration>
     Task<UdpDatagram> receive_from_until(std::chrono::time_point<Clock, Duration> deadline,
                                          std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_deadline(deadline, receive_from(max_bytes));
     }
+
     template <typename Clock, typename Duration>
     Task<std::string> receive_until(std::chrono::time_point<Clock, Duration> deadline,
                                     std::size_t max_bytes = 64 * 1024) {
         co_return co_await async_uv::with_deadline(deadline, receive(max_bytes));
     }
+
     template <typename Clock, typename Duration>
     Task<void> close_until(std::chrono::time_point<Clock, Duration> deadline) {
         co_return co_await async_uv::with_deadline(deadline, close());
@@ -192,3 +206,4 @@ private:
 };
 
 } // namespace async_uv
+

@@ -1,20 +1,28 @@
 #pragma once
 
+#include <future>
 #include <type_traits>
 
-#include <async_simple/Future.h>
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/FutureAwaiter.h>
+#include <exec/task.hpp>
 
 namespace async_uv {
 
 template <class T = void>
-using Task = async_simple::coro::Lazy<T>;
+using Task = exec::task<T>;
 
 template <class T = void>
-using Future = async_simple::Future<T>;
+using Future = std::shared_future<T>;
+
+template <class T>
+struct task_value;
+
+template <class T>
+struct task_value<exec::task<T>> {
+    using type = T;
+};
 
 template <class Awaitable>
-using TaskValue = typename std::decay_t<Awaitable>::ValueType;
+using TaskValue = typename task_value<std::decay_t<Awaitable>>::type;
 
 } // namespace async_uv
+

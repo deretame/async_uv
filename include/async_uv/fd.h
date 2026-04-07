@@ -1,105 +1,834 @@
 #pragma once
 
-#include <chrono>
+#include <atomic>
+#include <cstddef>
+#include <exception>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <utility>
 
-#include <uv.h>
+#include <asio/error.hpp>
+#include <asio/posix/stream_descriptor.hpp>
+#include <asio/read.hpp>
+#include <asio/write.hpp>
+#include <stdexec/execution.hpp>
 
-#include "async_uv/fs.h"
-#include "async_uv/message.h"
+#include "async_uv/runtime.h"
 
 namespace async_uv {
 
-enum class FdEventFlags : int {
-    none = 0,
-    readable = UV_READABLE,
-    writable = UV_WRITABLE,
-#ifdef UV_DISCONNECT
-    disconnect = UV_DISCONNECT,
-#endif
-#ifdef UV_PRIORITIZED
-    prioritized = UV_PRIORITIZED,
-#endif
-};
+namespace detail {
 
-template <>
-struct enable_bitmask_operators<FdEventFlags> : std::true_type {};
+template <class Receiver>
+void set_stopped_or_error(Receiver &receiver, const std::error_code &ec) noexcept {
+    if (ec == exec::asio::asio_impl::error::operation_aborted ||
+        ec == exec::asio::asio_impl::error::bad_descriptor) {
+        stdexec::set_stopped(std::move(receiver));
+        return;
+    }
+    stdexec::set_error(
+        std::move(receiver),
+        std::make_exception_ptr(std::system_error(ec, "FdStream asynchronous operation failed")));
+}
 
-struct FdEvent {
-    int status = 0;
-    int events = 0;
+template <class Receiver>
+void set_not_valid(Receiver &receiver) noexcept {
+    stdexec::set_error(
+        std::move(receiver),
+        std::make_exception_ptr(std::runtime_error("FdStream is not valid")));
+}
 
-    FdEvent() = default;
-    FdEvent(int status_in, int events_in) : status(status_in), events(events_in) {}
-    FdEvent(const FdEvent &) = delete;
-    FdEvent &operator=(const FdEvent &) = delete;
-    FdEvent(FdEvent &&) noexcept = default;
-    FdEvent &operator=(FdEvent &&) noexcept = default;
+} // namespace detail
 
-    bool ok() const noexcept;
-    bool readable() const noexcept;
-    bool writable() const noexcept;
-    bool disconnected() const noexcept;
-    bool prioritized() const noexcept;
-};
-
-class FdWatcher {
+class FdStream {
 public:
-    using next_type = std::optional<FdEvent>;
-    using task_type = Task<next_type>;
-    using stream_type = Stream<FdEvent>;
+    struct State {
+        Runtime *runtime = nullptr;
+        exec::asio::asio_impl::posix::stream_descriptor descriptor;
 
-    FdWatcher() = default;
-    ~FdWatcher();
+        explicit State(Runtime *rt) : runtime(rt), descriptor(rt->executor()) {}
+    };
 
-    FdWatcher(const FdWatcher &) = delete;
-    FdWatcher &operator=(const FdWatcher &) = delete;
-    FdWatcher(FdWatcher &&) noexcept = default;
-    FdWatcher &operator=(FdWatcher &&) noexcept = default;
+    class WaitReadableSender;
+    class WaitWritableSender;
+    class WriteSomeSender;
+    class WriteAllSender;
+    class ReadSomeSender;
+    class ReadExactlySender;
 
-    static Task<FdWatcher> watch(uv_os_sock_t fd, int events);
-    static Task<FdWatcher> watch(uv_os_sock_t fd, FdEventFlags flags);
+    FdStream() = default;
+    explicit FdStream(std::shared_ptr<State> state) noexcept;
+    ~FdStream();
+
+    FdStream(const FdStream &) = delete;
+    FdStream &operator=(const FdStream &) = delete;
+    FdStream(FdStream &&other) noexcept;
+    FdStream &operator=(FdStream &&other) noexcept;
+
+    // Duplicate an existing file descriptor and manage the duplicated handle.
+    static Task<FdStream> attach(int fd);
+
+    // Adopt and manage ownership of an existing file descriptor.
+    static Task<FdStream> adopt(int fd);
 
     bool valid() const noexcept;
-    uv_os_sock_t fd() const noexcept;
-    int watch_events() const noexcept;
+    int native_handle() const noexcept;
 
-    task_type next() const;
+    // Sender factories (P2300 style):
+    // each sender implements connect(receiver) -> operation_state and start().
+    [[nodiscard]] WaitReadableSender wait_readable_sender() const;
+    [[nodiscard]] WaitWritableSender wait_writable_sender() const;
+    [[nodiscard]] WriteSomeSender write_some_sender(std::string data) const;
+    [[nodiscard]] WriteAllSender write_all_sender(std::string data) const;
+    [[nodiscard]] ReadSomeSender read_some_sender(std::size_t max_bytes = 64 * 1024) const;
+    [[nodiscard]] ReadExactlySender read_exactly_sender(std::size_t bytes) const;
 
-    template <typename Rep, typename Period>
-    task_type next_for(std::chrono::duration<Rep, Period> timeout) const {
-        co_return co_await async_uv::with_timeout(timeout, next());
+    Task<void> wait_readable() const;
+    Task<void> wait_writable() const;
+
+    // Coroutine helpers built on top of sender factories.
+    Task<std::size_t> write_some(std::string_view data) const;
+    Task<std::size_t> write_all(std::string_view data) const;
+    Task<std::string> read_some(std::size_t max_bytes = 64 * 1024) const;
+    Task<std::string> read_exactly(std::size_t bytes) const;
+
+    Task<void> close();
+
+private:
+    std::shared_ptr<State> state_;
+};
+
+class FdStream::WaitReadableSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    WaitReadableSender() = default;
+    explicit WaitReadableSender(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const WaitReadableSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
     }
 
-    template <typename Clock, typename Duration>
-    task_type next_until(std::chrono::time_point<Clock, Duration> deadline) const {
-        co_return co_await async_uv::with_deadline(deadline, next());
-    }
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
 
-    stream_type events_stream() const;
-    stream_type events() const {
-        return events_stream();
-    }
-    Task<void> stop();
+        std::shared_ptr<State> state;
+        Receiver receiver;
+        std::atomic<bool> completed{false};
+        using StopToken =
+            decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
+        struct StopRequest {
+            Operation *self = nullptr;
+            void operator()() const noexcept {
+                if (self != nullptr) {
+                    self->request_cancel();
+                }
+            }
+        };
+        using StopCallback = stdexec::stop_callback_for_t<StopToken, StopRequest>;
+        std::optional<StopCallback> on_stop;
 
-    template <typename Rep, typename Period>
-    Task<void> stop_for(std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await async_uv::with_timeout(timeout, stop());
-    }
+        bool begin_operation() noexcept {
+            if (!state || !state->descriptor.is_open()) {
+                completed.store(true, std::memory_order_release);
+                detail::set_not_valid(receiver);
+                return false;
+            }
 
-    template <typename Clock, typename Duration>
-    Task<void> stop_until(std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await async_uv::with_deadline(deadline, stop());
+            StopToken token = stdexec::get_stop_token(stdexec::get_env(receiver));
+            if (token.stop_requested()) {
+                completed.store(true, std::memory_order_release);
+                stdexec::set_stopped(std::move(receiver));
+                return false;
+            }
+
+            on_stop.emplace(token, StopRequest{this});
+            return true;
+        }
+
+        bool finish_operation() noexcept {
+            bool expected = false;
+            if (!completed.compare_exchange_strong(
+                    expected,
+                    true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            on_stop.reset();
+            return true;
+        }
+
+        void request_cancel() noexcept {
+            if (completed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!state || !state->descriptor.is_open()) {
+                return;
+            }
+            std::error_code ignored;
+            state->descriptor.cancel(ignored);
+        }
+
+        void start() noexcept {
+            if (!begin_operation()) {
+                return;
+            }
+
+            state->descriptor.async_wait(
+                exec::asio::asio_impl::posix::stream_descriptor::wait_read,
+                [this](const std::error_code &ec) noexcept {
+                    if (!finish_operation()) {
+                        return;
+                    }
+                    if (ec) {
+                        detail::set_stopped_or_error(receiver, ec);
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver));
+                });
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, WaitReadableSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.state_), std::move(receiver), {}, std::nullopt};
     }
 
 private:
-    struct State;
-
-    explicit FdWatcher(std::shared_ptr<State> state) noexcept;
-    void request_stop();
-
     std::shared_ptr<State> state_;
+};
+
+class FdStream::WaitWritableSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    WaitWritableSender() = default;
+    explicit WaitWritableSender(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const WaitWritableSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        std::shared_ptr<State> state;
+        Receiver receiver;
+        std::atomic<bool> completed{false};
+        using StopToken =
+            decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
+        struct StopRequest {
+            Operation *self = nullptr;
+            void operator()() const noexcept {
+                if (self != nullptr) {
+                    self->request_cancel();
+                }
+            }
+        };
+        using StopCallback = stdexec::stop_callback_for_t<StopToken, StopRequest>;
+        std::optional<StopCallback> on_stop;
+
+        bool begin_operation() noexcept {
+            if (!state || !state->descriptor.is_open()) {
+                completed.store(true, std::memory_order_release);
+                detail::set_not_valid(receiver);
+                return false;
+            }
+
+            StopToken token = stdexec::get_stop_token(stdexec::get_env(receiver));
+            if (token.stop_requested()) {
+                completed.store(true, std::memory_order_release);
+                stdexec::set_stopped(std::move(receiver));
+                return false;
+            }
+
+            on_stop.emplace(token, StopRequest{this});
+            return true;
+        }
+
+        bool finish_operation() noexcept {
+            bool expected = false;
+            if (!completed.compare_exchange_strong(
+                    expected,
+                    true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            on_stop.reset();
+            return true;
+        }
+
+        void request_cancel() noexcept {
+            if (completed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!state || !state->descriptor.is_open()) {
+                return;
+            }
+            std::error_code ignored;
+            state->descriptor.cancel(ignored);
+        }
+
+        void start() noexcept {
+            if (!begin_operation()) {
+                return;
+            }
+
+            state->descriptor.async_wait(
+                exec::asio::asio_impl::posix::stream_descriptor::wait_write,
+                [this](const std::error_code &ec) noexcept {
+                    if (!finish_operation()) {
+                        return;
+                    }
+                    if (ec) {
+                        detail::set_stopped_or_error(receiver, ec);
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver));
+                });
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, WaitWritableSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.state_), std::move(receiver), {}, std::nullopt};
+    }
+
+private:
+    std::shared_ptr<State> state_;
+};
+
+class FdStream::WriteSomeSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(std::size_t),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    WriteSomeSender() = default;
+    WriteSomeSender(std::shared_ptr<State> state, std::string data)
+        : state_(std::move(state)), payload_(std::make_shared<std::string>(std::move(data))) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const WriteSomeSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        std::shared_ptr<State> state;
+        std::shared_ptr<std::string> payload;
+        Receiver receiver;
+        std::atomic<bool> completed{false};
+        using StopToken =
+            decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
+        struct StopRequest {
+            Operation *self = nullptr;
+            void operator()() const noexcept {
+                if (self != nullptr) {
+                    self->request_cancel();
+                }
+            }
+        };
+        using StopCallback = stdexec::stop_callback_for_t<StopToken, StopRequest>;
+        std::optional<StopCallback> on_stop;
+
+        bool begin_operation() noexcept {
+            if (!state || !state->descriptor.is_open()) {
+                completed.store(true, std::memory_order_release);
+                detail::set_not_valid(receiver);
+                return false;
+            }
+
+            StopToken token = stdexec::get_stop_token(stdexec::get_env(receiver));
+            if (token.stop_requested()) {
+                completed.store(true, std::memory_order_release);
+                stdexec::set_stopped(std::move(receiver));
+                return false;
+            }
+
+            on_stop.emplace(token, StopRequest{this});
+            return true;
+        }
+
+        bool finish_operation() noexcept {
+            bool expected = false;
+            if (!completed.compare_exchange_strong(
+                    expected,
+                    true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            on_stop.reset();
+            return true;
+        }
+
+        void request_cancel() noexcept {
+            if (completed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!state || !state->descriptor.is_open()) {
+                return;
+            }
+            std::error_code ignored;
+            state->descriptor.cancel(ignored);
+        }
+
+        void start() noexcept {
+            if (!begin_operation()) {
+                return;
+            }
+
+            state->descriptor.async_write_some(
+                exec::asio::asio_impl::buffer(payload->data(), payload->size()),
+                [this](const std::error_code &ec, std::size_t written) noexcept {
+                    if (!finish_operation()) {
+                        return;
+                    }
+                    if (ec) {
+                        detail::set_stopped_or_error(receiver, ec);
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver), written);
+                });
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, WriteSomeSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.state_),
+                std::move(self.payload_),
+                std::move(receiver),
+                {},
+                std::nullopt};
+    }
+
+private:
+    std::shared_ptr<State> state_;
+    std::shared_ptr<std::string> payload_;
+};
+
+class FdStream::WriteAllSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(std::size_t),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    WriteAllSender() = default;
+    WriteAllSender(std::shared_ptr<State> state, std::string data)
+        : state_(std::move(state)), payload_(std::make_shared<std::string>(std::move(data))) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const WriteAllSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        std::shared_ptr<State> state;
+        std::shared_ptr<std::string> payload;
+        Receiver receiver;
+        std::atomic<bool> completed{false};
+        using StopToken =
+            decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
+        struct StopRequest {
+            Operation *self = nullptr;
+            void operator()() const noexcept {
+                if (self != nullptr) {
+                    self->request_cancel();
+                }
+            }
+        };
+        using StopCallback = stdexec::stop_callback_for_t<StopToken, StopRequest>;
+        std::optional<StopCallback> on_stop;
+
+        bool begin_operation() noexcept {
+            if (!state || !state->descriptor.is_open()) {
+                completed.store(true, std::memory_order_release);
+                detail::set_not_valid(receiver);
+                return false;
+            }
+
+            StopToken token = stdexec::get_stop_token(stdexec::get_env(receiver));
+            if (token.stop_requested()) {
+                completed.store(true, std::memory_order_release);
+                stdexec::set_stopped(std::move(receiver));
+                return false;
+            }
+
+            on_stop.emplace(token, StopRequest{this});
+            return true;
+        }
+
+        bool finish_operation() noexcept {
+            bool expected = false;
+            if (!completed.compare_exchange_strong(
+                    expected,
+                    true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            on_stop.reset();
+            return true;
+        }
+
+        void request_cancel() noexcept {
+            if (completed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!state || !state->descriptor.is_open()) {
+                return;
+            }
+            std::error_code ignored;
+            state->descriptor.cancel(ignored);
+        }
+
+        void start() noexcept {
+            if (!begin_operation()) {
+                return;
+            }
+
+            exec::asio::asio_impl::async_write(
+                state->descriptor,
+                exec::asio::asio_impl::buffer(payload->data(), payload->size()),
+                [this](const std::error_code &ec, std::size_t written) noexcept {
+                    if (!finish_operation()) {
+                        return;
+                    }
+                    if (ec) {
+                        detail::set_stopped_or_error(receiver, ec);
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver), written);
+                });
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, WriteAllSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.state_),
+                std::move(self.payload_),
+                std::move(receiver),
+                {},
+                std::nullopt};
+    }
+
+private:
+    std::shared_ptr<State> state_;
+    std::shared_ptr<std::string> payload_;
+};
+
+class FdStream::ReadSomeSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(std::string),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    ReadSomeSender() = default;
+    ReadSomeSender(std::shared_ptr<State> state, std::size_t max_bytes)
+        : state_(std::move(state)), max_bytes_(max_bytes == 0 ? 64 * 1024 : max_bytes) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const ReadSomeSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        std::shared_ptr<State> state;
+        std::size_t max_bytes = 0;
+        Receiver receiver;
+        std::shared_ptr<std::string> buffer;
+        std::atomic<bool> completed{false};
+        using StopToken =
+            decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
+        struct StopRequest {
+            Operation *self = nullptr;
+            void operator()() const noexcept {
+                if (self != nullptr) {
+                    self->request_cancel();
+                }
+            }
+        };
+        using StopCallback = stdexec::stop_callback_for_t<StopToken, StopRequest>;
+        std::optional<StopCallback> on_stop;
+
+        bool begin_operation() noexcept {
+            if (!state || !state->descriptor.is_open()) {
+                completed.store(true, std::memory_order_release);
+                detail::set_not_valid(receiver);
+                return false;
+            }
+
+            StopToken token = stdexec::get_stop_token(stdexec::get_env(receiver));
+            if (token.stop_requested()) {
+                completed.store(true, std::memory_order_release);
+                stdexec::set_stopped(std::move(receiver));
+                return false;
+            }
+
+            on_stop.emplace(token, StopRequest{this});
+            return true;
+        }
+
+        bool finish_operation() noexcept {
+            bool expected = false;
+            if (!completed.compare_exchange_strong(
+                    expected,
+                    true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            on_stop.reset();
+            return true;
+        }
+
+        void request_cancel() noexcept {
+            if (completed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!state || !state->descriptor.is_open()) {
+                return;
+            }
+            std::error_code ignored;
+            state->descriptor.cancel(ignored);
+        }
+
+        void start() noexcept {
+            if (!begin_operation()) {
+                return;
+            }
+
+            buffer = std::make_shared<std::string>(max_bytes, '\0');
+            state->descriptor.async_read_some(
+                exec::asio::asio_impl::buffer(buffer->data(), buffer->size()),
+                [this](const std::error_code &ec, std::size_t n) noexcept {
+                    if (!finish_operation()) {
+                        return;
+                    }
+
+                    if (ec) {
+                        if (ec == exec::asio::asio_impl::error::eof) {
+                            stdexec::set_value(std::move(receiver), std::string{});
+                            return;
+                        }
+                        detail::set_stopped_or_error(receiver, ec);
+                        return;
+                    }
+
+                    buffer->resize(n);
+                    stdexec::set_value(std::move(receiver), std::move(*buffer));
+                });
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, ReadSomeSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.state_),
+                self.max_bytes_,
+                std::move(receiver),
+                nullptr,
+                {},
+                std::nullopt};
+    }
+
+private:
+    std::shared_ptr<State> state_;
+    std::size_t max_bytes_ = 64 * 1024;
+};
+
+class FdStream::ReadExactlySender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(std::string),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    ReadExactlySender() = default;
+    ReadExactlySender(std::shared_ptr<State> state, std::size_t bytes)
+        : state_(std::move(state)), bytes_(bytes) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const ReadExactlySender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        std::shared_ptr<State> state;
+        std::size_t bytes = 0;
+        Receiver receiver;
+        std::shared_ptr<std::string> buffer;
+        std::atomic<bool> completed{false};
+        using StopToken =
+            decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
+        struct StopRequest {
+            Operation *self = nullptr;
+            void operator()() const noexcept {
+                if (self != nullptr) {
+                    self->request_cancel();
+                }
+            }
+        };
+        using StopCallback = stdexec::stop_callback_for_t<StopToken, StopRequest>;
+        std::optional<StopCallback> on_stop;
+
+        bool begin_operation() noexcept {
+            if (!state || !state->descriptor.is_open()) {
+                completed.store(true, std::memory_order_release);
+                detail::set_not_valid(receiver);
+                return false;
+            }
+
+            StopToken token = stdexec::get_stop_token(stdexec::get_env(receiver));
+            if (token.stop_requested()) {
+                completed.store(true, std::memory_order_release);
+                stdexec::set_stopped(std::move(receiver));
+                return false;
+            }
+
+            on_stop.emplace(token, StopRequest{this});
+            return true;
+        }
+
+        bool finish_operation() noexcept {
+            bool expected = false;
+            if (!completed.compare_exchange_strong(
+                    expected,
+                    true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            on_stop.reset();
+            return true;
+        }
+
+        void request_cancel() noexcept {
+            if (completed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!state || !state->descriptor.is_open()) {
+                return;
+            }
+            std::error_code ignored;
+            state->descriptor.cancel(ignored);
+        }
+
+        void start() noexcept {
+            if (!begin_operation()) {
+                return;
+            }
+
+            buffer = std::make_shared<std::string>(bytes, '\0');
+            exec::asio::asio_impl::async_read(
+                state->descriptor,
+                exec::asio::asio_impl::buffer(buffer->data(), buffer->size()),
+                [this](const std::error_code &ec, std::size_t n) noexcept {
+                    if (!finish_operation()) {
+                        return;
+                    }
+                    if (ec) {
+                        detail::set_stopped_or_error(receiver, ec);
+                        return;
+                    }
+                    buffer->resize(n);
+                    stdexec::set_value(std::move(receiver), std::move(*buffer));
+                });
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, ReadExactlySender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.state_),
+                self.bytes_,
+                std::move(receiver),
+                nullptr,
+                {},
+                std::nullopt};
+    }
+
+private:
+    std::shared_ptr<State> state_;
+    std::size_t bytes_ = 0;
 };
 
 } // namespace async_uv
