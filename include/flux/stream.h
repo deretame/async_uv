@@ -7,9 +7,9 @@
 #include <stdexcept>
 #include <utility>
 
-#include "async_uv/task.h"
+#include "flux/task.h"
 
-namespace async_uv {
+namespace flux {
 
 template <typename T>
 class Stream {
@@ -78,4 +78,4 @@ private:
     std::shared_ptr<State> state_;
 };
 
-} // namespace async_uv
+} // namespace flux

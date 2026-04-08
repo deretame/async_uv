@@ -5,7 +5,7 @@
 #include <exec/when_any.hpp>
 #include <stdexec/execution.hpp>
 
-namespace async_uv::scope {
+namespace flux::scope {
 
 template <typename... Senders>
 auto all(Senders &&...senders) {
@@ -17,4 +17,4 @@ auto any(Senders &&...senders) {
     return exec::when_any(std::forward<Senders>(senders)...);
 }
 
-} // namespace async_uv::scope
+} // namespace flux::scope

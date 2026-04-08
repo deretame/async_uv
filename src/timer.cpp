@@ -1,9 +1,9 @@
-#include "async_uv/timer.h"
+#include "flux/timer.h"
 
 #include <stdexcept>
 #include <system_error>
 
-namespace async_uv {
+namespace flux {
 
 struct SteadyTimer::State {
     Runtime *runtime = nullptr;
@@ -93,4 +93,4 @@ Task<void> SteadyTimer::close() {
     state_.reset();
 }
 
-} // namespace async_uv
+} // namespace flux

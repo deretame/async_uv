@@ -4,9 +4,9 @@
 #include <cstddef>
 #include <memory>
 
-#include "async_uv/runtime.h"
+#include "flux/runtime.h"
 
-namespace async_uv {
+namespace flux {
 
 class SteadyTimer {
 public:
@@ -36,4 +36,4 @@ private:
     std::shared_ptr<State> state_;
 };
 
-} // namespace async_uv
+} // namespace flux

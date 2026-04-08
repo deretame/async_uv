@@ -1,6 +1,5 @@
-#include "async_uv/tcp.h"
+#include "flux/tcp.h"
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -10,7 +9,7 @@
 #include <system_error>
 #include <utility>
 
-namespace async_uv {
+namespace flux {
 
 namespace {
 
@@ -21,17 +20,15 @@ int to_port(std::uint16_t port) {
 }
 
 SocketAddress from_tcp_endpoint(const asio::ip::tcp::endpoint &endpoint) {
-    auto *addr = reinterpret_cast<const sockaddr *>(endpoint.data());
-    return SocketAddress::from_native(addr, static_cast<int>(endpoint.size()));
+    return SocketAddress::from_asio(endpoint.address(), static_cast<int>(endpoint.port()));
 }
 
 SocketAddress from_udp_endpoint(const asio::ip::udp::endpoint &endpoint) {
-    auto *addr = reinterpret_cast<const sockaddr *>(endpoint.data());
-    return SocketAddress::from_native(addr, static_cast<int>(endpoint.size()));
+    return SocketAddress::from_asio(endpoint.address(), static_cast<int>(endpoint.port()));
 }
 
 asio::ip::address to_asio_address(const SocketAddress &address) {
-    return asio::ip::make_address(address.ip());
+    return address.as_asio_address();
 }
 
 asio::ip::tcp::endpoint to_tcp_endpoint(const SocketAddress &address) {
@@ -69,74 +66,49 @@ bool family_matches(const SocketAddress &address, AddressFamily family) {
     return false;
 }
 
-} // namespace
-
-SocketAddress::SocketAddress(const sockaddr *address, int length)
-    : length_(length) {
-    if (address == nullptr || length <= 0 || length > static_cast<int>(sizeof(storage_))) {
-        length_ = 0;
-        std::memset(&storage_, 0, sizeof(storage_));
-        return;
-    }
-    std::memset(&storage_, 0, sizeof(storage_));
-    std::memcpy(&storage_, address, static_cast<std::size_t>(length));
+TcpClient::ConstBuffer to_const_buffer(std::string_view data) {
+    return TcpClient::ConstBuffer{
+        reinterpret_cast<const std::byte *>(data.data()),
+        data.size()};
 }
 
+} // namespace
+
+SocketAddress::SocketAddress(exec::asio::asio_impl::ip::address address, unsigned short port)
+    : address_(std::move(address)), port_(port) {}
+
 bool SocketAddress::valid() const noexcept {
-    return length_ > 0;
+    return address_.has_value();
 }
 
 int SocketAddress::family() const noexcept {
-    return valid() ? static_cast<int>(storage_.ss_family) : AF_UNSPEC;
+    if (!address_) {
+        return AF_UNSPEC;
+    }
+    return address_->is_v4() ? AF_INET : AF_INET6;
 }
 
 int SocketAddress::port() const noexcept {
-    if (!valid()) {
-        return 0;
-    }
-    if (storage_.ss_family == AF_INET) {
-        const auto *addr = reinterpret_cast<const sockaddr_in *>(&storage_);
-        return ntohs(addr->sin_port);
-    }
-    if (storage_.ss_family == AF_INET6) {
-        const auto *addr = reinterpret_cast<const sockaddr_in6 *>(&storage_);
-        return ntohs(addr->sin6_port);
-    }
-    return 0;
+    return static_cast<int>(port_);
 }
 
 bool SocketAddress::is_ipv4() const noexcept {
-    return family() == AF_INET;
+    return address_.has_value() && address_->is_v4();
 }
 
 bool SocketAddress::is_ipv6() const noexcept {
-    return family() == AF_INET6;
+    return address_.has_value() && address_->is_v6();
+}
+
+exec::asio::asio_impl::ip::address SocketAddress::as_asio_address() const {
+    if (!address_) {
+        throw std::runtime_error("invalid socket address");
+    }
+    return *address_;
 }
 
 std::string SocketAddress::ip() const {
-    if (!valid()) {
-        return {};
-    }
-
-    std::array<char, INET6_ADDRSTRLEN> buffer{};
-    if (storage_.ss_family == AF_INET) {
-        const auto *addr = reinterpret_cast<const sockaddr_in *>(&storage_);
-        if (inet_ntop(AF_INET, &addr->sin_addr, buffer.data(), static_cast<socklen_t>(buffer.size())) ==
-            nullptr) {
-            throw std::system_error(errno, std::generic_category(), "inet_ntop(AF_INET)");
-        }
-        return std::string(buffer.data());
-    }
-    if (storage_.ss_family == AF_INET6) {
-        const auto *addr = reinterpret_cast<const sockaddr_in6 *>(&storage_);
-        if (inet_ntop(
-                AF_INET6, &addr->sin6_addr, buffer.data(), static_cast<socklen_t>(buffer.size())) ==
-            nullptr) {
-            throw std::system_error(errno, std::generic_category(), "inet_ntop(AF_INET6)");
-        }
-        return std::string(buffer.data());
-    }
-    return {};
+    return address_ ? address_->to_string() : std::string{};
 }
 
 std::string SocketAddress::to_string() const {
@@ -150,40 +122,106 @@ std::string SocketAddress::to_string() const {
     return host + ":" + std::to_string(port());
 }
 
+void SocketAddress::refresh_native_cache() const noexcept {
+    if (!address_) {
+        native_length_ = 0;
+        native_ready_ = true;
+        return;
+    }
+
+    if (native_ready_) {
+        return;
+    }
+
+    std::memset(&native_storage_, 0, sizeof(native_storage_));
+    if (address_->is_v4()) {
+        auto *addr = reinterpret_cast<sockaddr_in *>(&native_storage_);
+        addr->sin_family = AF_INET;
+        addr->sin_port = htons(port_);
+        const auto bytes = address_->to_v4().to_bytes();
+        std::memcpy(&addr->sin_addr, bytes.data(), bytes.size());
+        native_length_ = static_cast<int>(sizeof(sockaddr_in));
+    } else {
+        auto *addr = reinterpret_cast<sockaddr_in6 *>(&native_storage_);
+        addr->sin6_family = AF_INET6;
+        addr->sin6_port = htons(port_);
+        addr->sin6_scope_id = address_->to_v6().scope_id();
+        const auto bytes = address_->to_v6().to_bytes();
+        std::memcpy(&addr->sin6_addr, bytes.data(), bytes.size());
+        native_length_ = static_cast<int>(sizeof(sockaddr_in6));
+    }
+    native_ready_ = true;
+}
+
 const sockaddr *SocketAddress::data() const noexcept {
-    return valid() ? reinterpret_cast<const sockaddr *>(&storage_) : nullptr;
+    refresh_native_cache();
+    return native_length_ > 0 ? reinterpret_cast<const sockaddr *>(&native_storage_) : nullptr;
 }
 
 sockaddr *SocketAddress::data() noexcept {
-    return valid() ? reinterpret_cast<sockaddr *>(&storage_) : nullptr;
+    refresh_native_cache();
+    return native_length_ > 0 ? reinterpret_cast<sockaddr *>(&native_storage_) : nullptr;
 }
 
 int SocketAddress::size() const noexcept {
-    return length_;
+    refresh_native_cache();
+    return native_length_;
+}
+
+SocketAddress SocketAddress::from_asio(exec::asio::asio_impl::ip::address address, int port) {
+    if (port < 0 || port > 65535) {
+        throw std::runtime_error("port out of range");
+    }
+    return SocketAddress(std::move(address), static_cast<unsigned short>(port));
 }
 
 SocketAddress SocketAddress::from_native(const sockaddr *address, int length) {
-    return SocketAddress(address, length);
+    if (address == nullptr || length <= 0) {
+        return {};
+    }
+
+    if (address->sa_family == AF_INET) {
+        if (length < static_cast<int>(sizeof(sockaddr_in))) {
+            return {};
+        }
+        const auto *addr = reinterpret_cast<const sockaddr_in *>(address);
+        asio::ip::address_v4::bytes_type bytes{};
+        std::memcpy(bytes.data(), &addr->sin_addr, bytes.size());
+        return SocketAddress(asio::ip::address_v4(bytes), ntohs(addr->sin_port));
+    }
+
+    if (address->sa_family == AF_INET6) {
+        if (length < static_cast<int>(sizeof(sockaddr_in6))) {
+            return {};
+        }
+        const auto *addr = reinterpret_cast<const sockaddr_in6 *>(address);
+        asio::ip::address_v6::bytes_type bytes{};
+        std::memcpy(bytes.data(), &addr->sin6_addr, bytes.size());
+        return SocketAddress(asio::ip::address_v6(bytes, addr->sin6_scope_id),
+                             ntohs(addr->sin6_port));
+    }
+
+    return {};
 }
 
 SocketAddress SocketAddress::ipv4(std::string ip, int port) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<std::uint16_t>(port));
-    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+    std::error_code ec;
+    const auto parsed = asio::ip::make_address_v4(ip, ec);
+    if (ec) {
         throw std::runtime_error("invalid IPv4 address: " + ip);
     }
-    return SocketAddress(reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
+
+    return from_asio(parsed, port);
 }
 
 SocketAddress SocketAddress::ipv6(std::string ip, int port) {
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(static_cast<std::uint16_t>(port));
-    if (inet_pton(AF_INET6, ip.c_str(), &addr.sin6_addr) != 1) {
+    std::error_code ec;
+    const auto parsed = asio::ip::make_address_v6(ip, ec);
+    if (ec) {
         throw std::runtime_error("invalid IPv6 address: " + ip);
     }
-    return SocketAddress(reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
+
+    return from_asio(parsed, port);
 }
 
 Task<std::vector<SocketAddress>> resolve(std::string host, int port, ResolveOptions options) {
@@ -247,6 +285,24 @@ resolve_udp(std::string host, std::string service, AddressFamily family) {
 Task<NameInfo> lookup_name(SocketAddress endpoint, NameInfoOptions options) {
     if (!endpoint.valid()) {
         throw std::runtime_error("lookup_name: invalid endpoint");
+    }
+
+    // Asio-first path: when no getnameinfo-specific flags are requested,
+    // use resolver reverse lookup directly.
+    if (!options.numeric_host && !options.numeric_service && !options.name_required &&
+        !options.datagram_service && !options.no_fqdn) {
+        auto ex = co_await get_current_loop();
+        if (endpoint.is_ipv4() || endpoint.is_ipv6()) {
+            asio::ip::tcp::resolver resolver(ex);
+            asio::ip::tcp::endpoint ep(
+                endpoint.as_asio_address(), static_cast<unsigned short>(endpoint.port()));
+            auto results = co_await resolver.async_resolve(ep, exec::asio::use_sender);
+            const auto it = results.begin();
+            if (it == results.end()) {
+                throw std::runtime_error("lookup_name failed: empty reverse resolution result");
+            }
+            co_return NameInfo{it->host_name(), it->service_name()};
+        }
     }
 
     int flags = 0;
@@ -344,58 +400,77 @@ bool TcpClient::eof() const noexcept {
     return state_ != nullptr && state_->eof;
 }
 
-Task<std::size_t> TcpClient::write(std::string_view data) {
+Task<std::size_t> TcpClient::write(ConstBuffer data) {
     if (!valid()) {
         throw std::runtime_error("TcpClient is not connected");
     }
+    if (data.empty()) {
+        co_return 0;
+    }
     co_return co_await state_->socket.async_write_some(
-        asio::buffer(data.data(), data.size()), exec::asio::use_sender);
+        asio::buffer(static_cast<const void *>(data.data()), data.size()), exec::asio::use_sender);
+}
+
+Task<std::size_t> TcpClient::write_all(ConstBuffer data) {
+    if (!valid()) {
+        throw std::runtime_error("TcpClient is not connected");
+    }
+    if (data.empty()) {
+        co_return 0;
+    }
+    co_return co_await asio::async_write(
+        state_->socket,
+        asio::buffer(static_cast<const void *>(data.data()), data.size()),
+        exec::asio::use_sender);
+}
+
+Task<std::size_t> TcpClient::write(std::string_view data) {
+    co_return co_await write(to_const_buffer(data));
 }
 
 Task<std::size_t> TcpClient::write_all(std::string_view data) {
-    if (!valid()) {
-        throw std::runtime_error("TcpClient is not connected");
-    }
-    co_return co_await asio::async_write(
-        state_->socket, asio::buffer(data.data(), data.size()), exec::asio::use_sender);
+    co_return co_await write_all(to_const_buffer(data));
 }
 
 Task<std::string> TcpClient::read_once(std::size_t max_bytes) {
     co_return co_await read_some(max_bytes);
 }
 
-Task<std::string> TcpClient::read_some(std::size_t max_bytes) {
+Task<std::size_t> TcpClient::read_some(MutableBuffer output) {
     if (!valid()) {
         throw std::runtime_error("TcpClient is not connected");
     }
+    if (output.empty()) {
+        co_return 0;
+    }
 
-    std::string buffer(max_bytes, '\0');
     try {
         const std::size_t n = co_await state_->socket.async_read_some(
-            asio::buffer(buffer.data(), buffer.size()), exec::asio::use_sender);
+            asio::buffer(static_cast<void *>(output.data()), output.size()), exec::asio::use_sender);
         if (n == 0) {
             state_->eof = true;
-            co_return std::string{};
+            co_return 0;
         }
-        buffer.resize(n);
-        co_return buffer;
+        co_return n;
     } catch (const std::system_error &error) {
         if (error.code() == asio::error::eof) {
             state_->eof = true;
-            co_return std::string{};
+            co_return 0;
         }
         throw;
     }
 }
 
-Task<std::string> TcpClient::read_exactly(std::size_t bytes) {
+Task<std::size_t> TcpClient::read_exactly(MutableBuffer output) {
     if (!valid()) {
         throw std::runtime_error("TcpClient is not connected");
     }
-    std::string buffer(bytes, '\0');
+    if (output.empty()) {
+        co_return 0;
+    }
     try {
-        (void)co_await asio::async_read(
-            state_->socket, asio::buffer(buffer.data(), buffer.size()), exec::asio::use_sender);
+        co_return co_await asio::async_read(
+            state_->socket, asio::buffer(static_cast<void *>(output.data()), output.size()), exec::asio::use_sender);
     } catch (const std::system_error &error) {
         if (error.code() == asio::error::eof) {
             state_->eof = true;
@@ -403,17 +478,51 @@ Task<std::string> TcpClient::read_exactly(std::size_t bytes) {
         }
         throw;
     }
+}
+
+Task<std::string> TcpClient::read_some(std::size_t max_bytes) {
+    if (max_bytes == 0) {
+        co_return std::string{};
+    }
+
+    std::string buffer(max_bytes, '\0');
+    const auto n = co_await read_some(MutableBuffer{
+        reinterpret_cast<std::byte *>(buffer.data()),
+        buffer.size()});
+    buffer.resize(n);
+    co_return buffer;
+}
+
+Task<std::string> TcpClient::read_exactly(std::size_t bytes) {
+    if (bytes == 0) {
+        co_return std::string{};
+    }
+
+    std::string buffer(bytes, '\0');
+    const auto n = co_await read_exactly(MutableBuffer{
+        reinterpret_cast<std::byte *>(buffer.data()),
+        buffer.size()});
+    buffer.resize(n);
     co_return buffer;
 }
 
 Task<std::string> TcpClient::read_all(std::size_t chunk_size) {
+    if (chunk_size == 0) {
+        co_return std::string{};
+    }
+
     std::string data;
+    data.reserve(chunk_size);
+    std::string chunk(chunk_size, '\0');
+
     while (true) {
-        auto chunk = co_await read_some(chunk_size);
-        if (chunk.empty() && eof()) {
+        const auto n = co_await read_some(MutableBuffer{
+            reinterpret_cast<std::byte *>(chunk.data()),
+            chunk.size()});
+        if (n == 0 && eof()) {
             break;
         }
-        data += chunk;
+        data.append(chunk.data(), n);
     }
     co_return data;
 }
@@ -601,4 +710,4 @@ Task<void> TcpListener::close() {
     state_.reset();
 }
 
-} // namespace async_uv
+} // namespace flux

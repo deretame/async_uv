@@ -2,23 +2,23 @@
 #include <mutex>
 #include <vector>
 
-#include "async_uv/async_uv.h"
+#include "flux/flux.h"
 
 namespace {
 
-async_uv::Task<void> run_trace_checks() {
+flux::Task<void> run_trace_checks() {
     std::mutex mutex;
-    std::vector<async_uv::TraceEvent> events;
+    std::vector<flux::TraceEvent> events;
 
-    async_uv::set_trace_hook([&](const async_uv::TraceEvent &event) {
+    flux::set_trace_hook([&](const flux::TraceEvent &event) {
         std::lock_guard<std::mutex> lock(mutex);
         events.push_back(event);
     });
 
-    async_uv::emit_trace_event({"test", "event1", 1, 10});
-    async_uv::emit_trace_event({"test", "event2", 2, 20});
-    async_uv::reset_trace_hook();
-    async_uv::emit_trace_event({"test", "event3", 3, 30});
+    flux::emit_trace_event({"test", "event1", 1, 10});
+    flux::emit_trace_event({"test", "event2", 2, 20});
+    flux::reset_trace_hook();
+    flux::emit_trace_event({"test", "event3", 3, 30});
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -33,7 +33,7 @@ async_uv::Task<void> run_trace_checks() {
 } // namespace
 
 int main() {
-    async_uv::Runtime runtime;
+    flux::Runtime runtime;
     runtime.block_on(run_trace_checks());
     return 0;
 }

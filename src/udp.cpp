@@ -1,28 +1,25 @@
-#include "async_uv/udp.h"
+#include "flux/udp.h"
 
 #include <cerrno>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 
-#include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/socket.h>
 
-namespace async_uv {
+namespace flux {
 
 namespace {
 
 namespace asio = exec::asio::asio_impl;
 
 SocketAddress from_udp_endpoint(const asio::ip::udp::endpoint &endpoint) {
-    auto *addr = reinterpret_cast<const sockaddr *>(endpoint.data());
-    return SocketAddress::from_native(addr, static_cast<int>(endpoint.size()));
+    return SocketAddress::from_asio(endpoint.address(), static_cast<int>(endpoint.port()));
 }
 
 asio::ip::address to_asio_address(const SocketAddress &address) {
-    return asio::ip::make_address(address.ip());
+    return address.as_asio_address();
 }
 
 asio::ip::udp::endpoint to_udp_endpoint(const SocketAddress &address) {
@@ -30,6 +27,12 @@ asio::ip::udp::endpoint to_udp_endpoint(const SocketAddress &address) {
         throw std::runtime_error("invalid socket address");
     }
     return asio::ip::udp::endpoint(to_asio_address(address), static_cast<unsigned short>(address.port()));
+}
+
+UdpSocket::ConstBuffer to_const_buffer(std::string_view data) {
+    return UdpSocket::ConstBuffer{
+        reinterpret_cast<const std::byte *>(data.data()),
+        data.size()};
 }
 
 } // namespace
@@ -158,53 +161,95 @@ bool UdpSocket::connected() const noexcept {
     return state_ != nullptr && state_->connected;
 }
 
-Task<std::size_t> UdpSocket::send(std::string_view data) {
+Task<std::size_t> UdpSocket::send(ConstBuffer data) {
     if (!valid() || !connected()) {
         throw std::runtime_error("UdpSocket::send requires a connected socket");
     }
+    if (data.empty()) {
+        co_return 0;
+    }
     co_return co_await state_->socket.async_send(
-        asio::buffer(data.data(), data.size()), exec::asio::use_sender);
+        asio::buffer(static_cast<const void *>(data.data()), data.size()),
+        exec::asio::use_sender);
 }
 
 Task<std::size_t> UdpSocket::send_all(std::string_view data) {
     co_return co_await send(data);
 }
 
-Task<std::size_t> UdpSocket::send_to(std::string_view data, SocketAddress endpoint) {
+Task<std::size_t> UdpSocket::send(std::string_view data) {
+    co_return co_await send(to_const_buffer(data));
+}
+
+Task<std::size_t> UdpSocket::send_to(ConstBuffer data, SocketAddress endpoint) {
     if (!valid()) {
         throw std::runtime_error("UdpSocket is not valid");
+    }
+    if (data.empty()) {
+        co_return 0;
     }
     auto remote = to_udp_endpoint(endpoint);
     co_return co_await state_->socket.async_send_to(
-        asio::buffer(data.data(), data.size()), remote, exec::asio::use_sender);
+        asio::buffer(static_cast<const void *>(data.data()), data.size()),
+        remote,
+        exec::asio::use_sender);
+}
+
+Task<std::size_t> UdpSocket::send_to(std::string_view data, SocketAddress endpoint) {
+    co_return co_await send_to(to_const_buffer(data), std::move(endpoint));
+}
+
+Task<UdpReceiveResult> UdpSocket::receive_from(MutableBuffer output) {
+    if (!valid()) {
+        throw std::runtime_error("UdpSocket is not valid");
+    }
+    if (output.empty()) {
+        co_return UdpReceiveResult{};
+    }
+    asio::ip::udp::endpoint remote;
+    const std::size_t n = co_await state_->socket.async_receive_from(
+        asio::buffer(static_cast<void *>(output.data()), output.size()),
+        remote,
+        exec::asio::use_sender);
+    co_return UdpReceiveResult{n, from_udp_endpoint(remote), 0u};
 }
 
 Task<UdpDatagram> UdpSocket::receive_from(std::size_t max_bytes) {
+    std::string payload(max_bytes, '\0');
+    auto received = co_await receive_from(MutableBuffer{
+        reinterpret_cast<std::byte *>(payload.data()),
+        payload.size()});
+    payload.resize(received.bytes);
+    co_return UdpDatagram{std::move(payload), std::move(received.remote_endpoint), received.flags};
+}
+
+Task<std::size_t> UdpSocket::receive(MutableBuffer output) {
     if (!valid()) {
         throw std::runtime_error("UdpSocket is not valid");
     }
-    std::string payload(max_bytes, '\0');
-    asio::ip::udp::endpoint remote;
-    const std::size_t n = co_await state_->socket.async_receive_from(
-        asio::buffer(payload.data(), payload.size()), remote, exec::asio::use_sender);
-    payload.resize(n);
-    co_return UdpDatagram{std::move(payload), from_udp_endpoint(remote), 0u};
+    if (!connected()) {
+        auto datagram = co_await receive_from(output);
+        co_return datagram.bytes;
+    }
+    if (output.empty()) {
+        co_return 0;
+    }
+    co_return co_await state_->socket.async_receive(
+        asio::buffer(static_cast<void *>(output.data()), output.size()),
+        exec::asio::use_sender);
 }
 
 Task<std::string> UdpSocket::receive(std::size_t max_bytes) {
-    if (!valid()) {
-        throw std::runtime_error("UdpSocket is not valid");
-    }
-    if (connected()) {
-        std::string payload(max_bytes, '\0');
-        const std::size_t n = co_await state_->socket.async_receive(
-            asio::buffer(payload.data(), payload.size()), exec::asio::use_sender);
-        payload.resize(n);
-        co_return payload;
+    if (max_bytes == 0) {
+        co_return std::string{};
     }
 
-    auto datagram = co_await receive_from(max_bytes);
-    co_return std::move(datagram.payload);
+    std::string payload(max_bytes, '\0');
+    const auto n = co_await receive(MutableBuffer{
+        reinterpret_cast<std::byte *>(payload.data()),
+        payload.size()});
+    payload.resize(n);
+    co_return payload;
 }
 
 UdpSocket::task_type UdpSocket::next(std::size_t max_bytes) {
@@ -333,5 +378,4 @@ UdpSocket::task_type UdpSocket::next_impl(const std::shared_ptr<State> &state, s
     co_return co_await socket.receive_from(max_bytes);
 }
 
-} // namespace async_uv
-
+} // namespace flux

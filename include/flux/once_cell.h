@@ -4,7 +4,7 @@
 #include <optional>
 #include <utility>
 
-namespace async_uv {
+namespace flux {
 
 template <typename T>
 class OnceCell {
@@ -27,4 +27,4 @@ private:
     std::optional<T> value_;
 };
 
-} // namespace async_uv
+} // namespace flux

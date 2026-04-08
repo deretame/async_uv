@@ -11,10 +11,10 @@
 #include <utility>
 #include <vector>
 
-#include "async_uv/cancel.h"
-#include "async_uv/runtime.h"
+#include "flux/cancel.h"
+#include "flux/runtime.h"
 
-namespace async_uv {
+namespace flux {
 
 namespace path {
 
@@ -143,4 +143,4 @@ Task<std::string> read_file(std::filesystem::path path);
 Task<void> write_file(std::filesystem::path path, std::string_view data);
 Task<void> append_file(std::filesystem::path path, std::string_view data);
 
-} // namespace async_uv
+} // namespace flux

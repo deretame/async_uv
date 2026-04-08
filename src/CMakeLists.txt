@@ -1,6 +1,6 @@
-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/async_uv_dependencies.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/flux_dependencies.cmake)
 
-add_library(async_uv
+add_library(flux
     cancel.cpp
     fd.cpp
     fs.cpp
@@ -11,32 +11,32 @@ add_library(async_uv
     watch.cpp
 )
 
-add_library(async_uv::async_uv ALIAS async_uv)
+add_library(flux::flux ALIAS flux)
 
-target_include_directories(async_uv
+target_include_directories(flux
     PUBLIC
         ${CMAKE_CURRENT_LIST_DIR}/../include
 )
 
-target_link_libraries(async_uv
+target_link_libraries(flux
     PUBLIC
-        async_uv_stdexec_headers
-        async_uv_asio_headers
+        flux_stdexec_headers
+        flux_asio_headers
         Threads::Threads
 )
 
-if(ASYNC_UV_USE_MIMALLOC)
+if(FLUX_USE_MIMALLOC)
     if(TARGET mimalloc-static)
-        target_link_libraries(async_uv PUBLIC mimalloc-static)
+        target_link_libraries(flux PUBLIC mimalloc-static)
     elseif(TARGET mimalloc)
-        target_link_libraries(async_uv PUBLIC mimalloc)
+        target_link_libraries(flux PUBLIC mimalloc)
     else()
-        message(FATAL_ERROR "ASYNC_UV_USE_MIMALLOC=ON but mimalloc target was not created")
+        message(FATAL_ERROR "FLUX_USE_MIMALLOC=ON but mimalloc target was not created")
     endif()
 endif()
 
-target_compile_features(async_uv PUBLIC cxx_std_23)
+target_compile_features(flux PUBLIC cxx_std_23)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(async_uv PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(flux PRIVATE -Wall -Wextra -Wpedantic)
 endif()

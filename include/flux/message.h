@@ -22,11 +22,11 @@
 #include <asio/bind_executor.hpp>
 #include <asio/strand.hpp>
 
-#include "async_uv/cancel.h"
-#include "async_uv/runtime.h"
-#include "async_uv/stream.h"
+#include "flux/cancel.h"
+#include "flux/runtime.h"
+#include "flux/stream.h"
 
-namespace async_uv {
+namespace flux {
 
 template <typename T>
 concept MyConstraint = std::is_trivial_v<T> && std::is_copy_constructible_v<T>;
@@ -121,8 +121,7 @@ private:
     }
 
     static bool is_io_context_for_runtime(const Runtime *runtime) noexcept {
-        return runtime != nullptr && Runtime::current() == runtime &&
-               Runtime::current_thread_role() == Runtime::ThreadRole::io;
+        return runtime != nullptr && runtime->in_io_thread();
     }
 
     struct SubscriberState;
@@ -346,7 +345,7 @@ private:
             return Subscription(topic->add_subscriber());
         }
 
-        Task<bool> publish_from_io(std::string topic_name, value_type value) {
+        Task<bool> publish_from_io(std::string_view topic_name, value_type value) {
             co_return co_await publish(topic_name, std::move(value));
         }
 
@@ -360,7 +359,7 @@ private:
             }
 
             try {
-                return runtime->block_on(publish(std::string(topic_name), std::move(value)));
+                return runtime->block_on(publish(topic_name, std::move(value)));
             } catch (...) {
                 return false;
             }
@@ -380,7 +379,7 @@ private:
 
             try {
                 return runtime->block_on(
-                    with_timeout(timeout, publish(std::string(topic_name), std::move(value))));
+                    with_timeout(timeout, publish(topic_name, std::move(value))));
             } catch (const Error &error) {
                 if (error.code() == ETIMEDOUT || error.code() == -ETIMEDOUT) {
                     return false;
@@ -475,7 +474,7 @@ private:
             dispatch_callback_on_io(runtime, std::move(callback), ec);
         }
 
-        Task<bool> publish(std::string topic_name, value_type value) {
+        Task<bool> publish(std::string_view topic_name, value_type value) {
             auto topic = get_or_create_topic(topic_name);
             if (!topic || topic->closed.load(std::memory_order_acquire)) {
                 co_return false;
@@ -694,4 +693,4 @@ private:
     std::shared_ptr<State> state_;
 };
 
-} // namespace async_uv
+} // namespace flux

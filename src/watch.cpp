@@ -1,4 +1,4 @@
-#include "async_uv/watch.h"
+#include "flux/watch.h"
 
 #include <array>
 #include <cerrno>
@@ -10,7 +10,7 @@
 #include <asio/posix/stream_descriptor.hpp>
 #include <unistd.h>
 
-namespace async_uv {
+namespace flux {
 
 namespace {
 
@@ -19,6 +19,13 @@ namespace asio = exec::asio::asio_impl;
 struct Snapshot {
     bool exists = false;
     FileInfo info{};
+};
+
+struct PendingEvent {
+    std::string name;
+    int status = 0;
+    std::uint32_t mask = 0;
+    bool ignored = false;
 };
 
 std::optional<FileInfo> load_file_info(const std::filesystem::path &path) {
@@ -53,14 +60,14 @@ std::optional<FileInfo> load_file_info(const std::filesystem::path &path) {
     return info;
 }
 
-Snapshot make_snapshot(const std::filesystem::path &path) {
-    Snapshot snap;
-    auto info = load_file_info(path);
-    snap.exists = info.has_value();
-    if (info) {
-        snap.info = *info;
-    }
-    return snap;
+Task<std::optional<FileInfo>> load_file_info_async(std::filesystem::path path) {
+    auto *runtime = co_await get_current_runtime();
+    auto sender = stdexec::starts_on(
+        runtime->blocking_scheduler(),
+        stdexec::just() | stdexec::then([path = std::move(path)]() mutable {
+            return load_file_info(path);
+        }));
+    co_return co_await std::move(sender);
 }
 
 std::string normalize_inotify_name(const char *name, std::size_t len) {
@@ -114,7 +121,7 @@ struct FsWatcher::State {
         inotify_fd = -1;
     }
 
-    std::optional<FsWatchEvent> try_pop_event_locked() {
+    std::optional<PendingEvent> try_pop_pending_event_locked() {
         const auto available = pending.size() - pending_offset;
         if (available < sizeof(inotify_event)) {
             return std::nullopt;
@@ -127,27 +134,13 @@ struct FsWatcher::State {
             return std::nullopt;
         }
 
-        FsWatchEvent event;
-        event.path = watched_path;
+        PendingEvent event;
         event.name = normalize_inotify_name(raw->name, raw->len);
         event.mask = raw->mask;
         if ((raw->mask & IN_Q_OVERFLOW) != 0U) {
             event.status = ENOSPC;
         } else {
             event.status = 0;
-        }
-
-        if (snapshot.exists) {
-            event.previous = snapshot.info;
-        }
-
-        auto current = load_file_info(watched_path);
-        if (current) {
-            event.current = *current;
-            snapshot.exists = true;
-            snapshot.info = *current;
-        } else {
-            snapshot.exists = false;
         }
 
         pending_offset += event_size;
@@ -159,9 +152,7 @@ struct FsWatcher::State {
             pending_offset = 0;
         }
 
-        if ((raw->mask & IN_IGNORED) != 0U) {
-            running = false;
-        }
+        event.ignored = (raw->mask & IN_IGNORED) != 0U;
 
         return event;
     }
@@ -173,7 +164,11 @@ Task<FsWatcher> FsWatcher::watch(std::filesystem::path path) {
     auto *runtime = co_await get_current_runtime();
     auto state = std::make_shared<State>(runtime);
     state->watched_path = std::move(path);
-    state->snapshot = make_snapshot(state->watched_path);
+    auto initial = co_await load_file_info_async(state->watched_path);
+    state->snapshot.exists = initial.has_value();
+    if (initial) {
+        state->snapshot.info = *initial;
+    }
 
     const int fd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (fd < 0) {
@@ -209,14 +204,49 @@ FsWatcher::task_type FsWatcher::next() const {
     }
 
     while (true) {
+        std::optional<PendingEvent> pending_event;
+        Snapshot previous_snapshot;
+        std::filesystem::path watched_path;
+
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             if (!state_->running) {
                 co_return std::nullopt;
             }
-            if (auto ready = state_->try_pop_event_locked()) {
-                co_return ready;
+            if (auto ready = state_->try_pop_pending_event_locked()) {
+                pending_event = std::move(ready);
+                previous_snapshot = state_->snapshot;
+                watched_path = state_->watched_path;
             }
+        }
+
+        if (pending_event) {
+            auto current = co_await load_file_info_async(watched_path);
+
+            FsWatchEvent event;
+            event.path = std::move(watched_path);
+            event.name = std::move(pending_event->name);
+            event.status = pending_event->status;
+            event.mask = pending_event->mask;
+            if (previous_snapshot.exists) {
+                event.previous = previous_snapshot.info;
+            }
+            if (current) {
+                event.current = *current;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->snapshot.exists = current.has_value();
+                if (current) {
+                    state_->snapshot.info = *current;
+                }
+                if (pending_event->ignored) {
+                    state_->running = false;
+                }
+            }
+
+            co_return event;
         }
 
         std::array<char, 4096> chunk{};
@@ -242,9 +272,40 @@ FsWatcher::task_type FsWatcher::next() const {
                 co_return std::nullopt;
             }
             state_->pending.insert(state_->pending.end(), chunk.begin(), chunk.begin() + n);
-            if (auto ready = state_->try_pop_event_locked()) {
-                co_return ready;
+            if (auto ready = state_->try_pop_pending_event_locked()) {
+                pending_event = std::move(ready);
+                previous_snapshot = state_->snapshot;
+                watched_path = state_->watched_path;
             }
+        }
+
+        if (pending_event) {
+            auto current = co_await load_file_info_async(watched_path);
+
+            FsWatchEvent event;
+            event.path = std::move(watched_path);
+            event.name = std::move(pending_event->name);
+            event.status = pending_event->status;
+            event.mask = pending_event->mask;
+            if (previous_snapshot.exists) {
+                event.previous = previous_snapshot.info;
+            }
+            if (current) {
+                event.current = *current;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->snapshot.exists = current.has_value();
+                if (current) {
+                    state_->snapshot.info = *current;
+                }
+                if (pending_event->ignored) {
+                    state_->running = false;
+                }
+            }
+
+            co_return event;
         }
     }
 }
@@ -267,4 +328,4 @@ Task<void> FsWatcher::stop() {
     state_->close_all();
 }
 
-} // namespace async_uv
+} // namespace flux

@@ -39,9 +39,9 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DASYNC_UV_BUILD_EXAMPLES=ON \
-            -DASYNC_UV_BUILD_TESTS=ON \
-            -DASYNC_UV_USE_MIMALLOC=ON \
+            -DFLUX_BUILD_EXAMPLES=OFF \
+            -DFLUX_BUILD_TESTS=ON \
+            -DFLUX_USE_MIMALLOC=ON \
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
@@ -93,9 +93,9 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_BUILD_TYPE=Release \
-            -DASYNC_UV_BUILD_EXAMPLES=ON \
-            -DASYNC_UV_BUILD_TESTS=ON \
-            -DASYNC_UV_USE_MIMALLOC=ON \
+            -DFLUX_BUILD_EXAMPLES=OFF \
+            -DFLUX_BUILD_TESTS=ON \
+            -DFLUX_USE_MIMALLOC=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DCMAKE_EXE_LINKER_FLAGS="-static"
@@ -108,6 +108,5 @@ jobs:
 
       - name: Inspect linked binaries
         run: |
-          file build/tests/async_uv_smoke_test
-          file build/tests/async_uv_scope_test
-          file build/examples/async_uv_demo
+          file build/tests/flux_smoke_test
+          file build/tests/flux_scope_test

@@ -11,10 +11,10 @@
 #include <exec/when_any.hpp>
 #include <stdexec/execution.hpp>
 
-#include "async_uv/error.h"
-#include "async_uv/runtime.h"
+#include "flux/error.h"
+#include "flux/runtime.h"
 
-namespace async_uv {
+namespace flux {
 
 class CancellationSource {
 public:
@@ -34,7 +34,7 @@ private:
 Task<stdexec::inplace_stop_token> get_current_slot();
 Task<std::shared_ptr<stdexec::inplace_stop_source>> get_current_signal();
 Task<bool> cancellation_requested();
-Task<void> throw_if_cancelled(std::string message = "async_uv operation canceled");
+Task<void> throw_if_cancelled(std::string message = "flux operation canceled");
 
 template <typename TimeoutTag, typename Duration>
 Task<TimeoutTag> timeout_after(Duration delay) {
@@ -43,35 +43,13 @@ Task<TimeoutTag> timeout_after(Duration delay) {
 }
 
 template <typename Lazy>
-Future<TaskValue<Lazy>> spawn(Runtime &runtime, Lazy &&lazy, CancellationSource &source) {
+auto spawn(Runtime &runtime, Lazy &&lazy, CancellationSource &source) {
     return runtime.spawn(std::forward<Lazy>(lazy), source.token());
 }
 
-template <typename Lazy>
-Future<TaskValue<Lazy>> spawn(Lazy &&lazy, CancellationSource &source) {
-    auto *runtime = Runtime::current();
-    if (runtime == nullptr) {
-        throw std::runtime_error(
-            "async_uv::spawn with cancellation requires a current async_uv::Runtime");
-    }
-    return spawn(*runtime, std::forward<Lazy>(lazy), source);
-}
-
 template <typename Func>
-Future<BlockingValue<Func>> spawn_blocking(Runtime &runtime,
-                                           Func &&func,
-                                           CancellationSource &source) {
+auto spawn_blocking(Runtime &runtime, Func &&func, CancellationSource &source) {
     return runtime.spawn_blocking(std::forward<Func>(func), source.token());
-}
-
-template <typename Func>
-Future<BlockingValue<Func>> spawn_blocking(Func &&func, CancellationSource &source) {
-    auto *runtime = Runtime::current();
-    if (runtime == nullptr) {
-        throw std::runtime_error(
-            "async_uv::spawn_blocking with cancellation requires a current async_uv::Runtime");
-    }
-    return runtime->spawn_blocking(std::forward<Func>(func), source.token());
 }
 
 template <typename Rep, typename Period, typename Lazy>
@@ -83,7 +61,7 @@ Task<TaskValue<Lazy>> with_timeout(std::chrono::duration<Rep, Period> timeout, L
             std::move(lazy) | stdexec::then([] { return true; }),
             timeout_after<bool>(delay));
         if (!completed) {
-            throw Error("async_uv::with_timeout", ETIMEDOUT);
+            throw Error("flux::with_timeout", ETIMEDOUT);
         }
         co_return;
     } else {
@@ -94,7 +72,7 @@ Task<TaskValue<Lazy>> with_timeout(std::chrono::duration<Rep, Period> timeout, L
                     [](auto value) { return std::optional<StoredValue>(std::move(value)); }),
             timeout_after<std::optional<StoredValue>>(delay));
         if (!maybe_value.has_value()) {
-            throw Error("async_uv::with_timeout", ETIMEDOUT);
+            throw Error("flux::with_timeout", ETIMEDOUT);
         }
         co_return std::move(*maybe_value);
     }
@@ -107,4 +85,4 @@ Task<TaskValue<Lazy>> with_deadline(std::chrono::time_point<Clock, Duration> dea
     co_return co_await with_timeout(remaining, std::move(lazy));
 }
 
-} // namespace async_uv
+} // namespace flux

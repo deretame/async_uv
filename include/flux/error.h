@@ -7,7 +7,7 @@
 #include <string_view>
 #include <system_error>
 
-namespace async_uv {
+namespace flux {
 
 class Error : public std::runtime_error {
 public:
@@ -37,5 +37,5 @@ inline void throw_if_uv_error(int code, std::string_view where) {
     }
 }
 
-} // namespace async_uv
+} // namespace flux
 

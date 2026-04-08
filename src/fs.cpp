@@ -1,31 +1,34 @@
-#include "async_uv/fs.h"
+#include "flux/fs.h"
 
 #include <cerrno>
-#include <cstring>
 #include <fstream>
-#include <iterator>
 #include <system_error>
 #include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace async_uv {
+namespace flux {
 
 namespace {
-
-namespace asio = exec::asio::asio_impl;
 
 template <typename Func>
 Task<BlockingValue<Func>> run_blocking(Func &&func) {
     auto *runtime = co_await get_current_runtime();
-    co_await asio::post(runtime->blocking_executor(), exec::asio::use_sender);
-    if constexpr (std::is_void_v<BlockingValue<Func>>) {
-        std::invoke(std::forward<Func>(func));
-        co_return;
-    } else {
-        co_return std::invoke(std::forward<Func>(func));
-    }
+    using Work = std::decay_t<Func>;
+    using ValueType = BlockingValue<Func>;
+
+    auto work = Work(std::forward<Func>(func));
+    auto sender = stdexec::starts_on(
+        runtime->blocking_scheduler(),
+        stdexec::just() | stdexec::then([work = std::move(work)]() mutable -> ValueType {
+            if constexpr (std::is_void_v<ValueType>) {
+                std::invoke(work);
+            } else {
+                return std::invoke(work);
+            }
+        }));
+    co_return co_await std::move(sender);
 }
 
 FileInfo to_file_info(const std::filesystem::path &path) {
@@ -172,17 +175,30 @@ Task<void> Fs::create_file(std::filesystem::path path) {
 
 Task<std::string> Fs::read_file(std::filesystem::path path) {
     co_return co_await run_blocking([path = std::move(path)] {
-        std::ifstream in(path, std::ios::binary);
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
         if (!in) {
             throw std::runtime_error("failed to open file for reading: " + path.string());
         }
-        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+        const auto end = in.tellg();
+        if (end < 0) {
+            throw std::runtime_error("failed to query file size: " + path.string());
+        }
+
+        std::string content(static_cast<std::size_t>(end), '\0');
+        in.seekg(0, std::ios::beg);
+        if (!content.empty()) {
+            in.read(content.data(), static_cast<std::streamsize>(content.size()));
+            if (!in) {
+                throw std::runtime_error("failed to read file: " + path.string());
+            }
+        }
+        return content;
     });
 }
 
 Task<void> Fs::write_file(std::filesystem::path path, std::string_view data) {
-    std::string owned(data);
-    co_await run_blocking([path = std::move(path), data = std::move(owned)] {
+    co_await run_blocking([path = std::move(path), data] {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) {
             throw std::runtime_error("failed to open file for writing: " + path.string());
@@ -195,8 +211,7 @@ Task<void> Fs::write_file(std::filesystem::path path, std::string_view data) {
 }
 
 Task<void> Fs::append_file(std::filesystem::path path, std::string_view data) {
-    std::string owned(data);
-    co_await run_blocking([path = std::move(path), data = std::move(owned)] {
+    co_await run_blocking([path = std::move(path), data] {
         std::ofstream out(path, std::ios::binary | std::ios::app);
         if (!out) {
             throw std::runtime_error("failed to open file for append: " + path.string());
@@ -288,7 +303,7 @@ Task<std::string> Fs::temp_directory_path() {
 
 Task<std::string> Fs::create_temporary_directory(std::string pattern) {
     co_return co_await run_blocking([pattern = std::move(pattern)] {
-        auto tpl = make_tmp_template_path(pattern, "async_uv_tmp_XXXXXX");
+        auto tpl = make_tmp_template_path(pattern, "flux_tmp_XXXXXX");
         std::vector<char> buffer(tpl.begin(), tpl.end());
         buffer.push_back('\0');
         char *created = ::mkdtemp(buffer.data());
@@ -301,7 +316,7 @@ Task<std::string> Fs::create_temporary_directory(std::string pattern) {
 
 Task<std::string> Fs::create_temporary_file(std::string pattern) {
     co_return co_await run_blocking([pattern = std::move(pattern)] {
-        auto tpl = make_tmp_template_path(pattern, "async_uv_file_XXXXXX");
+        auto tpl = make_tmp_template_path(pattern, "flux_file_XXXXXX");
         std::vector<char> buffer(tpl.begin(), tpl.end());
         buffer.push_back('\0');
         const int fd = ::mkstemp(buffer.data());
@@ -325,4 +340,4 @@ Task<void> append_file(std::filesystem::path path, std::string_view data) {
     co_await Fs::append_file(std::move(path), data);
 }
 
-} // namespace async_uv
+} // namespace flux

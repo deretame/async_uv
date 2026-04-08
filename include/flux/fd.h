@@ -5,6 +5,7 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,9 +19,9 @@
 #include <asio/write.hpp>
 #include <stdexec/execution.hpp>
 
-#include "async_uv/runtime.h"
+#include "flux/runtime.h"
 
-namespace async_uv {
+namespace flux {
 
 namespace detail {
 
@@ -47,6 +48,9 @@ void set_not_valid(Receiver &receiver) noexcept {
 
 class FdStream {
 public:
+    using ConstBuffer = std::span<const std::byte>;
+    using MutableBuffer = std::span<std::byte>;
+
     struct State {
         Runtime *runtime = nullptr;
         exec::asio::asio_impl::posix::stream_descriptor descriptor;
@@ -81,21 +85,27 @@ public:
 
     // Sender factories (P2300 style):
     // each sender implements connect(receiver) -> operation_state and start().
+    // NOTE: ConstBuffer/MutableBuffer are non-owning views. Caller must keep
+    // the referenced memory alive until the sender completes.
     [[nodiscard]] WaitReadableSender wait_readable_sender() const;
     [[nodiscard]] WaitWritableSender wait_writable_sender() const;
-    [[nodiscard]] WriteSomeSender write_some_sender(std::string data) const;
-    [[nodiscard]] WriteAllSender write_all_sender(std::string data) const;
-    [[nodiscard]] ReadSomeSender read_some_sender(std::size_t max_bytes = 64 * 1024) const;
-    [[nodiscard]] ReadExactlySender read_exactly_sender(std::size_t bytes) const;
+    [[nodiscard]] WriteSomeSender write_some_sender(ConstBuffer data) const;
+    [[nodiscard]] WriteAllSender write_all_sender(ConstBuffer data) const;
+    [[nodiscard]] ReadSomeSender read_some_sender(MutableBuffer output) const;
+    [[nodiscard]] ReadExactlySender read_exactly_sender(MutableBuffer output) const;
 
     Task<void> wait_readable() const;
     Task<void> wait_writable() const;
 
     // Coroutine helpers built on top of sender factories.
+    Task<std::size_t> write_some(ConstBuffer data) const;
+    Task<std::size_t> write_all(ConstBuffer data) const;
+    Task<std::size_t> read_some(MutableBuffer output) const;
+    Task<std::size_t> read_exactly(MutableBuffer output) const;
+
+    // String-view convenience wrappers (no copy, caller owns buffer lifetime).
     Task<std::size_t> write_some(std::string_view data) const;
     Task<std::size_t> write_all(std::string_view data) const;
-    Task<std::string> read_some(std::size_t max_bytes = 64 * 1024) const;
-    Task<std::string> read_exactly(std::size_t bytes) const;
 
     Task<void> close();
 
@@ -206,6 +216,12 @@ public:
             self.start();
         }
     };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const WaitReadableSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.state_, std::move(receiver), {}, std::nullopt};
+    }
 
     template <stdexec::receiver Receiver>
     friend auto tag_invoke(stdexec::connect_t, WaitReadableSender &&self, Receiver receiver)
@@ -322,6 +338,12 @@ public:
     };
 
     template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const WaitWritableSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.state_, std::move(receiver), {}, std::nullopt};
+    }
+
+    template <stdexec::receiver Receiver>
     friend auto tag_invoke(stdexec::connect_t, WaitWritableSender &&self, Receiver receiver)
         -> Operation<std::remove_cvref_t<Receiver>> {
         return {std::move(self.state_), std::move(receiver), {}, std::nullopt};
@@ -340,8 +362,8 @@ public:
         stdexec::set_stopped_t()>;
 
     WriteSomeSender() = default;
-    WriteSomeSender(std::shared_ptr<State> state, std::string data)
-        : state_(std::move(state)), payload_(std::make_shared<std::string>(std::move(data))) {}
+    WriteSomeSender(std::shared_ptr<State> state, ConstBuffer data)
+        : state_(std::move(state)), data_(data.data()), size_(data.size()) {}
 
     template <class Env>
     friend auto tag_invoke(stdexec::get_completion_signatures_t,
@@ -355,7 +377,8 @@ public:
         using operation_state_concept = stdexec::operation_state_t;
 
         std::shared_ptr<State> state;
-        std::shared_ptr<std::string> payload;
+        const std::byte *data = nullptr;
+        std::size_t size = 0;
         Receiver receiver;
         std::atomic<bool> completed{false};
         using StopToken =
@@ -419,7 +442,7 @@ public:
             }
 
             state->descriptor.async_write_some(
-                exec::asio::asio_impl::buffer(payload->data(), payload->size()),
+                exec::asio::asio_impl::buffer(static_cast<const void *>(data), size),
                 [this](const std::error_code &ec, std::size_t written) noexcept {
                     if (!finish_operation()) {
                         return;
@@ -438,10 +461,22 @@ public:
     };
 
     template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const WriteSomeSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.state_,
+                self.data_,
+                self.size_,
+                std::move(receiver),
+                {},
+                std::nullopt};
+    }
+
+    template <stdexec::receiver Receiver>
     friend auto tag_invoke(stdexec::connect_t, WriteSomeSender &&self, Receiver receiver)
         -> Operation<std::remove_cvref_t<Receiver>> {
         return {std::move(self.state_),
-                std::move(self.payload_),
+                self.data_,
+                self.size_,
                 std::move(receiver),
                 {},
                 std::nullopt};
@@ -449,7 +484,8 @@ public:
 
 private:
     std::shared_ptr<State> state_;
-    std::shared_ptr<std::string> payload_;
+    const std::byte *data_ = nullptr;
+    std::size_t size_ = 0;
 };
 
 class FdStream::WriteAllSender {
@@ -461,8 +497,8 @@ public:
         stdexec::set_stopped_t()>;
 
     WriteAllSender() = default;
-    WriteAllSender(std::shared_ptr<State> state, std::string data)
-        : state_(std::move(state)), payload_(std::make_shared<std::string>(std::move(data))) {}
+    WriteAllSender(std::shared_ptr<State> state, ConstBuffer data)
+        : state_(std::move(state)), data_(data.data()), size_(data.size()) {}
 
     template <class Env>
     friend auto tag_invoke(stdexec::get_completion_signatures_t,
@@ -476,7 +512,8 @@ public:
         using operation_state_concept = stdexec::operation_state_t;
 
         std::shared_ptr<State> state;
-        std::shared_ptr<std::string> payload;
+        const std::byte *data = nullptr;
+        std::size_t size = 0;
         Receiver receiver;
         std::atomic<bool> completed{false};
         using StopToken =
@@ -541,7 +578,7 @@ public:
 
             exec::asio::asio_impl::async_write(
                 state->descriptor,
-                exec::asio::asio_impl::buffer(payload->data(), payload->size()),
+                exec::asio::asio_impl::buffer(static_cast<const void *>(data), size),
                 [this](const std::error_code &ec, std::size_t written) noexcept {
                     if (!finish_operation()) {
                         return;
@@ -560,10 +597,22 @@ public:
     };
 
     template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const WriteAllSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.state_,
+                self.data_,
+                self.size_,
+                std::move(receiver),
+                {},
+                std::nullopt};
+    }
+
+    template <stdexec::receiver Receiver>
     friend auto tag_invoke(stdexec::connect_t, WriteAllSender &&self, Receiver receiver)
         -> Operation<std::remove_cvref_t<Receiver>> {
         return {std::move(self.state_),
-                std::move(self.payload_),
+                self.data_,
+                self.size_,
                 std::move(receiver),
                 {},
                 std::nullopt};
@@ -571,20 +620,21 @@ public:
 
 private:
     std::shared_ptr<State> state_;
-    std::shared_ptr<std::string> payload_;
+    const std::byte *data_ = nullptr;
+    std::size_t size_ = 0;
 };
 
 class FdStream::ReadSomeSender {
 public:
     using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<
-        stdexec::set_value_t(std::string),
+        stdexec::set_value_t(std::size_t),
         stdexec::set_error_t(std::exception_ptr),
         stdexec::set_stopped_t()>;
 
     ReadSomeSender() = default;
-    ReadSomeSender(std::shared_ptr<State> state, std::size_t max_bytes)
-        : state_(std::move(state)), max_bytes_(max_bytes == 0 ? 64 * 1024 : max_bytes) {}
+    ReadSomeSender(std::shared_ptr<State> state, MutableBuffer output)
+        : state_(std::move(state)), output_(output) {}
 
     template <class Env>
     friend auto tag_invoke(stdexec::get_completion_signatures_t,
@@ -598,9 +648,9 @@ public:
         using operation_state_concept = stdexec::operation_state_t;
 
         std::shared_ptr<State> state;
-        std::size_t max_bytes = 0;
+        std::byte *output = nullptr;
+        std::size_t capacity = 0;
         Receiver receiver;
-        std::shared_ptr<std::string> buffer;
         std::atomic<bool> completed{false};
         using StopToken =
             decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
@@ -662,9 +712,16 @@ public:
                 return;
             }
 
-            buffer = std::make_shared<std::string>(max_bytes, '\0');
+            if (capacity == 0 || output == nullptr) {
+                if (!finish_operation()) {
+                    return;
+                }
+                stdexec::set_value(std::move(receiver), static_cast<std::size_t>(0));
+                return;
+            }
+
             state->descriptor.async_read_some(
-                exec::asio::asio_impl::buffer(buffer->data(), buffer->size()),
+                exec::asio::asio_impl::buffer(static_cast<void *>(output), capacity),
                 [this](const std::error_code &ec, std::size_t n) noexcept {
                     if (!finish_operation()) {
                         return;
@@ -672,15 +729,15 @@ public:
 
                     if (ec) {
                         if (ec == exec::asio::asio_impl::error::eof) {
-                            stdexec::set_value(std::move(receiver), std::string{});
+                            stdexec::set_value(
+                                std::move(receiver), static_cast<std::size_t>(0));
                             return;
                         }
                         detail::set_stopped_or_error(receiver, ec);
                         return;
                     }
 
-                    buffer->resize(n);
-                    stdexec::set_value(std::move(receiver), std::move(*buffer));
+                    stdexec::set_value(std::move(receiver), n);
                 });
         }
 
@@ -690,32 +747,43 @@ public:
     };
 
     template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const ReadSomeSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.state_,
+                self.output_.data(),
+                self.output_.size(),
+                std::move(receiver),
+                {},
+                std::nullopt};
+    }
+
+    template <stdexec::receiver Receiver>
     friend auto tag_invoke(stdexec::connect_t, ReadSomeSender &&self, Receiver receiver)
         -> Operation<std::remove_cvref_t<Receiver>> {
         return {std::move(self.state_),
-                self.max_bytes_,
+                self.output_.data(),
+                self.output_.size(),
                 std::move(receiver),
-                nullptr,
                 {},
                 std::nullopt};
     }
 
 private:
     std::shared_ptr<State> state_;
-    std::size_t max_bytes_ = 64 * 1024;
+    MutableBuffer output_{};
 };
 
 class FdStream::ReadExactlySender {
 public:
     using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<
-        stdexec::set_value_t(std::string),
+        stdexec::set_value_t(std::size_t),
         stdexec::set_error_t(std::exception_ptr),
         stdexec::set_stopped_t()>;
 
     ReadExactlySender() = default;
-    ReadExactlySender(std::shared_ptr<State> state, std::size_t bytes)
-        : state_(std::move(state)), bytes_(bytes) {}
+    ReadExactlySender(std::shared_ptr<State> state, MutableBuffer output)
+        : state_(std::move(state)), output_(output) {}
 
     template <class Env>
     friend auto tag_invoke(stdexec::get_completion_signatures_t,
@@ -729,9 +797,9 @@ public:
         using operation_state_concept = stdexec::operation_state_t;
 
         std::shared_ptr<State> state;
-        std::size_t bytes = 0;
+        std::byte *output = nullptr;
+        std::size_t size = 0;
         Receiver receiver;
-        std::shared_ptr<std::string> buffer;
         std::atomic<bool> completed{false};
         using StopToken =
             decltype(stdexec::get_stop_token(stdexec::get_env(std::declval<Receiver &>())));
@@ -793,10 +861,17 @@ public:
                 return;
             }
 
-            buffer = std::make_shared<std::string>(bytes, '\0');
+            if (size == 0 || output == nullptr) {
+                if (!finish_operation()) {
+                    return;
+                }
+                stdexec::set_value(std::move(receiver), static_cast<std::size_t>(0));
+                return;
+            }
+
             exec::asio::asio_impl::async_read(
                 state->descriptor,
-                exec::asio::asio_impl::buffer(buffer->data(), buffer->size()),
+                exec::asio::asio_impl::buffer(static_cast<void *>(output), size),
                 [this](const std::error_code &ec, std::size_t n) noexcept {
                     if (!finish_operation()) {
                         return;
@@ -805,8 +880,7 @@ public:
                         detail::set_stopped_or_error(receiver, ec);
                         return;
                     }
-                    buffer->resize(n);
-                    stdexec::set_value(std::move(receiver), std::move(*buffer));
+                    stdexec::set_value(std::move(receiver), n);
                 });
         }
 
@@ -816,19 +890,30 @@ public:
     };
 
     template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const ReadExactlySender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.state_,
+                self.output_.data(),
+                self.output_.size(),
+                std::move(receiver),
+                {},
+                std::nullopt};
+    }
+
+    template <stdexec::receiver Receiver>
     friend auto tag_invoke(stdexec::connect_t, ReadExactlySender &&self, Receiver receiver)
         -> Operation<std::remove_cvref_t<Receiver>> {
         return {std::move(self.state_),
-                self.bytes_,
+                self.output_.data(),
+                self.output_.size(),
                 std::move(receiver),
-                nullptr,
                 {},
                 std::nullopt};
     }
 
 private:
     std::shared_ptr<State> state_;
-    std::size_t bytes_ = 0;
+    MutableBuffer output_{};
 };
 
-} // namespace async_uv
+} // namespace flux

@@ -121,5 +121,5 @@ else()
     message(FATAL_ERROR "libwebsockets target not found after FetchContent")
 endif()
 
-add_library(async_uv::layer2_lws ALIAS async_uv_layer2_lws)
+add_library(flux::layer2_lws ALIAS async_uv_layer2_lws)
 set(ASYNC_UV_WS_HAS_LIBWEBSOCKETS ON)

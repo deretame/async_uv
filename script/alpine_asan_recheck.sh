@@ -3,7 +3,7 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-alpine:latest}"
-CONTAINER_NAME="${CONTAINER_NAME:-async_uv_alpine_builder}"
+CONTAINER_NAME="${CONTAINER_NAME:-flux_alpine_builder}"
 BUILD_DIR="${BUILD_DIR:-build_alpine_asan}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-300}"
 JOBS="${JOBS:-$(nproc)}"
@@ -76,7 +76,7 @@ retry() {
   done
 }
 
-if [ ! -f /var/tmp/.async_uv_deps_ready ] || ! apk info -e openssl-dev >/dev/null 2>&1; then
+if [ ! -f /var/tmp/.flux_deps_ready ] || ! apk info -e openssl-dev >/dev/null 2>&1; then
   sed -i "s#https\\?://dl-cdn.alpinelinux.org/alpine#https://mirrors.cernet.edu.cn/alpine#g" /etc/apk/repositories
   retry 5 apk update
   retry 5 apk add --no-cache \
@@ -91,7 +91,7 @@ if [ ! -f /var/tmp/.async_uv_deps_ready ] || ! apk info -e openssl-dev >/dev/nul
     ninja-build \
     ninja-is-really-ninja \
     openssl-dev
-  touch /var/tmp/.async_uv_deps_ready
+  touch /var/tmp/.flux_deps_ready
 fi
 
 if [ "$CLEAN_BUILD" = "1" ]; then
@@ -102,9 +102,9 @@ retry 3 cmake -S . -B "$BUILD_DIR" -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DASYNC_UV_BUILD_EXAMPLES=ON \
-  -DASYNC_UV_BUILD_TESTS=ON \
-  -DASYNC_UV_USE_MIMALLOC=ON \
+  -DFLUX_BUILD_EXAMPLES=OFF \
+  -DFLUX_BUILD_TESTS=ON \
+  -DFLUX_USE_MIMALLOC=ON \
   -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
   -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
@@ -114,9 +114,9 @@ retry 2 cmake --build "$BUILD_DIR" -j"$JOBS"
 
 ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1:check_initialization_order=1 \
 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-ctest --test-dir "$BUILD_DIR" --output-on-failure --timeout "$TEST_TIMEOUT" -E async_uv_smoke_test
+ctest --test-dir "$BUILD_DIR" --output-on-failure --timeout "$TEST_TIMEOUT" -E flux_smoke_test
 
 ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1:check_initialization_order=1 \
 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-sh -lc "cd /tmp && /work/$BUILD_DIR/tests/async_uv_smoke_test"
+sh -lc "cd /tmp && /work/$BUILD_DIR/tests/flux_smoke_test"
 '

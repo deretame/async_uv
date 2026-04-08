@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "async_uv/async_uv.h"
+#include "flux/flux.h"
 
 namespace {
 
@@ -22,14 +22,14 @@ struct CallbackResult {
     std::atomic<bool> done{false};
 };
 
-async_uv::Task<void> wait_callback(const std::shared_ptr<CallbackResult> &result) {
+flux::Task<void> wait_callback(const std::shared_ptr<CallbackResult> &result) {
     while (!result->done.load(std::memory_order_acquire)) {
-        co_await async_uv::sleep_for(1ms);
+        co_await flux::sleep_for(1ms);
     }
 }
 
-async_uv::Task<void> run_message_bus_smoke_test() {
-    auto bus = co_await async_uv::MessageBus<int>::create();
+flux::Task<void> run_message_bus_smoke_test() {
+    auto bus = co_await flux::MessageBus<int>::create();
     auto subscriber = bus.subscribe("smoke");
     auto publisher = bus.io_publisher("smoke");
 
@@ -45,9 +45,9 @@ async_uv::Task<void> run_message_bus_smoke_test() {
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_order_test() {
-    auto bus = co_await async_uv::MessageBus<int>::create(
-        async_uv::MessageBus<int>::Options{.topic_capacity = 256, .subscription_capacity = 256});
+flux::Task<void> run_message_bus_order_test() {
+    auto bus = co_await flux::MessageBus<int>::create(
+        flux::MessageBus<int>::Options{.topic_capacity = 256, .subscription_capacity = 256});
     auto subscriber = bus.subscribe("ordered");
     auto publisher = bus.io_publisher("ordered");
 
@@ -56,7 +56,7 @@ async_uv::Task<void> run_message_bus_order_test() {
     }
 
     for (int i = 0; i < 100; ++i) {
-        auto event = co_await async_uv::with_timeout(1s, subscriber.next());
+        auto event = co_await flux::with_timeout(1s, subscriber.next());
         assert(event.has_value());
         assert(*event == i);
     }
@@ -65,9 +65,9 @@ async_uv::Task<void> run_message_bus_order_test() {
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_isolation_test() {
-    auto bus = co_await async_uv::MessageBus<int>::create(
-        async_uv::MessageBus<int>::Options{.topic_capacity = 128, .subscription_capacity = 128});
+flux::Task<void> run_message_bus_isolation_test() {
+    auto bus = co_await flux::MessageBus<int>::create(
+        flux::MessageBus<int>::Options{.topic_capacity = 128, .subscription_capacity = 128});
     auto a_subscriber = bus.subscribe("alpha");
     auto b_subscriber = bus.subscribe("beta");
     auto a_publisher = bus.io_publisher("alpha");
@@ -79,8 +79,8 @@ async_uv::Task<void> run_message_bus_isolation_test() {
     }
 
     for (int i = 0; i < 50; ++i) {
-        auto a = co_await async_uv::with_timeout(1s, a_subscriber.next());
-        auto b = co_await async_uv::with_timeout(1s, b_subscriber.next());
+        auto a = co_await flux::with_timeout(1s, a_subscriber.next());
+        auto b = co_await flux::with_timeout(1s, b_subscriber.next());
         assert(a.has_value());
         assert(b.has_value());
         assert(*a == i);
@@ -92,13 +92,13 @@ async_uv::Task<void> run_message_bus_isolation_test() {
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_multithread_test() {
+flux::Task<void> run_message_bus_multithread_test() {
     constexpr int kThreads = 4;
     constexpr int kPerThread = 100;
     constexpr int kTotal = kThreads * kPerThread;
 
-    auto bus = co_await async_uv::MessageBus<int>::create(
-        async_uv::MessageBus<int>::Options{.topic_capacity = 512, .subscription_capacity = 512});
+    auto bus = co_await flux::MessageBus<int>::create(
+        flux::MessageBus<int>::Options{.topic_capacity = 512, .subscription_capacity = 512});
     auto subscriber = bus.subscribe("multi");
     auto publisher = bus.thread_publisher("multi");
 
@@ -121,7 +121,7 @@ async_uv::Task<void> run_message_bus_multithread_test() {
     std::unordered_set<int> seen;
     seen.reserve(kTotal);
     for (int i = 0; i < kTotal; ++i) {
-        auto event = co_await async_uv::with_timeout(2s, subscriber.next());
+        auto event = co_await flux::with_timeout(2s, subscriber.next());
         assert(event.has_value());
         seen.insert(*event);
     }
@@ -131,9 +131,9 @@ async_uv::Task<void> run_message_bus_multithread_test() {
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_backpressure_test() {
-    auto bus = co_await async_uv::MessageBus<int>::create(
-        async_uv::MessageBus<int>::Options{.topic_capacity = 1, .subscription_capacity = 1});
+flux::Task<void> run_message_bus_backpressure_test() {
+    auto bus = co_await flux::MessageBus<int>::create(
+        flux::MessageBus<int>::Options{.topic_capacity = 1, .subscription_capacity = 1});
     auto subscriber = bus.subscribe("tight");
     auto publisher = bus.thread_publisher("tight");
 
@@ -155,15 +155,15 @@ async_uv::Task<void> run_message_bus_backpressure_test() {
     assert(third_ok);
     assert(!fourth_ok);
 
-    auto first = co_await async_uv::with_timeout(1s, subscriber.next());
+    auto first = co_await flux::with_timeout(1s, subscriber.next());
     assert(first.has_value());
     assert(*first == 1);
 
-    auto second = co_await async_uv::with_timeout(1s, subscriber.next());
+    auto second = co_await flux::with_timeout(1s, subscriber.next());
     assert(second.has_value());
     assert(*second == 2);
 
-    auto third = co_await async_uv::with_timeout(1s, subscriber.next());
+    auto third = co_await flux::with_timeout(1s, subscriber.next());
     assert(third.has_value());
     assert(*third == 3);
 
@@ -171,9 +171,9 @@ async_uv::Task<void> run_message_bus_backpressure_test() {
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_callback_thread_test() {
-    auto *runtime = co_await async_uv::get_current_runtime();
-    auto bus = co_await async_uv::MessageBus<int>::create();
+flux::Task<void> run_message_bus_callback_thread_test() {
+    auto *runtime = co_await flux::get_current_runtime();
+    auto bus = co_await flux::MessageBus<int>::create();
     auto subscriber = bus.subscribe("callback");
     auto publisher = bus.thread_publisher("callback");
 
@@ -184,22 +184,21 @@ async_uv::Task<void> run_message_bus_callback_thread_test() {
                 std::lock_guard<std::mutex> lock(result->mutex);
                 result->ec = ec;
                 result->role_is_io =
-                    async_uv::Runtime::current() == runtime &&
-                    async_uv::Runtime::current_thread_role() == async_uv::Runtime::ThreadRole::io;
+                    runtime != nullptr && runtime->in_io_thread() && !runtime->in_blocking_thread();
             }
             result->done.store(true, std::memory_order_release);
         });
     });
     sender1.join();
 
-    co_await async_uv::with_timeout(1s, wait_callback(first_result));
+    co_await flux::with_timeout(1s, wait_callback(first_result));
     {
         std::lock_guard<std::mutex> lock(first_result->mutex);
         assert(!first_result->ec);
         assert(first_result->role_is_io);
     }
 
-    auto event = co_await async_uv::with_timeout(1s, subscriber.next());
+    auto event = co_await flux::with_timeout(1s, subscriber.next());
     assert(event.has_value());
     assert(*event == 11);
 
@@ -212,30 +211,29 @@ async_uv::Task<void> run_message_bus_callback_thread_test() {
                 std::lock_guard<std::mutex> lock(result->mutex);
                 result->ec = ec;
                 result->role_is_io =
-                    async_uv::Runtime::current() == runtime &&
-                    async_uv::Runtime::current_thread_role() == async_uv::Runtime::ThreadRole::io;
+                    runtime != nullptr && runtime->in_io_thread() && !runtime->in_blocking_thread();
             }
             result->done.store(true, std::memory_order_release);
         });
     });
     sender2.join();
 
-    co_await async_uv::with_timeout(1s, wait_callback(second_result));
+    co_await flux::with_timeout(1s, wait_callback(second_result));
     {
         std::lock_guard<std::mutex> lock(second_result->mutex);
         assert(static_cast<bool>(second_result->ec));
         assert(second_result->role_is_io);
     }
 
-    auto closed_event = co_await async_uv::with_timeout(500ms, subscriber.next());
+    auto closed_event = co_await flux::with_timeout(500ms, subscriber.next());
     assert(!closed_event.has_value());
 
     co_await subscriber.close();
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_thread_permission_test() {
-    auto bus = co_await async_uv::MessageBus<int>::create();
+flux::Task<void> run_message_bus_thread_permission_test() {
+    auto bus = co_await flux::MessageBus<int>::create();
 
     auto thread_publisher = bus.thread_publisher("perm");
     assert(!thread_publisher.sync_publish(1));
@@ -255,23 +253,23 @@ async_uv::Task<void> run_message_bus_thread_permission_test() {
     bus.close();
 }
 
-async_uv::Task<void> run_message_bus_close_cancel_test() {
-    auto bus = co_await async_uv::MessageBus<int>::create();
+flux::Task<void> run_message_bus_close_cancel_test() {
+    auto bus = co_await flux::MessageBus<int>::create();
     auto subscriber = bus.subscribe("close");
     auto io_publisher = bus.io_publisher("close");
     auto thread_publisher = bus.thread_publisher("close");
 
     bool timeout_hit = false;
     try {
-        (void)co_await async_uv::with_timeout(20ms, subscriber.next());
-    } catch (const async_uv::Error &error) {
+        (void)co_await flux::with_timeout(20ms, subscriber.next());
+    } catch (const flux::Error &error) {
         timeout_hit = true;
         assert(error.code() == ETIMEDOUT || error.code() == -ETIMEDOUT);
     }
     assert(timeout_hit);
 
     bus.close_topic("close");
-    auto closed_event = co_await async_uv::with_timeout(500ms, subscriber.next());
+    auto closed_event = co_await flux::with_timeout(500ms, subscriber.next());
     assert(!closed_event.has_value());
     assert(!co_await io_publisher.publish(99));
     assert(!thread_publisher.sync_publish(100));
@@ -280,7 +278,7 @@ async_uv::Task<void> run_message_bus_close_cancel_test() {
     auto subscriber2 = bus.subscribe("close2");
     auto io_publisher2 = bus.io_publisher("close2");
     bus.close();
-    auto closed_event2 = co_await async_uv::with_timeout(500ms, subscriber2.next());
+    auto closed_event2 = co_await flux::with_timeout(500ms, subscriber2.next());
     assert(!closed_event2.has_value());
     assert(!co_await io_publisher2.publish(1));
 
@@ -288,7 +286,7 @@ async_uv::Task<void> run_message_bus_close_cancel_test() {
     co_await subscriber2.close();
 }
 
-async_uv::Task<void> run_all() {
+flux::Task<void> run_all() {
     co_await run_message_bus_smoke_test();
     co_await run_message_bus_order_test();
     co_await run_message_bus_isolation_test();
@@ -302,7 +300,7 @@ async_uv::Task<void> run_all() {
 } // namespace
 
 int main() {
-    async_uv::Runtime runtime(async_uv::Runtime::build().io_threads(4).blocking_threads(2));
+    flux::Runtime runtime(flux::Runtime::build().io_threads(4).blocking_threads(2));
     runtime.block_on(run_all());
     return 0;
 }

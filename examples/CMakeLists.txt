@@ -1,6 +1,6 @@
-if(NOT TARGET async_uv)
-    message(FATAL_ERROR "examples require the async_uv target")
+if(NOT TARGET flux)
+    message(FATAL_ERROR "examples require the flux target")
 endif()
 
-add_executable(async_uv_demo demo.cpp)
-target_link_libraries(async_uv_demo PRIVATE async_uv)
+add_executable(flux_demo demo.cpp)
+target_link_libraries(flux_demo PRIVATE flux)

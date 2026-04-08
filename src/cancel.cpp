@@ -1,6 +1,6 @@
-#include "async_uv/cancel.h"
+#include "flux/cancel.h"
 
-namespace async_uv {
+namespace flux {
 
 CancellationSource::CancellationSource()
     : source_(std::make_shared<stdexec::inplace_stop_source>()) {}
@@ -57,4 +57,4 @@ Task<void> throw_if_cancelled(std::string message) {
     }
 }
 
-} // namespace async_uv
+} // namespace flux

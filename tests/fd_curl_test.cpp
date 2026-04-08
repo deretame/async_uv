@@ -101,13 +101,49 @@ static constexpr curl_socket_t CURL_SOCKET_BAD = -1;
 static constexpr curl_socket_t CURL_SOCKET_TIMEOUT = CURL_SOCKET_BAD;
 #endif
 
-#include "async_uv/async_uv.h"
+#include "flux/flux.h"
 
 namespace {
 
 namespace asio = exec::asio::asio_impl;
 
 using namespace std::chrono_literals;
+
+flux::FdStream::ConstBuffer as_const_buffer(std::string_view data) {
+    return flux::FdStream::ConstBuffer{
+        reinterpret_cast<const std::byte *>(data.data()),
+        data.size()};
+}
+
+flux::Task<std::size_t>
+read_fd_chunk(flux::FdStream &stream, std::string &scratch, std::size_t max_bytes) {
+    if (max_bytes == 0) {
+        scratch.clear();
+        co_return static_cast<std::size_t>(0);
+    }
+
+    scratch.resize(max_bytes);
+    auto n = co_await stream.read_some_sender(flux::FdStream::MutableBuffer{
+        reinterpret_cast<std::byte *>(scratch.data()),
+        scratch.size()});
+    scratch.resize(n);
+    co_return n;
+}
+
+flux::Task<std::size_t>
+read_tcp_chunk(flux::TcpClient &client, std::string &scratch, std::size_t max_bytes) {
+    if (max_bytes == 0) {
+        scratch.clear();
+        co_return static_cast<std::size_t>(0);
+    }
+
+    scratch.resize(max_bytes);
+    auto n = co_await client.read_some(flux::TcpClient::MutableBuffer{
+        reinterpret_cast<std::byte *>(scratch.data()),
+        scratch.size()});
+    scratch.resize(n);
+    co_return n;
+}
 
 std::string curl_easy_error(CURLcode rc) {
     const char *message = curl_easy_strerror(rc);
@@ -429,7 +465,7 @@ private:
 
 class AsyncCurlConnector {
 public:
-    static async_uv::Task<async_uv::FdStream>
+    static flux::Task<flux::FdStream>
     connect_only(std::string url, std::chrono::milliseconds timeout = 8s);
 
 private:
@@ -440,7 +476,7 @@ private:
 };
 
 struct AsyncCurlConnector::State : std::enable_shared_from_this<AsyncCurlConnector::State> {
-    explicit State(async_uv::Runtime *rt, std::shared_ptr<CurlEventLoop> io_loop)
+    explicit State(flux::Runtime *rt, std::shared_ptr<CurlEventLoop> io_loop)
         : runtime(rt), io(std::move(io_loop)) {}
 
     void fail_locked(std::string message) {
@@ -585,7 +621,7 @@ struct AsyncCurlConnector::State : std::enable_shared_from_this<AsyncCurlConnect
         }
     }
 
-    async_uv::Runtime *runtime = nullptr;
+    flux::Runtime *runtime = nullptr;
     std::shared_ptr<CurlEventLoop> io;
     std::recursive_mutex mutex;
 
@@ -621,9 +657,9 @@ int AsyncCurlConnector::on_timer(CURLM *, long timeout_ms, void *userp) {
     return 0;
 }
 
-async_uv::Task<async_uv::FdStream>
+flux::Task<flux::FdStream>
 AsyncCurlConnector::connect_only(std::string url, std::chrono::milliseconds timeout) {
-    auto *runtime = co_await async_uv::get_current_runtime();
+    auto *runtime = co_await flux::get_current_runtime();
     auto event_loop = AsioCurlEventLoop::create(runtime->executor());
     auto state = std::make_shared<State>(runtime, std::move(event_loop));
 
@@ -692,7 +728,7 @@ AsyncCurlConnector::connect_only(std::string url, std::chrono::milliseconds time
                 break;
             }
 
-            co_await async_uv::sleep_for(1ms);
+            co_await flux::sleep_for(1ms);
         }
 
         curl_socket_t active_socket = CURL_SOCKET_BAD;
@@ -707,7 +743,7 @@ AsyncCurlConnector::connect_only(std::string url, std::chrono::milliseconds time
             active_socket = state->active_socket;
         }
 
-        auto stream = co_await async_uv::FdStream::attach(static_cast<int>(active_socket));
+        auto stream = co_await flux::FdStream::attach(static_cast<int>(active_socket));
 
         {
             std::lock_guard<std::recursive_mutex> lock(state->mutex);
@@ -722,22 +758,23 @@ AsyncCurlConnector::connect_only(std::string url, std::chrono::milliseconds time
     }
 }
 
-async_uv::Task<void> run_server(async_uv::TcpListener listener) {
+flux::Task<void> run_server(flux::TcpListener listener) {
     auto client = co_await listener.accept();
 
     std::string request;
+    std::string scratch;
     while (request.find("\r\n\r\n") == std::string::npos) {
-        auto chunk = co_await client.read_some(1024);
-        if (chunk.empty() && client.eof()) {
+        const auto n = co_await read_tcp_chunk(client, scratch, 1024);
+        if (n == 0 && client.eof()) {
             break;
         }
-        request += chunk;
+        request.append(scratch.data(), n);
     }
 
     assert(request.find("GET / HTTP/1.1") != std::string::npos);
     assert(request.find("Host: 127.0.0.1") != std::string::npos);
 
-    const std::string body = "hello from async_uv fd stream";
+    const std::string body = "hello from flux fd stream";
     const std::string response = "HTTP/1.1 200 OK\r\n"
                                  "Content-Type: text/plain\r\n"
                                  "Connection: close\r\n"
@@ -752,20 +789,21 @@ async_uv::Task<void> run_server(async_uv::TcpListener listener) {
     co_await listener.close();
 }
 
-async_uv::Task<std::string> receive_response(async_uv::FdStream &stream) {
+flux::Task<std::string> receive_response(flux::FdStream &stream) {
     std::string response;
+    std::string scratch;
     while (true) {
-        auto chunk = co_await stream.read_some_sender(2048);
-        if (chunk.empty()) {
+        const auto n = co_await read_fd_chunk(stream, scratch, 2048);
+        if (n == 0) {
             break;
         }
-        response += std::move(chunk);
+        response.append(scratch.data(), n);
     }
     co_return response;
 }
 
-async_uv::Task<void>
-close_managed_stream(std::shared_ptr<std::optional<async_uv::FdStream>> managed_stream) {
+flux::Task<void>
+close_managed_stream(std::shared_ptr<std::optional<flux::FdStream>> managed_stream) {
     if (managed_stream && managed_stream->has_value() && managed_stream->value().valid()) {
         co_await (managed_stream->value().close() | stdexec::unstoppable);
     }
@@ -774,7 +812,7 @@ close_managed_stream(std::shared_ptr<std::optional<async_uv::FdStream>> managed_
     }
 }
 
-async_uv::Task<void> close_fd_stream_unstoppable(async_uv::FdStream &stream) {
+flux::Task<void> close_fd_stream_unstoppable(flux::FdStream &stream) {
     if (stream.valid()) {
         co_await (stream.close() | stdexec::unstoppable);
     }
@@ -788,23 +826,23 @@ std::string http_body_from_response(std::string response) {
     return response.substr(sep + 4);
 }
 
-async_uv::Task<std::string> fetch_http_body_with_curl(int port, std::string path) {
+flux::Task<std::string> fetch_http_body_with_curl(int port, std::string path) {
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + path;
     const std::string request = "GET " + path +
                                 " HTTP/1.1\r\n"
                                 "Host: 127.0.0.1\r\n"
                                 "Connection: close\r\n\r\n";
 
-    auto managed_stream = std::make_shared<std::optional<async_uv::FdStream>>();
+    auto managed_stream = std::make_shared<std::optional<flux::FdStream>>();
     auto pipeline = AsyncCurlConnector::connect_only(url, 8s)
                   | stdexec::then(
-                        [managed_stream](async_uv::FdStream stream) {
+                        [managed_stream](flux::FdStream stream) {
                             assert(stream.valid());
                             managed_stream->emplace(std::move(stream));
                         })
                   | stdexec::let_value(
                         [request, managed_stream]() mutable {
-                            return managed_stream->value().write_all_sender(std::move(request));
+                            return managed_stream->value().write_all_sender(as_const_buffer(request));
                         })
                   | stdexec::then([expected = request.size()](std::size_t sent) {
                         assert(sent == expected);
@@ -850,21 +888,22 @@ std::string make_redis_command(std::initializer_list<std::string_view> parts) {
     return payload;
 }
 
-async_uv::Task<async_uv::FdStream> connect_redis_stream() {
-    auto ex = co_await async_uv::get_current_loop();
+flux::Task<flux::FdStream> connect_redis_stream() {
+    auto ex = co_await flux::get_current_loop();
     asio::ip::tcp::resolver resolver(ex);
     auto endpoints = co_await resolver.async_resolve("127.0.0.1", "6379", exec::asio::use_sender);
 
     asio::ip::tcp::socket socket(ex);
     co_await asio::async_connect(socket, endpoints, exec::asio::use_sender);
 
-    auto stream = co_await async_uv::FdStream::attach(socket.native_handle());
+    auto stream = co_await flux::FdStream::attach(socket.native_handle());
     std::error_code ec;
     socket.close(ec);
     co_return stream;
 }
 
-async_uv::Task<std::string> read_redis_line(async_uv::FdStream &stream, std::string &buffer) {
+flux::Task<std::string>
+read_redis_line(flux::FdStream &stream, std::string &buffer, std::string &scratch) {
     while (true) {
         const auto pos = buffer.find("\r\n");
         if (pos != std::string::npos) {
@@ -873,27 +912,29 @@ async_uv::Task<std::string> read_redis_line(async_uv::FdStream &stream, std::str
             co_return line;
         }
 
-        auto chunk = co_await stream.read_some_sender(2048);
-        if (chunk.empty()) {
+        const auto n = co_await read_fd_chunk(stream, scratch, 2048);
+        if (n == 0) {
             throw std::runtime_error("redis connection closed while reading line");
         }
-        buffer += std::move(chunk);
+        buffer.append(scratch.data(), n);
     }
 }
 
-async_uv::Task<void>
-read_redis_exact(async_uv::FdStream &stream, std::string &buffer, std::size_t bytes) {
+flux::Task<void>
+read_redis_exact(
+    flux::FdStream &stream, std::string &buffer, std::size_t bytes, std::string &scratch) {
     while (buffer.size() < bytes) {
-        auto chunk = co_await stream.read_some_sender(2048);
-        if (chunk.empty()) {
+        const auto n = co_await read_fd_chunk(stream, scratch, 2048);
+        if (n == 0) {
             throw std::runtime_error("redis connection closed while reading payload");
         }
-        buffer += std::move(chunk);
+        buffer.append(scratch.data(), n);
     }
 }
 
-async_uv::Task<RedisRespValue> read_redis_reply(async_uv::FdStream &stream, std::string &buffer) {
-    const std::string line = co_await read_redis_line(stream, buffer);
+flux::Task<RedisRespValue> read_redis_reply(flux::FdStream &stream, std::string &buffer) {
+    std::string scratch;
+    const std::string line = co_await read_redis_line(stream, buffer, scratch);
     if (line.empty()) {
         throw std::runtime_error("invalid empty redis response line");
     }
@@ -919,7 +960,7 @@ async_uv::Task<RedisRespValue> read_redis_reply(async_uv::FdStream &stream, std:
         }
 
         const std::size_t bulk_len = static_cast<std::size_t>(length);
-        co_await read_redis_exact(stream, buffer, bulk_len + 2);
+        co_await read_redis_exact(stream, buffer, bulk_len + 2, scratch);
         if (buffer[bulk_len] != '\r' || buffer[bulk_len + 1] != '\n') {
             throw std::runtime_error("invalid redis bulk terminator");
         }
@@ -937,14 +978,14 @@ async_uv::Task<RedisRespValue> read_redis_reply(async_uv::FdStream &stream, std:
     throw std::runtime_error("unsupported redis response type");
 }
 
-async_uv::Task<RedisRespValue> run_redis_command(std::string command) {
+flux::Task<RedisRespValue> run_redis_command(std::string command) {
     auto stream = co_await connect_redis_stream();
     std::exception_ptr pending_error;
     RedisRespValue reply;
     std::string buffer;
 
     try {
-        auto flow = stream.write_all_sender(std::move(command))
+        auto flow = stream.write_all_sender(as_const_buffer(command))
                   | stdexec::then([](std::size_t sent) {
                         assert(sent > 0);
                     })
@@ -963,7 +1004,7 @@ async_uv::Task<RedisRespValue> run_redis_command(std::string command) {
     co_return reply;
 }
 
-async_uv::Task<void> redis_set_value(std::string key, std::string value) {
+flux::Task<void> redis_set_value(std::string key, std::string value) {
     auto reply = co_await run_redis_command(
         make_redis_command({"SET", std::string_view(key), std::string_view(value)}));
     assert(reply.type == RedisRespType::simple_string);
@@ -971,20 +1012,20 @@ async_uv::Task<void> redis_set_value(std::string key, std::string value) {
     assert(*reply.value == "OK");
 }
 
-async_uv::Task<std::optional<std::string>> redis_get_value(std::string key) {
+flux::Task<std::optional<std::string>> redis_get_value(std::string key) {
     auto reply = co_await run_redis_command(make_redis_command({"GET", std::string_view(key)}));
     assert(reply.type == RedisRespType::bulk_string);
     co_return reply.value;
 }
 
-async_uv::Task<long long> redis_del_key(std::string key) {
+flux::Task<long long> redis_del_key(std::string key) {
     auto reply = co_await run_redis_command(make_redis_command({"DEL", std::string_view(key)}));
     assert(reply.type == RedisRespType::integer);
     assert(reply.integer.has_value());
     co_return *reply.integer;
 }
 
-async_uv::Task<bool> redis_ping_available() {
+flux::Task<bool> redis_ping_available() {
     try {
         auto reply = co_await run_redis_command(make_redis_command({"PING"}));
         co_return reply.type == RedisRespType::simple_string && reply.value.has_value() &&
@@ -1026,18 +1067,19 @@ std::string response_body_for_target(std::string_view target) {
     throw std::runtime_error("unexpected request target in pipeline server");
 }
 
-async_uv::Task<void> run_pipeline_server(async_uv::TcpListener listener) {
+flux::Task<void> run_pipeline_server(flux::TcpListener listener) {
     constexpr int expected_requests = 3;
     for (int i = 0; i < expected_requests; ++i) {
         auto client = co_await listener.accept();
 
         std::string request;
+        std::string scratch;
         while (request.find("\r\n\r\n") == std::string::npos) {
-            auto chunk = co_await client.read_some(1024);
-            if (chunk.empty() && client.eof()) {
+            const auto n = co_await read_tcp_chunk(client, scratch, 1024);
+            if (n == 0 && client.eof()) {
                 break;
             }
-            request += chunk;
+            request.append(scratch.data(), n);
         }
 
         assert(request.find("Host: 127.0.0.1") != std::string::npos);
@@ -1058,8 +1100,8 @@ async_uv::Task<void> run_pipeline_server(async_uv::TcpListener listener) {
     co_await listener.close();
 }
 
-async_uv::Task<void> run_client_curl_redis_pipeline(int port) {
-    const std::string redis_key = "async_uv:curl:redis:pipeline";
+flux::Task<void> run_client_curl_redis_pipeline(int port) {
+    const std::string redis_key = "flux:curl:redis:pipeline";
     auto pipeline = fetch_http_body_with_curl(port, "/first")
                   | stdexec::then([](std::string body) {
                         assert(body == "curl-first-body");
@@ -1116,8 +1158,8 @@ async_uv::Task<void> run_client_curl_redis_pipeline(int port) {
     co_await std::move(pipeline);
 }
 
-async_uv::Task<void> run_client_curl_redis_pipeline_coroutine(int port) {
-    const std::string redis_key = "async_uv:curl:redis:coroutine";
+flux::Task<void> run_client_curl_redis_pipeline_coroutine(int port) {
+    const std::string redis_key = "flux:curl:redis:coroutine";
 
     const std::string first_body = co_await fetch_http_body_with_curl(port, "/first");
     assert(first_body == "curl-first-body");
@@ -1142,7 +1184,7 @@ async_uv::Task<void> run_client_curl_redis_pipeline_coroutine(int port) {
     assert(!maybe_deleted.has_value());
 }
 
-async_uv::Task<void> run_client_coroutine(int port) {
+flux::Task<void> run_client_coroutine(int port) {
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/";
     const std::string request = "GET / HTTP/1.1\r\n"
                                 "Host: 127.0.0.1\r\n"
@@ -1153,20 +1195,21 @@ async_uv::Task<void> run_client_coroutine(int port) {
 
     std::exception_ptr pending_error;
     try {
-        const std::size_t sent = co_await async_uv::with_timeout(2s, stream.write_all(request));
+        const std::size_t sent = co_await flux::with_timeout(2s, stream.write_all(request));
         assert(sent == request.size());
 
         std::string response;
+        std::string scratch;
         while (true) {
-            auto chunk = co_await async_uv::with_timeout(2s, stream.read_some(2048));
-            if (chunk.empty()) {
+            const auto n = co_await flux::with_timeout(2s, read_fd_chunk(stream, scratch, 2048));
+            if (n == 0) {
                 break;
             }
-            response += std::move(chunk);
+            response.append(scratch.data(), n);
         }
 
         assert(response.find("HTTP/1.1 200 OK") != std::string::npos);
-        assert(response.find("hello from async_uv fd stream") != std::string::npos);
+        assert(response.find("hello from flux fd stream") != std::string::npos);
     } catch (...) {
         pending_error = std::current_exception();
     }
@@ -1177,7 +1220,7 @@ async_uv::Task<void> run_client_coroutine(int port) {
     }
 }
 
-async_uv::Task<void> run_client(int port) {
+flux::Task<void> run_client(int port) {
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/";
     const std::string request = "GET / HTTP/1.1\r\n"
                                 "Host: 127.0.0.1\r\n"
@@ -1185,7 +1228,7 @@ async_uv::Task<void> run_client(int port) {
 
     // Keep the connected stream alive through the whole pipeline so that `finally`
     // can close it at the very end without leaking resources on errors/timeouts.
-    auto managed_stream = std::make_shared<std::optional<async_uv::FdStream>>();
+    auto managed_stream = std::make_shared<std::optional<flux::FdStream>>();
 
     // Full pipeline demo:
     // 1) connect_only (non-blocking curl multi + fd/timer driving)
@@ -1196,13 +1239,13 @@ async_uv::Task<void> run_client(int port) {
     // 6) always close stream in finally (success/failure/cancel all covered)
     auto pipeline = AsyncCurlConnector::connect_only(url, 8s)
                   | stdexec::then(
-                        [managed_stream](async_uv::FdStream stream) {
+                        [managed_stream](flux::FdStream stream) {
                             assert(stream.valid());
                             managed_stream->emplace(std::move(stream));
                         })
                   | stdexec::let_value(
                         [request, managed_stream]() mutable {
-                            return managed_stream->value().write_all_sender(std::move(request));
+                            return managed_stream->value().write_all_sender(as_const_buffer(request));
                         })
                   | stdexec::then([expected = request.size()](std::size_t sent) {
                         assert(sent == expected);
@@ -1213,7 +1256,7 @@ async_uv::Task<void> run_client(int port) {
                         })
                   | stdexec::then([](std::string response) {
                         assert(response.find("HTTP/1.1 200 OK") != std::string::npos);
-                        assert(response.find("hello from async_uv fd stream") != std::string::npos);
+                        assert(response.find("hello from flux fd stream") != std::string::npos);
                         return response;
                     })
                   | exec::finally(close_managed_stream(managed_stream));
@@ -1224,54 +1267,54 @@ async_uv::Task<void> run_client(int port) {
     // request/response lifecycle in one composable sender chain.
 }
 
-async_uv::Task<void> run_fd_curl_sender_test() {
-    auto listener = co_await async_uv::TcpListener::bind("127.0.0.1", 0);
+flux::Task<void> run_fd_curl_sender_test() {
+    auto listener = co_await flux::TcpListener::bind("127.0.0.1", 0);
     const int port = listener.port();
     assert(port > 0);
 
-    co_await async_uv::scope::all(run_server(std::move(listener)), run_client(port));
+    co_await flux::scope::all(run_server(std::move(listener)), run_client(port));
 }
 
-async_uv::Task<void> run_fd_curl_coroutine_test() {
-    auto listener = co_await async_uv::TcpListener::bind("127.0.0.1", 0);
+flux::Task<void> run_fd_curl_coroutine_test() {
+    auto listener = co_await flux::TcpListener::bind("127.0.0.1", 0);
     const int port = listener.port();
     assert(port > 0);
 
-    co_await async_uv::scope::all(run_server(std::move(listener)), run_client_coroutine(port));
+    co_await flux::scope::all(run_server(std::move(listener)), run_client_coroutine(port));
 }
 
-async_uv::Task<void> run_fd_curl_redis_pipeline_test() {
+flux::Task<void> run_fd_curl_redis_pipeline_test() {
     if (!(co_await redis_ping_available())) {
         std::cerr << "[skip] redis unavailable at 127.0.0.1:6379, skip curl+redis pipeline test\n";
         co_return;
     }
 
-    auto listener = co_await async_uv::TcpListener::bind("127.0.0.1", 0);
+    auto listener = co_await flux::TcpListener::bind("127.0.0.1", 0);
     const int port = listener.port();
     assert(port > 0);
 
-    co_await async_uv::scope::all(
+    co_await flux::scope::all(
         run_pipeline_server(std::move(listener)),
         run_client_curl_redis_pipeline(port));
 }
 
-async_uv::Task<void> run_fd_curl_redis_pipeline_coroutine_test() {
+flux::Task<void> run_fd_curl_redis_pipeline_coroutine_test() {
     if (!(co_await redis_ping_available())) {
         std::cerr
             << "[skip] redis unavailable at 127.0.0.1:6379, skip curl+redis coroutine pipeline test\n";
         co_return;
     }
 
-    auto listener = co_await async_uv::TcpListener::bind("127.0.0.1", 0);
+    auto listener = co_await flux::TcpListener::bind("127.0.0.1", 0);
     const int port = listener.port();
     assert(port > 0);
 
-    co_await async_uv::scope::all(
+    co_await flux::scope::all(
         run_pipeline_server(std::move(listener)),
         run_client_curl_redis_pipeline_coroutine(port));
 }
 
-async_uv::Task<void> run_fd_curl_test() {
+flux::Task<void> run_fd_curl_test() {
     co_await run_fd_curl_sender_test();
     co_await run_fd_curl_coroutine_test();
     co_await run_fd_curl_redis_pipeline_test();
@@ -1287,7 +1330,7 @@ int main() {
     }
 
     try {
-        async_uv::Runtime runtime(async_uv::Runtime::build().io_threads(2).blocking_threads(2));
+        flux::Runtime runtime(flux::Runtime::build().io_threads(2).blocking_threads(2));
         runtime.block_on(run_fd_curl_test());
     } catch (...) {
         curl_global_cleanup();

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -15,13 +16,19 @@
 #include <asio/error.hpp>
 #include <asio/ip/tcp.hpp>
 
-#include "async_uv/async_uv.h"
+#include "flux/flux.h"
 
 namespace {
 
 namespace asio = exec::asio::asio_impl;
 
 using namespace std::chrono_literals;
+
+flux::FdStream::ConstBuffer as_const_buffer(std::string_view data) {
+    return flux::FdStream::ConstBuffer{
+        reinterpret_cast<const std::byte *>(data.data()),
+        data.size()};
+}
 
 enum class RespType {
     simple_string,
@@ -49,8 +56,8 @@ std::string make_resp_command(std::initializer_list<std::string_view> parts) {
     return payload;
 }
 
-async_uv::Task<async_uv::FdStream> connect_fd_stream(std::string host, int port) {
-    auto ex = co_await async_uv::get_current_loop();
+flux::Task<flux::FdStream> connect_fd_stream(std::string host, int port) {
+    auto ex = co_await flux::get_current_loop();
     asio::ip::tcp::resolver resolver(ex);
     auto endpoints =
         co_await resolver.async_resolve(std::move(host), std::to_string(port), exec::asio::use_sender);
@@ -58,13 +65,13 @@ async_uv::Task<async_uv::FdStream> connect_fd_stream(std::string host, int port)
     asio::ip::tcp::socket socket(ex);
     co_await asio::async_connect(socket, endpoints, exec::asio::use_sender);
 
-    auto stream = co_await async_uv::FdStream::attach(socket.native_handle());
+    auto stream = co_await flux::FdStream::attach(socket.native_handle());
     std::error_code ec;
     socket.close(ec);
     co_return stream;
 }
 
-async_uv::Task<std::string> read_line(async_uv::FdStream &stream, std::string &buffer) {
+flux::Task<std::string> read_line(flux::FdStream &stream, std::string &buffer) {
     while (true) {
         const auto pos = buffer.find("\r\n");
         if (pos != std::string::npos) {
@@ -73,26 +80,28 @@ async_uv::Task<std::string> read_line(async_uv::FdStream &stream, std::string &b
             co_return line;
         }
 
-        auto chunk = co_await stream.read_some_sender(4096);
-        if (chunk.empty()) {
+        std::array<std::byte, 4096> chunk{};
+        auto n = co_await stream.read_some_sender(std::span<std::byte>(chunk));
+        if (n == 0) {
             throw std::runtime_error("redis connection closed while reading line");
         }
-        buffer += std::move(chunk);
+        buffer.append(reinterpret_cast<const char *>(chunk.data()), n);
     }
 }
 
-async_uv::Task<void>
-read_exact_bytes(async_uv::FdStream &stream, std::string &buffer, std::size_t bytes) {
+flux::Task<void>
+read_exact_bytes(flux::FdStream &stream, std::string &buffer, std::size_t bytes) {
     while (buffer.size() < bytes) {
-        auto chunk = co_await stream.read_some_sender(4096);
-        if (chunk.empty()) {
+        std::array<std::byte, 4096> chunk{};
+        auto n = co_await stream.read_some_sender(std::span<std::byte>(chunk));
+        if (n == 0) {
             throw std::runtime_error("redis connection closed while reading payload");
         }
-        buffer += std::move(chunk);
+        buffer.append(reinterpret_cast<const char *>(chunk.data()), n);
     }
 }
 
-async_uv::Task<RespValue> read_resp(async_uv::FdStream &stream, std::string &buffer) {
+flux::Task<RespValue> read_resp(flux::FdStream &stream, std::string &buffer) {
     const std::string line = co_await read_line(stream, buffer);
     if (line.empty()) {
         throw std::runtime_error("invalid empty RESP line");
@@ -148,7 +157,7 @@ bool is_redis_unavailable_code(const std::error_code &ec) {
            ec == std::errc::timed_out;
 }
 
-async_uv::Task<void> run_fd_redis_test() {
+flux::Task<void> run_fd_redis_test() {
     auto stream = co_await connect_fd_stream("127.0.0.1", 6379);
     assert(stream.valid());
 
@@ -156,7 +165,7 @@ async_uv::Task<void> run_fd_redis_test() {
 
     {
         const std::string ping = make_resp_command({"PING"});
-        auto ping_flow = stream.write_all_sender(ping)
+        auto ping_flow = stream.write_all_sender(as_const_buffer(ping))
                        | stdexec::then([expected = ping.size()](std::size_t sent) {
                              assert(sent == expected);
                          })
@@ -169,12 +178,12 @@ async_uv::Task<void> run_fd_redis_test() {
         assert(*reply.value == "PONG");
     }
 
-    const std::string key = "async_uv:fd:redis:test";
+    const std::string key = "flux:fd:redis:test";
     const std::string value = "fd_sender_ok";
 
     {
         const std::string set = make_resp_command({"SET", key, value});
-        auto set_flow = stream.write_all_sender(set)
+        auto set_flow = stream.write_all_sender(as_const_buffer(set))
                       | stdexec::then([expected = set.size()](std::size_t sent) {
                             assert(sent == expected);
                         })
@@ -189,7 +198,7 @@ async_uv::Task<void> run_fd_redis_test() {
 
     {
         const std::string get = make_resp_command({"GET", key});
-        auto get_flow = stream.write_all_sender(get)
+        auto get_flow = stream.write_all_sender(as_const_buffer(get))
                       | stdexec::then([expected = get.size()](std::size_t sent) {
                             assert(sent == expected);
                         })
@@ -209,7 +218,7 @@ async_uv::Task<void> run_fd_redis_test() {
 
 int main() {
     try {
-        async_uv::Runtime runtime(async_uv::Runtime::build().io_threads(2).blocking_threads(2));
+        flux::Runtime runtime(flux::Runtime::build().io_threads(2).blocking_threads(2));
         runtime.block_on(run_fd_redis_test());
         return 0;
     } catch (const std::system_error &error) {

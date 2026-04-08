@@ -1,6 +1,6 @@
-# async_uv
+# flux
 
-`async_uv` is a C++23 async IO library built on top of `libuv` and `async_simple`.
+`flux` is a C++23 async IO library built on top of `libuv` and `async_simple`.
 
 It aims for:
 
@@ -30,26 +30,26 @@ ctest --test-dir build --output-on-failure
 - `src/CMakeLists.txt`: library-only target definition
 - `examples/CMakeLists.txt`: examples only
 - `tests/CMakeLists.txt`: tests only
-- `cmake/async_uv_dependencies.cmake`: shared dependency setup
+- `cmake/flux_dependencies.cmake`: shared dependency setup
 
 If another project only wants the library target, it can include just the library directory:
 
 ```cmake
-add_subdirectory(path/to/async_uv/src async_uv)
-target_link_libraries(my_app PRIVATE async_uv::async_uv)
+add_subdirectory(path/to/flux/src flux)
+target_link_libraries(my_app PRIVATE flux::flux)
 ```
 
 If you add the repository root instead, examples and tests are controlled by:
 
-- `ASYNC_UV_BUILD_EXAMPLES`
-- `ASYNC_UV_BUILD_TESTS`
-- `ASYNC_UV_USE_MIMALLOC`
-- `ASYNC_UV_ENABLE_LAYER2` (build layer2 targets: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws`)
-- `ASYNC_UV_ENABLE_LAYER3` (build layer3 target; automatically enables layer2)
+- `FLUX_BUILD_EXAMPLES`
+- `FLUX_BUILD_TESTS`
+- `FLUX_USE_MIMALLOC`
+- `FLUX_ENABLE_LAYER2` (build layer2 targets: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws`)
+- `FLUX_ENABLE_LAYER3` (build layer3 target; automatically enables layer2)
 
 Layer relationship:
 
-- layer1: `async_uv` (base IO runtime)
+- layer1: `flux` (base IO runtime)
 - layer2: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws` (depend on layer1)
 - layer3: `async_uv_layer3` (depends on layer2, and transitively layer1)
 
@@ -60,11 +60,11 @@ Layer2 boundary (scope):
 
 Layer2 stable API checklist:
 
-- `async_uv::http`: HTTP client + parser + server primitives only (no router)
-- `async_uv::sql`: connection/query/transaction/pool primitives
-- `async_uv::redis`: connection/command/pool primitives
-- `async_uv::ws`: open/close/send/recv/messages stream primitives (`ws`/`wss`)
-- `async_uv::layer2::ErrorKind`: cross-module error mapping contract
+- `flux::http`: HTTP client + parser + server primitives only (no router)
+- `flux::sql`: connection/query/transaction/pool primitives
+- `flux::redis`: connection/command/pool primitives
+- `flux::ws`: open/close/send/recv/messages stream primitives (`ws`/`wss`)
+- `flux::layer2::ErrorKind`: cross-module error mapping contract
 - `trace hook` categories: `layer2_http`, `layer2_sql`, `layer2_redis`, `layer2_ws`
 
 Layer2 header index (for layer3 integration):
@@ -82,13 +82,13 @@ Layer2 integration reading order (recommended):
 1. boundary/scope (`Layer2 boundary`)
 2. header entry points (`Layer2 header index`)
 3. module primitives (`Layer2 SQL`, `Layer2 Redis`, `Layer2 WebSocket`, `Layer2 HTTP server primitives`)
-4. unified error mapping (`async_uv::layer2::ErrorKind` + `to_error_kind(...)`)
+4. unified error mapping (`flux::layer2::ErrorKind` + `to_error_kind(...)`)
 5. trace hooks (`layer2_http`, `layer2_sql`, `layer2_redis`, `layer2_ws`)
 
 Example:
 
 ```bash
-cmake -S . -B build -G Ninja -DASYNC_UV_ENABLE_LAYER2=ON
+cmake -S . -B build -G Ninja -DFLUX_ENABLE_LAYER2=ON
 cmake --build build
 ```
 
@@ -109,9 +109,9 @@ the build falls back to mbedTLS when building curl from source.
 `async_uv_http` provides a minimal async API similar to reqwest-style ergonomics:
 
 ```cpp
-auto runtime = co_await async_uv::get_current_runtime();
+auto runtime = co_await flux::get_current_runtime();
 
-auto client = async_uv::http::Client::build()
+auto client = flux::http::Client::build()
     .runtime(*runtime) // 可选；不传时使用当前运行时 / optional; fallback to current runtime
     .default_header("Accept", "application/json")
     .timeout(std::chrono::seconds(20))
@@ -121,16 +121,16 @@ std::map<std::string, std::string> payload{{"hello", "world"}};
 DemoPayload request_data{"world", "cpp"};
 HttpBinPostJsonEcho response_json = co_await client.post("https://httpbin.org/post")
     .json(request_data)
-    .request_format(async_uv::http::RequestFormat::json)   // 也支持 .request_format("json")
-    .response_format(async_uv::http::ResponseFormat::json) // 也支持 .response_format("json")
+    .request_format(flux::http::RequestFormat::json)   // 也支持 .request_format("json")
+    .response_format(flux::http::ResponseFormat::json) // 也支持 .response_format("json")
     .send()
     .json<HttpBinPostJsonEcho>();
 
 auto upload_json = co_await client.post("https://httpbin.org/post")
     .multipart({
-        async_uv::http::field("kind", "demo"),
-        async_uv::http::field("lang", "cpp"),
-        async_uv::http::file("file", "/tmp/demo.txt")
+        flux::http::field("kind", "demo"),
+        flux::http::field("lang", "cpp"),
+        flux::http::file("file", "/tmp/demo.txt")
             .filename("demo.txt")
             .content_type("text/plain"),
     })
@@ -152,7 +152,7 @@ auto image_json = co_await client.post("https://httpbin.org/post")
 // 或者文件来源（由 curl 从文件读取上传）
 auto file_json = co_await client.post("https://httpbin.org/post")
     .multipart({
-        async_uv::http::file("image", "/tmp/demo.png")
+        flux::http::file("image", "/tmp/demo.png")
             .filename("demo.png")
             .content_type("image/png"),
     })
@@ -160,7 +160,7 @@ auto file_json = co_await client.post("https://httpbin.org/post")
     .json<nlohmann::json>();
 
 // 大文件下载（流式落盘，避免整文件进内存）
-async_uv::http::DownloadOptions dl;
+flux::http::DownloadOptions dl;
 dl.resume = true;
 dl.use_temp_file = true;
 dl.temp_path = "/tmp/archive.bin.part";
@@ -170,7 +170,7 @@ auto dl_result = co_await client.download_to_file(
 ```
 
 `Client` uses reqwest-like chained request builders (`get/post/put/del -> query/json/xml/urlencoded/multipart -> send`).
-By default, non-2xx responses throw `async_uv::http::HttpError` with structured error fields.
+By default, non-2xx responses throw `flux::http::HttpError` with structured error fields.
 Response format defaults to JSON if not set explicitly.
 You can also set request format explicitly via `request_format(...)`.
 `query(...)` supports map/unordered_map-style containers and values that are string-like,
@@ -187,7 +187,7 @@ Additional HTTP features:
 - transport error kind (`TransportErrorKind`) for finer error handling
 - llhttp parser (`HttpParser` + `HttpMessage`) for incremental raw HTTP parsing
 
-Layer2 SQL abstraction (`async_uv::sql`) currently provides:
+Layer2 SQL abstraction (`flux::sql`) currently provides:
 
 - unified async API for SQLite / MySQL / PostgreSQL (driver availability depends on source dependency build)
 - `Connection::open/query/execute/close/cancel` coroutine interfaces
@@ -200,13 +200,13 @@ Layer2 SQL abstraction (`async_uv::sql`) currently provides:
 - row/column normalized result model (`QueryResult`, `Row`, nullable `Cell`)
 
 ```cpp
-auto db_opts = async_uv::sql::ConnectionOptions::builder()
-    .driver(async_uv::sql::Driver::sqlite)
+auto db_opts = flux::sql::ConnectionOptions::builder()
+    .driver(flux::sql::Driver::sqlite)
     .file(":memory:")
     .query_timeout_ms(2000)
     .build();
 
-async_uv::sql::Connection db;
+flux::sql::Connection db;
 co_await db.open(db_opts);
 co_await db.execute("CREATE TABLE demo(id INTEGER PRIMARY KEY, name TEXT)");
 co_await db.begin();
@@ -219,11 +219,11 @@ auto rows = co_await db.query("SELECT id, name FROM demo ORDER BY id");
 auto filtered = co_await db.query(
     "SELECT id, name FROM demo WHERE name = ? AND id > ?",
     {"alice", 0},
-    async_uv::sql::QueryOptions::builder().timeout_ms(1000).build()
+    flux::sql::QueryOptions::builder().timeout_ms(1000).build()
 );
 
-auto pool = co_await async_uv::sql::ConnectionPool::create(
-    async_uv::sql::ConnectionPoolOptions::builder()
+auto pool = co_await flux::sql::ConnectionPool::create(
+    flux::sql::ConnectionPoolOptions::builder()
         .connection(db_opts)
         .max_connections(4)
         .preconnect(true)
@@ -243,7 +243,7 @@ SQL test toggles:
 - `ASYNC_UV_SQL_TEST_MYSQL=1` enables mysql integration checks
 - `ASYNC_UV_SQL_PG_*` / `ASYNC_UV_SQL_MY_*` can override default host/port/user/password/database
 
-Layer2 Redis abstraction (`async_uv::redis`) currently provides:
+Layer2 Redis abstraction (`flux::redis`) currently provides:
 
 - coroutine-based `Client::open/command/execute/close` API
 - Redis command parameter replacement using `?` placeholders with `std::vector<RedisParam>`
@@ -253,21 +253,21 @@ Layer2 Redis abstraction (`async_uv::redis`) currently provides:
 - connection pool (`ConnectionPool`) with configurable pool size / acquire timeout / max lifetime / health check command
 
 ```cpp
-auto redis_opts = async_uv::redis::ConnectionOptions::builder()
+auto redis_opts = flux::redis::ConnectionOptions::builder()
     .host("127.0.0.1")
     .port(6379)
     // .tls_enabled(true)
     // .tls_server_name("redis.example.com")
     .build();
 
-async_uv::redis::Client redis;
+flux::redis::Client redis;
 co_await redis.open(redis_opts);
 co_await redis.command("SET ? ?", {"demo:key", "value"});
 auto reply = co_await redis.command("GET ?", {"demo:key"});
 co_await redis.close();
 
-auto redis_pool = co_await async_uv::redis::ConnectionPool::create(
-    async_uv::redis::ConnectionPoolOptions::builder()
+auto redis_pool = co_await flux::redis::ConnectionPool::create(
+    flux::redis::ConnectionPoolOptions::builder()
         .connection(redis_opts)
         .max_connections(4)
         .preconnect(true)
@@ -284,7 +284,7 @@ Redis test toggles:
 - `ASYNC_UV_REDIS_HOST` / `ASYNC_UV_REDIS_PORT` / `ASYNC_UV_REDIS_USER` / `ASYNC_UV_REDIS_PASSWORD` / `ASYNC_UV_REDIS_DB`
 - TLS env (optional): `ASYNC_UV_REDIS_TLS=1`, `ASYNC_UV_REDIS_TLS_VERIFY_PEER=0|1`, `ASYNC_UV_REDIS_TLS_CA_CERT`, `ASYNC_UV_REDIS_TLS_CA_DIR`, `ASYNC_UV_REDIS_TLS_CERT`, `ASYNC_UV_REDIS_TLS_KEY`, `ASYNC_UV_REDIS_TLS_SERVER_NAME`
 
-Layer2 WebSocket abstraction (`async_uv::ws`) currently provides:
+Layer2 WebSocket abstraction (`flux::ws`) currently provides:
 
 - coroutine-style `Client::open/close/send_text/send_binary/next_message/next_message_for/messages`
 - ws and wss URL support (TLS handled by IXWebSocket + OpenSSL backend)
@@ -293,19 +293,19 @@ Layer2 WebSocket abstraction (`async_uv::ws`) currently provides:
 - built-in trace events: `layer2_ws/open_*`, `layer2_ws/send_*`, `layer2_ws/recv_*`, `layer2_ws/close_*`
 
 ```cpp
-auto ws_opts = async_uv::ws::ClientOptions::builder()
+auto ws_opts = flux::ws::ClientOptions::builder()
     .url("wss://echo.websocket.events")
     .connect_timeout_ms(5000)
     .disable_automatic_reconnection(true)
     .tls_verify_peer(true)
     .build();
 
-async_uv::ws::Client ws;
+flux::ws::Client ws;
 co_await ws.open(ws_opts);
 co_await ws.send_text("hello ws");
 
 auto msg = co_await ws.next_message();
-if (msg.type == async_uv::ws::MessageType::text) {
+if (msg.type == flux::ws::MessageType::text) {
     // msg.data
 }
 
@@ -317,7 +317,7 @@ Stream-style receive example (recommended for continuous consume):
 ```cpp
 auto stream = ws.messages();
 while (auto message = co_await stream.next()) {
-    if (message->type == async_uv::ws::MessageType::text) {
+    if (message->type == flux::ws::MessageType::text) {
         // process text
     }
 }
@@ -329,7 +329,7 @@ If you only want the first N text messages, prefer "stream loop + break":
 std::vector<std::string> got;
 auto stream = ws.messages();
 while (auto message = co_await stream.next()) {
-    if (message->type != async_uv::ws::MessageType::text) {
+    if (message->type != flux::ws::MessageType::text) {
         continue;
     }
     got.push_back(message->data);
@@ -343,43 +343,43 @@ WebSocket dependency toggle:
 
 - `ASYNC_UV_LAYER2_FETCH_IXWEBSOCKET=ON|OFF` (default ON)
 
-Layer2 unified error mapping (`async_uv::layer2::ErrorKind`):
+Layer2 unified error mapping (`flux::layer2::ErrorKind`):
 
-- map SQL errors by `async_uv::layer2::to_error_kind(async_uv::sql::SqlErrorKind)`
-- map Redis errors by `async_uv::layer2::to_error_kind(async_uv::redis::RedisErrorKind)`
-- map HTTP errors by `async_uv::layer2::to_error_kind(async_uv::http::HttpErrorCode, async_uv::http::TransportErrorKind)`
-- map WebSocket errors by `async_uv::layer2::to_error_kind(async_uv::ws::WsErrorKind)`
+- map SQL errors by `flux::layer2::to_error_kind(flux::sql::SqlErrorKind)`
+- map Redis errors by `flux::layer2::to_error_kind(flux::redis::RedisErrorKind)`
+- map HTTP errors by `flux::layer2::to_error_kind(flux::http::HttpErrorCode, flux::http::TransportErrorKind)`
+- map WebSocket errors by `flux::layer2::to_error_kind(flux::ws::WsErrorKind)`
 
 ```cpp
 #include "async_uv_layer2/error.h"
 
 try {
     co_await redis.command("GET ?", {"demo:key"});
-} catch (const async_uv::redis::RedisError& e) {
-    auto kind = async_uv::layer2::to_error_kind(e.kind());
-    if (kind == async_uv::layer2::ErrorKind::not_connected) {
+} catch (const flux::redis::RedisError& e) {
+    auto kind = flux::layer2::to_error_kind(e.kind());
+    if (kind == flux::layer2::ErrorKind::not_connected) {
         // reconnect or fallback
     }
 }
 ```
 
-Common `to_string` helpers for logging (`async_uv::layer2::to_string`):
+Common `to_string` helpers for logging (`flux::layer2::to_string`):
 
 ```cpp
 #include "async_uv_layer2/to_string.h"
 
 try {
     co_await ws.send_text("hello");
-} catch (const async_uv::ws::WsError& e) {
-    auto kind_text = async_uv::layer2::to_string(e.kind());
+} catch (const flux::ws::WsError& e) {
+    auto kind_text = flux::layer2::to_string(e.kind());
     // e.g. "not_connected"
 }
 
-auto mapped = async_uv::layer2::to_error_kind(async_uv::ws::WsErrorKind::send_failed);
-auto mapped_text = async_uv::layer2::to_string(mapped); // "operation_failed"
+auto mapped = flux::layer2::to_error_kind(flux::ws::WsErrorKind::send_failed);
+auto mapped_text = flux::layer2::to_string(mapped); // "operation_failed"
 ```
 
-Layer2 HTTP server primitives (`async_uv::http`) currently provides:
+Layer2 HTTP server primitives (`flux::http`) currently provides:
 
 - request-target parser (`parse_request_target`) for path/query/fragment split
 - server request model (`ServerRequest`) converted from `HttpMessage`
@@ -390,24 +390,24 @@ Layer2 HTTP server primitives (`async_uv::http`) currently provides:
 - stream primitives (`BodyReader`/`BodyWriter`) with in-memory and socket implementations
 
 ```cpp
-auto target = async_uv::http::parse_request_target("/v1/items?id=1&name=foo");
+auto target = flux::http::parse_request_target("/v1/items?id=1&name=foo");
 
-async_uv::http::ServerResponse res;
+flux::http::ServerResponse res;
 res.status_code = 200;
 res.headers.push_back({"Content-Type", "application/json"});
 res.body = R"({"ok":true})";
 
-std::string wire = async_uv::http::serialize_response(res);
+std::string wire = flux::http::serialize_response(res);
 
-async_uv::http::MiddlewareChain chain;
-chain.use([](async_uv::http::ServerRequest req,
-             async_uv::http::ServerHandler next) -> async_uv::Task<async_uv::http::ServerResponse> {
+flux::http::MiddlewareChain chain;
+chain.use([](flux::http::ServerRequest req,
+             flux::http::ServerHandler next) -> flux::Task<flux::http::ServerResponse> {
     req.headers.push_back({"X-Trace", "1"});
     co_return co_await next(std::move(req));
 });
 
-chain.endpoint([](async_uv::http::ServerRequest req) -> async_uv::Task<async_uv::http::ServerResponse> {
-    async_uv::http::ServerResponse out;
+chain.endpoint([](flux::http::ServerRequest req) -> flux::Task<flux::http::ServerResponse> {
+    flux::http::ServerResponse out;
     out.status_code = 200;
     out.body = req.header("X-Trace").value_or("0");
     co_return out;
@@ -423,16 +423,16 @@ Behavior contracts (important defaults):
 - if no proxy is configured explicitly, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env is used
 
 ```cpp
-async_uv::http::RetryPolicy retry;
+flux::http::RetryPolicy retry;
 retry.enabled = true;
 retry.max_attempts = 3;
 retry.base_backoff = std::chrono::milliseconds(100);
 retry.max_backoff = std::chrono::seconds(1);
 
-async_uv::http::ProxyOptions proxy;
+flux::http::ProxyOptions proxy;
 proxy.url = "http://127.0.0.1:7890";
 
-async_uv::http::CookieJarOptions cookie;
+flux::http::CookieJarOptions cookie;
 cookie.enabled = true;
 cookie.file_path = "/tmp/async_uv_cookie.jar";
 
@@ -441,36 +441,36 @@ auto text_body = co_await client.get("https://example.com")
     .retry(retry)
     .proxy(proxy)
     .stream_response([&](std::string_view chunk) { streamed += chunk.size(); }, false)
-    .response_format(async_uv::http::ResponseFormat::text)
+    .response_format(flux::http::ResponseFormat::text)
     .send()
     .text();
 
 try {
     auto _ = co_await client.get("http://nonexistent.async-uv.invalid/").send().raw();
-} catch (const async_uv::http::HttpError& e) {
-    if (e.transport_kind() == async_uv::http::TransportErrorKind::dns) {
+} catch (const flux::http::HttpError& e) {
+    if (e.transport_kind() == flux::http::TransportErrorKind::dns) {
         // handle DNS issue
     }
 }
 
-auto client_with_cookie = async_uv::http::Client::build()
+auto client_with_cookie = flux::http::Client::build()
     .cookie_jar(cookie)
     .build();
 
-async_uv::http::HttpParser parser(async_uv::http::ParseMode::response);
+flux::http::HttpParser parser(flux::http::ParseMode::response);
 co_await parser.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
 if (auto msg = co_await parser.next_message()) {
     auto content_length = msg->header("Content-Length");
     auto body = msg->body();
 }
 
-auto one = co_await async_uv::http::parse_first_message(
+auto one = co_await flux::http::parse_first_message(
     "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
-auto all = co_await async_uv::http::parse_all_messages(
+auto all = co_await flux::http::parse_all_messages(
     "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
 
 // 大体积响应体可自动落盘（例如 multipart/form-data 或大文件）
-async_uv::http::ParserOptions parse_opts;
+flux::http::ParserOptions parse_opts;
 parse_opts.max_body_in_memory = 1024; // 超过 1KB 自动写临时文件
 parse_opts.temp_directory = "/tmp/async_uv_parser";
 parse_opts.max_feed_chunk_size = 64 * 1024; // 大块输入分片解析
@@ -481,7 +481,7 @@ parse_opts.yield_every_chunks = 8; // 每处理若干分片让出一次执行权
 // 2) 高吞吐/大包优先：max_feed_chunk_size=128KB~512KB, yield_every_chunks=8~32
 // 3) 默认平衡值：max_feed_chunk_size=64KB, yield_every_chunks=8
 
-async_uv::http::HttpParser big_parser(async_uv::http::ParseMode::response, parse_opts);
+flux::http::HttpParser big_parser(flux::http::ParseMode::response, parse_opts);
 co_await big_parser.feed(raw_http_data);
 if (auto msg = co_await big_parser.next_message(); msg && msg->body_in_file()) {
     auto tmp = msg->body_file_path();
@@ -508,7 +508,7 @@ For example, with modern JSON (`nlohmann::json`) in application code:
 ```cpp
 #include <nlohmann/json.hpp>
 
-class NlohmannJsonCodec : public async_uv::http::JsonCodec {
+class NlohmannJsonCodec : public flux::http::JsonCodec {
 public:
     std::string serialize(const void* value, const std::type_info& type) const override {
         if (type == typeid(std::map<std::string, std::string>)) {
@@ -527,15 +527,15 @@ public:
     }
 };
 
-class MyLoggingInterceptor : public async_uv::http::Interceptor {
+class MyLoggingInterceptor : public flux::http::Interceptor {
 public:
-    void on_request(async_uv::http::Request& request) const override {
+    void on_request(flux::http::Request& request) const override {
         request.headers.push_back({"X-Trace-Source", "demo"});
     }
 };
 
-auto runtime = co_await async_uv::get_current_runtime();
-auto client = async_uv::http::Client::build()
+auto runtime = co_await flux::get_current_runtime();
+auto client = flux::http::Client::build()
     .runtime(*runtime)
     .json_codec(std::make_shared<NlohmannJsonCodec>())
     .interceptor(std::make_shared<MyLoggingInterceptor>())
@@ -550,17 +550,17 @@ Request/response format options:
 
 ### Runtime
 
-`async_uv::Runtime` owns a `libuv` loop and also serves as an `async_simple::Executor`.
+`flux::Runtime` owns a `libuv` loop and also serves as an `async_simple::Executor`.
 
 ```cpp
-async_uv::Runtime runtime;
+flux::Runtime runtime;
 runtime.block_on(my_task());
 ```
 
 You can optionally set the `libuv` worker threadpool size when creating a runtime:
 
 ```cpp
-async_uv::Runtime runtime(async_uv::Runtime::build().uv_threadpool_size(8));
+flux::Runtime runtime(flux::Runtime::build().uv_threadpool_size(8));
 ```
 
 `UV_THREADPOOL_SIZE` is process-wide in `libuv`, so the configured value must stay consistent
@@ -580,7 +580,7 @@ You can register a process-wide trace hook for lightweight runtime signals:
 
 auto mailbox_events = std::make_shared<std::atomic_int>(0);
 
-async_uv::set_trace_hook([mailbox_events](const async_uv::TraceEvent& event) {
+flux::set_trace_hook([mailbox_events](const flux::TraceEvent& event) {
     if (std::string_view(event.category) == "mailbox") {
         mailbox_events->fetch_add(1, std::memory_order_relaxed);
     }
@@ -592,10 +592,10 @@ async_uv::set_trace_hook([mailbox_events](const async_uv::TraceEvent& event) {
 
 // ... run async work ...
 
-async_uv::reset_trace_hook();
+flux::reset_trace_hook();
 ```
 
-Use `async_uv::reset_trace_hook()` to clear it. Hook callbacks should stay lightweight and
+Use `flux::reset_trace_hook()` to clear it. Hook callbacks should stay lightweight and
 non-blocking.
 
 ### Stable Event Names
@@ -638,8 +638,8 @@ Internal operations install cancellation handlers with operation-local `Slot` ob
 `TaskScope` is the main structured-concurrency primitive.
 
 ```cpp
-auto value = co_await async_uv::with_task_scope(
-    [](async_uv::TaskScope& scope) -> async_uv::Task<int> {
+auto value = co_await flux::with_task_scope(
+    [](flux::TaskScope& scope) -> flux::Task<int> {
         auto [a, b] = co_await scope.all(task_a(), task_b());
         auto fastest = co_await scope.any_success(task_c(), task_d(), task_e());
         co_return a + b + fastest;
@@ -724,10 +724,10 @@ Available stream sources include:
 `Mailbox<T>` is move-only-message only, and it can optionally be bounded:
 
 ```cpp
-async_uv::MailboxOptions options;
+flux::MailboxOptions options;
 options.max_buffered_messages = 1024;
-options.overflow_policy = async_uv::MailboxOptions::OverflowPolicy::reject_new;
-auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<MyMessage>>::create(options);
+options.overflow_policy = flux::MailboxOptions::OverflowPolicy::reject_new;
+auto mailbox = co_await flux::Mailbox<std::unique_ptr<MyMessage>>::create(options);
 ```
 
 Overflow policy:
@@ -759,12 +759,12 @@ bool queued_sync = sender.sync_send_for(std::make_unique<MyMessage>(), 50ms);
 
 ## TLS BIO Interface
 
-`async_uv` does not implement TLS protocol internals. It exposes a BIO-style interface so
+`flux` does not implement TLS protocol internals. It exposes a BIO-style interface so
 you can plug an external TLS engine:
 
-- `async_uv::TlsBio`
-- `async_uv::TlsBioResult`
-- `async_uv::TlsBioStatus`
+- `flux::TlsBio`
+- `flux::TlsBioResult`
+- `flux::TlsBioStatus`
 
 Typical usage:
 
@@ -774,14 +774,14 @@ Typical usage:
 4. feed plain bytes with `write_plain(...)`
 5. pull plain bytes with `read_plain(...)`
 
-`tests/async_uv_tls_bio_test` uses mbedTLS as a lightweight reference implementation.
+`tests/flux_trace_test` uses mbedTLS as a lightweight reference implementation.
 
 ## File Watcher
 
 `FsWatcher` wraps Linux `inotify` and provides filesystem change events as task/stream APIs.
 
 ```cpp
-auto watcher = co_await async_uv::FsWatcher::watch("/tmp/demo.txt");
+auto watcher = co_await flux::FsWatcher::watch("/tmp/demo.txt");
 
 auto event = co_await watcher.next_for(std::chrono::milliseconds(500));
 if (event && event->ok() && event->modified()) {
@@ -789,7 +789,7 @@ if (event && event->ok() && event->modified()) {
 }
 ```
 
-`tests/async_uv_fs_watch_test` validates `FsWatcher` behavior.
+`tests/flux_fs_watch_test` validates `FsWatcher` behavior.
 
 ## Behavior Contracts
 
@@ -806,14 +806,14 @@ if (event && event->ok() && event->modified()) {
 ### File IO
 
 ```cpp
-co_await async_uv::Fs::write_file("demo.txt", "hello\n");
-auto text = co_await async_uv::Fs::read_file_for("demo.txt", std::chrono::milliseconds(50));
+co_await flux::Fs::write_file("demo.txt", "hello\n");
+auto text = co_await flux::Fs::read_file_for("demo.txt", std::chrono::milliseconds(50));
 ```
 
 ### TCP
 
 ```cpp
-auto client = co_await async_uv::TcpSocket::connect_for(
+auto client = co_await flux::TcpSocket::connect_for(
     "127.0.0.1", 8080, std::chrono::seconds(1));
 co_await client.send_all("ping");
 
@@ -827,8 +827,8 @@ while (auto chunk = co_await chunks.next()) {
 ### UDP
 
 ```cpp
-auto socket = co_await async_uv::UdpSocket::connect_for(
-    async_uv::SocketAddress::ipv4("127.0.0.1", 9000), std::chrono::seconds(1));
+auto socket = co_await flux::UdpSocket::connect_for(
+    flux::SocketAddress::ipv4("127.0.0.1", 9000), std::chrono::seconds(1));
 co_await socket.send("ping");
 auto reply = co_await socket.receive_for(std::chrono::seconds(1));
 ```
@@ -836,9 +836,9 @@ auto reply = co_await socket.receive_for(std::chrono::seconds(1));
 ### Scope
 
 ```cpp
-auto result = co_await async_uv::with_task_scope(
-    [](async_uv::TaskScope& scope) -> async_uv::Task<int> {
-        std::vector<async_uv::Task<int>> tasks;
+auto result = co_await flux::with_task_scope(
+    [](flux::TaskScope& scope) -> flux::Task<int> {
+        std::vector<flux::Task<int>> tasks;
         tasks.push_back(fetch_a());
         tasks.push_back(fetch_b());
 
@@ -853,7 +853,7 @@ auto result = co_await async_uv::with_task_scope(
 `Mailbox<T>` requires move-only `T` (non-copyable), so sending always transfers ownership.
 
 ```cpp
-auto mailbox = co_await async_uv::Mailbox<std::unique_ptr<int>>::create();
+auto mailbox = co_await flux::Mailbox<std::unique_ptr<int>>::create();
 auto sender = mailbox.sender();
 sender.send(std::make_unique<int>(42));
 sender.close();
@@ -870,7 +870,7 @@ while (auto value = co_await stream.next()) {
 Run:
 
 ```bash
-build/async_uv_demo
+build/flux_demo
 ```
 
 The demo covers:
@@ -888,14 +888,14 @@ The demo covers:
 Main test binaries:
 
 ```bash
-build/async_uv_smoke_test
-build/async_uv_scope_test
-build/async_uv_constraints_test
-build/async_uv_tls_bio_test
-build/async_uv_fs_watch_test
+build/flux_smoke_test
+build/flux_scope_test
+build/flux_constraints_test
+build/flux_trace_test
+build/flux_fs_watch_test
 ```
 
-`async_uv_smoke_test` focuses on:
+`flux_smoke_test` focuses on:
 
 - filesystem APIs
 - TCP and UDP flows
@@ -903,7 +903,7 @@ build/async_uv_fs_watch_test
 - cancellation
 - mailbox and watcher behavior
 
-`async_uv_scope_test` focuses on:
+`flux_scope_test` focuses on:
 
 - scope lifecycle
 - `spawn_blocking`
@@ -911,17 +911,17 @@ build/async_uv_fs_watch_test
 - timeout behavior inside scopes
 - RAII cleanup
 
-`async_uv_constraints_test` focuses on:
+`flux_constraints_test` focuses on:
 
 - move-only mailbox concept constraints
 - compile-time guardrails (including `try_compile` rejection for `Mailbox<int>`)
 
-`async_uv_tls_bio_test` focuses on:
+`flux_trace_test` focuses on:
 
 - TLS BIO interface contract
 - mbedTLS-based in-memory client/server handshake and encrypted payload exchange
 
-`async_uv_fs_watch_test` focuses on:
+`flux_fs_watch_test` focuses on:
 
 - `FsWatcher` change events (`modified`, `renamed`, `removed`)
 - filesystem change observation on native Linux paths
