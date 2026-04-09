@@ -4,10 +4,10 @@
 #include <fstream>
 #include <string>
 
-#include "async_uv/runtime.h"
-#include "async_uv_layer2/error.h"
-#include "async_uv_layer2/to_string.h"
-#include "async_uv_ws/ws.h"
+#include "flux/runtime.h"
+#include "flux_layer2/error.h"
+#include "flux_layer2/to_string.h"
+#include "flux_ws/ws.h"
 
 namespace {
 
@@ -69,8 +69,8 @@ void write_text_file(const std::filesystem::path &path, const std::string &text)
     assert(out.good());
 }
 
-async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
-    auto server = async_uv::ws::Server::create({
+flux::Task<void> run_plain_ws(flux::Runtime &runtime) {
+    auto server = flux::ws::Server::create({
         .runtime = &runtime,
         .host = "127.0.0.1",
         .port = 0,
@@ -80,7 +80,7 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
     assert(server.started());
     assert(server.port() > 0);
 
-    auto client = async_uv::ws::Client::create({
+    auto client = flux::ws::Client::create({
         .runtime = &runtime,
         .address = "127.0.0.1",
         .port = server.port(),
@@ -92,18 +92,18 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
 
     auto server_open = co_await server.next();
     assert(server_open.has_value());
-    assert(server_open->kind == async_uv::ws::ServerEvent::Kind::open);
+    assert(server_open->kind == flux::ws::ServerEvent::Kind::open);
     const auto connection_id = server_open->connection_id;
 
     auto client_open = co_await client.next();
     assert(client_open.has_value());
-    assert(client_open->kind == async_uv::ws::Client::Event::Kind::open);
+    assert(client_open->kind == flux::ws::Client::Event::Kind::open);
 
-    assert(async_uv::layer2::to_string(async_uv::ws::MessageType::text) == "text");
+    assert(flux::layer2::to_string(flux::ws::MessageType::text) == "text");
 
     {
-        async_uv::ws::StreamChunk chunk;
-        chunk.type = async_uv::ws::MessageType::text;
+        flux::ws::StreamChunk chunk;
+        chunk.type = flux::ws::MessageType::text;
         chunk.payload = "hel";
         chunk.is_first_fragment = true;
         chunk.is_final_fragment = false;
@@ -111,8 +111,8 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
         assert(sent);
     }
     {
-        async_uv::ws::StreamChunk chunk;
-        chunk.type = async_uv::ws::MessageType::text;
+        flux::ws::StreamChunk chunk;
+        chunk.type = flux::ws::MessageType::text;
         chunk.payload = "lo";
         chunk.is_first_fragment = false;
         chunk.is_final_fragment = true;
@@ -122,7 +122,7 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
 
     auto server_msg_1 = co_await server.next();
     assert(server_msg_1.has_value());
-    assert(server_msg_1->kind == async_uv::ws::ServerEvent::Kind::message);
+    assert(server_msg_1->kind == flux::ws::ServerEvent::Kind::message);
     assert(server_msg_1->connection_id == connection_id);
     assert(server_msg_1->message.has_value());
     assert(server_msg_1->message->payload == "hel");
@@ -130,15 +130,15 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
 
     auto server_msg_2 = co_await server.next();
     assert(server_msg_2.has_value());
-    assert(server_msg_2->kind == async_uv::ws::ServerEvent::Kind::message);
+    assert(server_msg_2->kind == flux::ws::ServerEvent::Kind::message);
     assert(server_msg_2->connection_id == connection_id);
     assert(server_msg_2->message.has_value());
     assert(server_msg_2->message->payload == "lo");
     assert(server_msg_2->message->is_final_fragment);
 
     {
-        async_uv::ws::StreamChunk chunk;
-        chunk.type = async_uv::ws::MessageType::binary;
+        flux::ws::StreamChunk chunk;
+        chunk.type = flux::ws::MessageType::binary;
         chunk.payload = "12";
         chunk.is_first_fragment = true;
         chunk.is_final_fragment = false;
@@ -146,8 +146,8 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
         assert(sent);
     }
     {
-        async_uv::ws::StreamChunk chunk;
-        chunk.type = async_uv::ws::MessageType::binary;
+        flux::ws::StreamChunk chunk;
+        chunk.type = flux::ws::MessageType::binary;
         chunk.payload = "34";
         chunk.is_first_fragment = false;
         chunk.is_final_fragment = true;
@@ -157,28 +157,28 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
 
     auto client_msg_1 = co_await client.next();
     assert(client_msg_1.has_value());
-    assert(client_msg_1->kind == async_uv::ws::Client::Event::Kind::message);
+    assert(client_msg_1->kind == flux::ws::Client::Event::Kind::message);
     assert(client_msg_1->message.has_value());
     assert(client_msg_1->message->payload == "12");
 
     auto client_msg_2 = co_await client.next();
     assert(client_msg_2.has_value());
-    assert(client_msg_2->kind == async_uv::ws::Client::Event::Kind::message);
+    assert(client_msg_2->kind == flux::ws::Client::Event::Kind::message);
     assert(client_msg_2->message.has_value());
     assert(client_msg_2->message->payload == "34");
 
-    const auto text = async_uv::layer2::to_string(*client_msg_2->message);
+    const auto text = flux::layer2::to_string(*client_msg_2->message);
     assert(text.find("type=binary") != std::string::npos);
     assert(text.find("payload_size=2") != std::string::npos);
 
     co_await client.close(1000, "done");
     auto server_close = co_await server.next();
     assert(server_close.has_value());
-    assert(server_close->kind == async_uv::ws::ServerEvent::Kind::close);
+    assert(server_close->kind == flux::ws::ServerEvent::Kind::close);
 
     {
-        async_uv::ws::StreamChunk chunk;
-        chunk.type = async_uv::ws::MessageType::binary;
+        flux::ws::StreamChunk chunk;
+        chunk.type = flux::ws::MessageType::binary;
         chunk.payload = "payload";
         chunk.is_first_fragment = true;
         chunk.is_final_fragment = false;
@@ -190,15 +190,15 @@ async_uv::Task<void> run_plain_ws(async_uv::Runtime &runtime) {
     assert(!server.started());
 }
 
-async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
-    const auto temp = std::filesystem::temp_directory_path() / "async_uv_wss_test";
+flux::Task<void> run_wss(flux::Runtime &runtime) {
+    const auto temp = std::filesystem::temp_directory_path() / "flux_wss_test";
     std::filesystem::create_directories(temp);
     const auto cert_path = temp / "server.crt";
     const auto key_path = temp / "server.key";
     write_text_file(cert_path, kCertPem);
     write_text_file(key_path, kKeyPem);
 
-    auto server = async_uv::ws::Server::create({
+    auto server = flux::ws::Server::create({
         .runtime = &runtime,
         .host = "127.0.0.1",
         .port = 0,
@@ -210,7 +210,7 @@ async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
     assert(server.started());
     assert(server.port() > 0);
 
-    auto client = async_uv::ws::Client::create({
+    auto client = flux::ws::Client::create({
         .runtime = &runtime,
         .address = "127.0.0.1",
         .port = server.port(),
@@ -223,12 +223,12 @@ async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
     co_await client.connect();
     auto server_open = co_await server.next();
     assert(server_open.has_value());
-    assert(server_open->kind == async_uv::ws::ServerEvent::Kind::open);
+    assert(server_open->kind == flux::ws::ServerEvent::Kind::open);
     const auto connection_id = server_open->connection_id;
 
     auto client_open = co_await client.next();
     assert(client_open.has_value());
-    assert(client_open->kind == async_uv::ws::Client::Event::Kind::open);
+    assert(client_open->kind == flux::ws::Client::Event::Kind::open);
 
     {
         const bool sent = co_await client.send_text("wss-c2s");
@@ -236,7 +236,7 @@ async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
     }
     auto server_msg = co_await server.next();
     assert(server_msg.has_value());
-    assert(server_msg->kind == async_uv::ws::ServerEvent::Kind::message);
+    assert(server_msg->kind == flux::ws::ServerEvent::Kind::message);
     assert(server_msg->connection_id == connection_id);
     assert(server_msg->message.has_value());
     assert(server_msg->message->payload == "wss-c2s");
@@ -247,7 +247,7 @@ async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
     }
     auto client_msg = co_await client.next();
     assert(client_msg.has_value());
-    assert(client_msg->kind == async_uv::ws::Client::Event::Kind::message);
+    assert(client_msg->kind == flux::ws::Client::Event::Kind::message);
     assert(client_msg->message.has_value());
     assert(client_msg->message->payload == "wss-s2c");
 
@@ -258,7 +258,7 @@ async_uv::Task<void> run_wss(async_uv::Runtime &runtime) {
 } // namespace
 
 int main() {
-    async_uv::Runtime runtime(async_uv::Runtime::build().name("async_uv_ws_test"));
+    flux::Runtime runtime(flux::Runtime::build().name("flux_ws_test"));
     runtime.block_on(run_plain_ws(runtime));
     runtime.block_on(run_wss(runtime));
     return 0;

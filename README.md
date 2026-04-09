@@ -1,11 +1,11 @@
 # flux
 
-`flux` is a C++23 async IO library built on top of `libuv` and `async_simple`.
+`flux` is a C++23 async IO library built on top of `stdexec` and Asio schedulers.
 
 It aims for:
 
 - sync-style coroutine APIs for file, timer, TCP, UDP, watcher, and mailbox work
-- a `libuv`-backed `async_simple::Executor`
+- a `Runtime` with dedicated IO/blocking executors and P2300 scheduler integration
 - unified cancellation and timeout handling
 - structured concurrency with RAII cleanup
 - pluggable TLS BIO abstraction (engine provided by external SSL library)
@@ -44,13 +44,13 @@ If you add the repository root instead, examples and tests are controlled by:
 - `FLUX_BUILD_EXAMPLES`
 - `FLUX_BUILD_TESTS`
 - `FLUX_USE_MIMALLOC`
-- `FLUX_ENABLE_LAYER2` (build layer2 targets: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws`)
+- `FLUX_ENABLE_LAYER2` (build layer2 targets: `flux_http` / `flux_sql` / `flux_redis` / `flux_ws`)
 - `FLUX_ENABLE_LAYER3` (build layer3 target; automatically enables layer2)
 
 Layer relationship:
 
 - layer1: `flux` (base IO runtime)
-- layer2: `async_uv_http` / `async_uv_sql` / `async_uv_redis` / `async_uv_ws` (depend on layer1)
+- layer2: `flux_http` / `flux_sql` / `flux_redis` / `flux_ws` (depend on layer1)
 - layer3: `async_uv_layer3` (depends on layer2, and transitively layer1)
 
 Layer2 boundary (scope):
@@ -69,13 +69,13 @@ Layer2 stable API checklist:
 
 Layer2 header index (for layer3 integration):
 
-- HTTP client/parser: `layer2/include/async_uv_http/http.h`, `layer2/include/async_uv_http/parser.h`
-- HTTP server primitives: `layer2/include/async_uv_http/server.h`
-- SQL: `layer2/include/async_uv_sql/sql.h`
-- Redis: `layer2/include/async_uv_redis/redis.h`
-- WebSocket: `layer2/include/async_uv_ws/ws.h`
-- unified error mapping: `layer2/include/async_uv_layer2/error.h`
-- logging helper (`to_string`): `layer2/include/async_uv_layer2/to_string.h`
+- HTTP client/parser: `layer2/include/flux_http/http.h`, `layer2/include/flux_http/parser.h`
+- HTTP server primitives: `layer2/include/flux_http/server.h`
+- SQL: `layer2/include/flux_sql/sql.h`
+- Redis: `layer2/include/flux_redis/redis.h`
+- WebSocket: `layer2/include/flux_ws/ws.h`
+- unified error mapping: `layer2/include/flux_layer2/error.h`
+- logging helper (`to_string`): `layer2/include/flux_layer2/to_string.h`
 
 Layer2 integration reading order (recommended):
 
@@ -95,18 +95,17 @@ cmake --build build
 Then link:
 
 ```cmake
-target_link_libraries(my_app PRIVATE async_uv_http)
-# optionally add: async_uv_sql async_uv_redis async_uv_ws
+target_link_libraries(my_app PRIVATE flux_http)
+# optionally add: flux_sql flux_redis flux_ws
 ```
 
-`async_uv_http` uses libcurl. OpenSSL backend is preferred. If OpenSSL is unavailable,
-the build falls back to mbedTLS when building curl from source.
+`flux_http` uses Boost.Beast + Boost.URL (with Asio transport). TLS uses OpenSSL.
 
 ## Core Pieces
 
 ### Layer2 HTTP
 
-`async_uv_http` provides a minimal async API similar to reqwest-style ergonomics:
+`flux_http` provides a minimal async API similar to reqwest-style ergonomics:
 
 ```cpp
 auto runtime = co_await flux::get_current_runtime();
@@ -185,13 +184,13 @@ Additional HTTP features:
 - proxy options (`ProxyOptions`) and cookie jar options (`CookieJarOptions`)
 - streaming response chunks via `stream_response(...)` / `on_response_chunk(...)`
 - transport error kind (`TransportErrorKind`) for finer error handling
-- llhttp parser (`HttpParser` + `HttpMessage`) for incremental raw HTTP parsing
+- Beast-based parser (`HttpParser` + `HttpMessage`) for incremental raw HTTP parsing
 
 Layer2 SQL abstraction (`flux::sql`) currently provides:
 
 - unified async API for SQLite / MySQL / PostgreSQL (driver availability depends on source dependency build)
-- `Connection::open/query/execute/close/cancel` coroutine interfaces
-- parameterized query API (`query/execute` overloads with `std::vector<SqlParam>`, supports string/int/double/bool/null)
+- `Connection::open/query/close/cancel` coroutine interfaces
+- parameterized query API (`query` overloads with `std::vector<SqlParam>`, supports string/int/double/bool/null)
 - basic transaction helpers (`begin/commit/rollback`)
 - query timeout options (`ConnectionOptions::query_timeout_ms`, `QueryOptions::timeout_ms`)
 - connection pool (`ConnectionPool`) with configurable pool size / acquire timeout / max lifetime / health check SQL
@@ -208,9 +207,9 @@ auto db_opts = flux::sql::ConnectionOptions::builder()
 
 flux::sql::Connection db;
 co_await db.open(db_opts);
-co_await db.execute("CREATE TABLE demo(id INTEGER PRIMARY KEY, name TEXT)");
+co_await db.query("CREATE TABLE demo(id INTEGER PRIMARY KEY, name TEXT)");
 co_await db.begin();
-co_await db.execute("INSERT INTO demo(name) VALUES(?)", {"alice"});
+co_await db.query("INSERT INTO demo(name) VALUES(?)", {"alice"});
 co_await db.commit();
 
 auto rows = co_await db.query("SELECT id, name FROM demo ORDER BY id");
@@ -239,16 +238,16 @@ co_await db.close();
 
 SQL test toggles:
 
-- `ASYNC_UV_SQL_TEST_POSTGRES=1` enables postgres integration checks
-- `ASYNC_UV_SQL_TEST_MYSQL=1` enables mysql integration checks
-- `ASYNC_UV_SQL_PG_*` / `ASYNC_UV_SQL_MY_*` can override default host/port/user/password/database
+- `FLUX_SQL_TEST_POSTGRES=1` enables postgres integration checks
+- `FLUX_SQL_TEST_MYSQL=1` enables mysql integration checks
+- `FLUX_SQL_PG_*` / `FLUX_SQL_MY_*` can override default host/port/user/password/database
 
 Layer2 Redis abstraction (`flux::redis`) currently provides:
 
-- coroutine-based `Client::open/command/execute/close` API
+- coroutine-based `Client::open/command/close` API
 - Redis command parameter replacement using `?` placeholders with `std::vector<RedisParam>`
-- official hiredis source dependency with fd watcher driven nonblocking socket flow
-- TLS/SSL support via hiredis SSL (`tls_enabled`, CA/cert/key/server_name, verify mode)
+- Boost.Redis backend with Asio transport
+- TLS/SSL support via OpenSSL (`tls_enabled`, CA/cert/key/server_name, verify mode)
 - optional auth/select on connect (`user`/`password`/`db`)
 - connection pool (`ConnectionPool`) with configurable pool size / acquire timeout / max lifetime / health check command
 
@@ -280,14 +279,14 @@ co_await redis_pool.close();
 
 Redis test toggles:
 
-- `ASYNC_UV_TEST_REDIS=1` enables redis integration checks
-- `ASYNC_UV_REDIS_HOST` / `ASYNC_UV_REDIS_PORT` / `ASYNC_UV_REDIS_USER` / `ASYNC_UV_REDIS_PASSWORD` / `ASYNC_UV_REDIS_DB`
-- TLS env (optional): `ASYNC_UV_REDIS_TLS=1`, `ASYNC_UV_REDIS_TLS_VERIFY_PEER=0|1`, `ASYNC_UV_REDIS_TLS_CA_CERT`, `ASYNC_UV_REDIS_TLS_CA_DIR`, `ASYNC_UV_REDIS_TLS_CERT`, `ASYNC_UV_REDIS_TLS_KEY`, `ASYNC_UV_REDIS_TLS_SERVER_NAME`
+- `FLUX_TEST_REDIS=1` enables redis integration checks
+- `FLUX_REDIS_HOST` / `FLUX_REDIS_PORT` / `FLUX_REDIS_USER` / `FLUX_REDIS_PASSWORD` / `FLUX_REDIS_DB`
+- TLS env (optional): `FLUX_REDIS_TLS=1`, `FLUX_REDIS_TLS_VERIFY_PEER=0|1`, `FLUX_REDIS_TLS_CA_CERT`, `FLUX_REDIS_TLS_CA_DIR`, `FLUX_REDIS_TLS_CERT`, `FLUX_REDIS_TLS_KEY`, `FLUX_REDIS_TLS_SERVER_NAME`
 
 Layer2 WebSocket abstraction (`flux::ws`) currently provides:
 
 - coroutine-style `Client::open/close/send_text/send_binary/next_message/next_message_for/messages`
-- ws and wss URL support (TLS handled by IXWebSocket + OpenSSL backend)
+- ws and wss URL support (TLS handled by Beast WebSocket + OpenSSL backend)
 - callback-to-coroutine bridging via mailbox stream (`next_message` and `messages().next()` awaitable pull model)
 - builder-style options (`ClientOptions::builder()`) for timeout/ping/reconnect/TLS fields
 - built-in trace events: `layer2_ws/open_*`, `layer2_ws/send_*`, `layer2_ws/recv_*`, `layer2_ws/close_*`
@@ -339,9 +338,9 @@ while (auto message = co_await stream.next()) {
 }
 ```
 
-WebSocket dependency toggle:
+WebSocket dependency backend:
 
-- `ASYNC_UV_LAYER2_FETCH_IXWEBSOCKET=ON|OFF` (default ON)
+- Boost.Beast WebSocket (default, source-built Boost headers)
 
 Layer2 unified error mapping (`flux::layer2::ErrorKind`):
 
@@ -351,7 +350,7 @@ Layer2 unified error mapping (`flux::layer2::ErrorKind`):
 - map WebSocket errors by `flux::layer2::to_error_kind(flux::ws::WsErrorKind)`
 
 ```cpp
-#include "async_uv_layer2/error.h"
+#include "flux_layer2/error.h"
 
 try {
     co_await redis.command("GET ?", {"demo:key"});
@@ -366,7 +365,7 @@ try {
 Common `to_string` helpers for logging (`flux::layer2::to_string`):
 
 ```cpp
-#include "async_uv_layer2/to_string.h"
+#include "flux_layer2/to_string.h"
 
 try {
     co_await ws.send_text("hello");
@@ -434,7 +433,7 @@ proxy.url = "http://127.0.0.1:7890";
 
 flux::http::CookieJarOptions cookie;
 cookie.enabled = true;
-cookie.file_path = "/tmp/async_uv_cookie.jar";
+cookie.file_path = "/tmp/flux_cookie.jar";
 
 std::size_t streamed = 0;
 auto text_body = co_await client.get("https://example.com")
@@ -472,7 +471,7 @@ auto all = co_await flux::http::parse_all_messages(
 // 大体积响应体可自动落盘（例如 multipart/form-data 或大文件）
 flux::http::ParserOptions parse_opts;
 parse_opts.max_body_in_memory = 1024; // 超过 1KB 自动写临时文件
-parse_opts.temp_directory = "/tmp/async_uv_parser";
+parse_opts.temp_directory = "/tmp/flux_parser";
 parse_opts.max_feed_chunk_size = 64 * 1024; // 大块输入分片解析
 parse_opts.yield_every_chunks = 8; // 每处理若干分片让出一次执行权
 
@@ -550,21 +549,23 @@ Request/response format options:
 
 ### Runtime
 
-`flux::Runtime` owns a `libuv` loop and also serves as an `async_simple::Executor`.
+`flux::Runtime` owns Asio IO/blocking thread pools and exposes executors + schedulers.
 
 ```cpp
 flux::Runtime runtime;
 runtime.block_on(my_task());
 ```
 
-You can optionally set the `libuv` worker threadpool size when creating a runtime:
+You can optionally set IO/blocking thread counts when creating a runtime:
 
 ```cpp
-flux::Runtime runtime(flux::Runtime::build().uv_threadpool_size(8));
+flux::Runtime runtime(
+    flux::Runtime::build()
+        .io_threads(4)
+        .blocking_threads(8));
 ```
 
-`UV_THREADPOOL_SIZE` is process-wide in `libuv`, so the configured value must stay consistent
-across runtimes in the same process.
+`io_threads` and `blocking_threads` are runtime-local options.
 
 `Runtime` also exposes executor stats through `runtime.stat()`, which can be used to sample
 pending task count.
@@ -617,11 +618,11 @@ Current built-in trace events (stable names in current version):
 | `timer` | `wait_start` / `wait_fired` / `wait_canceled` / `wait_error` / `close` | timer lifecycle | due ms or `0` |
 | `watch` | `fs_event_start` / `fs_event` / `fs_event_stop` / `fs_poll_start` / `fs_poll` / `fs_poll_stop` (+ `_error`) | watcher lifecycle | event flags or `0` |
 | `fd` | `poll_start` / `poll_event` / `poll_stop` (+ `_error`) | fd/socket readiness watcher lifecycle | polled event flags |
-| `fs` | `<uv_fs_* api name>` | fs request finished (success/error) | `uv_fs_t.result` snapshot |
+| `fs` | `<fs api name>` | fs request finished (success/error) | operation result snapshot |
 
 ### Cancellation
 
-Cancellation is built on `async_simple::Signal` and `Slot`.
+Cancellation is built on `stdexec::inplace_stop_source` and stop tokens.
 
 Public helpers:
 
@@ -631,7 +632,7 @@ Public helpers:
 - `with_deadline(...)`
 - `get_current_signal()`
 
-Internal operations install cancellation handlers with operation-local `Slot` objects, so they do not keep raw parent `Slot*` pointers across async boundaries.
+Internal operations install operation-local stop callbacks and propagate stop tokens across async boundaries.
 
 ### Structured Concurrency
 

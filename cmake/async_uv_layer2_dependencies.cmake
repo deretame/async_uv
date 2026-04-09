@@ -4,143 +4,106 @@ include(FetchContent)
 
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
 
-option(ASYNC_UV_LAYER2_FETCH_CURL "Fetch curl from source when system curl is unavailable" ON)
-option(ASYNC_UV_LAYER2_FETCH_LLHTTP "Fetch llhttp from source when unavailable" ON)
-option(ASYNC_UV_LAYER2_FETCH_BOOST "Fetch boost from source when unavailable" ON)
+option(FLUX_LAYER2_PREFER_SOURCE_DEPS
+       "Prefer building layer2 dependencies from source (except OpenSSL)"
+       ON)
+option(FLUX_LAYER2_FETCH_BOOST
+       "Fetch Boost headers from source when system Boost is unavailable"
+       ON)
 
-find_package(OpenSSL QUIET)
-find_package(CURL QUIET)
+if(NOT TARGET Boost::headers AND NOT FLUX_LAYER2_PREFER_SOURCE_DEPS)
+    find_package(Boost QUIET)
+endif()
 
-if(NOT TARGET CURL::libcurl)
-    if(NOT ASYNC_UV_LAYER2_FETCH_CURL)
-        message(FATAL_ERROR "layer2 requires CURL::libcurl. Install system libcurl or set ASYNC_UV_LAYER2_FETCH_CURL=ON")
-    endif()
+if(NOT TARGET Boost::headers)
+    if(Boost_FOUND AND Boost_INCLUDE_DIRS)
+        add_library(flux_layer2_boost_headers INTERFACE)
+        target_include_directories(flux_layer2_boost_headers INTERFACE ${Boost_INCLUDE_DIRS})
+        add_library(Boost::headers ALIAS flux_layer2_boost_headers)
+    elseif(FLUX_LAYER2_FETCH_BOOST)
+        FetchContent_Declare(
+            flux_boost_headers
+            URL https://archives.boost.io/release/1.87.0/source/boost_1_87_0.tar.gz
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        )
+        FetchContent_MakeAvailable(flux_boost_headers)
 
-    set(BUILD_CURL_EXE OFF CACHE BOOL "" FORCE)
-    set(BUILD_LIBCURL_DOCS OFF CACHE BOOL "" FORCE)
-    set(BUILD_MISC_DOCS OFF CACHE BOOL "" FORCE)
-    set(CURL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
-    set(CURL_ENABLE_EXPORT_TARGET OFF CACHE BOOL "" FORCE)
-    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    set(CURL_USE_SCHANNEL OFF CACHE BOOL "" FORCE)
-    set(CURL_USE_MBEDTLS OFF CACHE BOOL "" FORCE)
-    set(CURL_USE_LIBPSL OFF CACHE BOOL "" FORCE)
-    set(CURL_USE_LIBSSH2 OFF CACHE BOOL "" FORCE)
-    set(USE_LIBIDN2 OFF CACHE BOOL "" FORCE)
-    set(USE_NGHTTP2 OFF CACHE BOOL "" FORCE)
-    set(USE_LIBPSL OFF CACHE BOOL "" FORCE)
-    set(CURL_ZLIB OFF CACHE BOOL "" FORCE)
-    set(CURL_BROTLI OFF CACHE BOOL "" FORCE)
-    set(CURL_ZSTD OFF CACHE BOOL "" FORCE)
-    set(HTTP_ONLY ON CACHE BOOL "" FORCE)
-
-    set(ASYNC_UV_LAYER2_USE_MBEDTLS OFF)
-
-    if(OpenSSL_FOUND)
-        set(CURL_USE_OPENSSL ON CACHE BOOL "" FORCE)
+        add_library(flux_layer2_boost_headers INTERFACE)
+        target_include_directories(
+            flux_layer2_boost_headers INTERFACE ${flux_boost_headers_SOURCE_DIR})
+        target_compile_definitions(
+            flux_layer2_boost_headers INTERFACE BOOST_ERROR_CODE_HEADER_ONLY=1)
+        add_library(Boost::headers ALIAS flux_layer2_boost_headers)
     else()
-        message(WARNING "OpenSSL not found, fallback to mbedTLS backend for curl")
-        set(CURL_USE_OPENSSL OFF CACHE BOOL "" FORCE)
-        set(CURL_USE_MBEDTLS ON CACHE BOOL "" FORCE)
-        set(ASYNC_UV_LAYER2_USE_MBEDTLS ON)
-
-        if(NOT TARGET mbedtls)
-            set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
-            set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-            set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-            set(USE_SHARED_MBEDTLS_LIBRARY OFF CACHE BOOL "" FORCE)
-            set(USE_STATIC_MBEDTLS_LIBRARY ON CACHE BOOL "" FORCE)
-
-            FetchContent_Declare(
-                mbedtls
-                URL https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/v3.6.3
-                DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-            )
-
-            FetchContent_MakeAvailable(mbedtls)
-        endif()
-
-        set(MBEDTLS_INCLUDE_DIR "${mbedtls_SOURCE_DIR}/include" CACHE PATH "" FORCE)
-        set(MBEDTLS_LIBRARY mbedtls CACHE STRING "" FORCE)
-        set(MBEDX509_LIBRARY mbedx509 CACHE STRING "" FORCE)
-        set(MBEDCRYPTO_LIBRARY mbedcrypto CACHE STRING "" FORCE)
-    endif()
-
-    FetchContent_Declare(
-        curl
-        URL https://codeload.github.com/curl/curl/tar.gz/refs/tags/curl-8_13_0
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-    )
-
-    FetchContent_MakeAvailable(curl)
-
-    if(TARGET libcurl AND NOT TARGET CURL::libcurl)
-        add_library(CURL::libcurl ALIAS libcurl)
+        message(FATAL_ERROR
+            "layer2 requires Boost headers (beast/url/mysql/redis); "
+            "install Boost or set FLUX_LAYER2_FETCH_BOOST=ON")
     endif()
 endif()
 
-if(NOT TARGET llhttp::llhttp)
-    if(NOT ASYNC_UV_LAYER2_FETCH_LLHTTP)
-        message(FATAL_ERROR "layer2 requires llhttp. Install llhttp or set ASYNC_UV_LAYER2_FETCH_LLHTTP=ON")
-    endif()
-
-    FetchContent_Declare(
-        llhttp
-        URL https://codeload.github.com/nodejs/llhttp/tar.gz/refs/tags/release/v9.2.1
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-    )
-
-    FetchContent_MakeAvailable(llhttp)
-
-    if(TARGET llhttp_static AND NOT TARGET llhttp::llhttp)
-        add_library(llhttp::llhttp ALIAS llhttp_static)
-    elseif(TARGET llhttp AND NOT TARGET llhttp::llhttp)
-        add_library(llhttp::llhttp ALIAS llhttp)
-    elseif(TARGET llhttp_shared AND NOT TARGET llhttp::llhttp)
-        add_library(llhttp::llhttp ALIAS llhttp_shared)
-    endif()
-
-    if(NOT TARGET llhttp::llhttp)
-        if(EXISTS "${llhttp_SOURCE_DIR}/src/api.c" AND EXISTS "${llhttp_SOURCE_DIR}/include/llhttp.h")
-            add_library(async_uv_llhttp_fallback STATIC
-                ${llhttp_SOURCE_DIR}/src/api.c
-                ${llhttp_SOURCE_DIR}/src/http.c
-                ${llhttp_SOURCE_DIR}/src/llhttp.c
-            )
-            target_include_directories(async_uv_llhttp_fallback PUBLIC
-                ${llhttp_SOURCE_DIR}/include
-            )
-            add_library(llhttp::llhttp ALIAS async_uv_llhttp_fallback)
-        endif()
-    endif()
-
-    if(NOT TARGET llhttp::llhttp)
-        message(FATAL_ERROR "Failed to provide llhttp::llhttp target")
+set(FLUX_LAYER2_BOOST_ROOT "")
+if(DEFINED flux_boost_headers_SOURCE_DIR AND
+   EXISTS "${flux_boost_headers_SOURCE_DIR}/boost/version.hpp")
+    set(FLUX_LAYER2_BOOST_ROOT "${flux_boost_headers_SOURCE_DIR}")
+elseif(TARGET Boost::headers)
+    get_target_property(_flux_layer2_boost_header_dirs Boost::headers INTERFACE_INCLUDE_DIRECTORIES)
+    if(_flux_layer2_boost_header_dirs)
+        foreach(_flux_layer2_boost_dir IN LISTS _flux_layer2_boost_header_dirs)
+            if(EXISTS "${_flux_layer2_boost_dir}/boost/version.hpp")
+                set(FLUX_LAYER2_BOOST_ROOT "${_flux_layer2_boost_dir}")
+                break()
+            endif()
+        endforeach()
     endif()
 endif()
 
-option(ASYNC_UV_LAYER2_FETCH_ADA "Fetch ada-url from source when unavailable" ON)
+if(NOT TARGET Boost::url)
+    if(FLUX_LAYER2_BOOST_ROOT AND
+       EXISTS "${FLUX_LAYER2_BOOST_ROOT}/libs/url/src")
+        file(
+            GLOB_RECURSE FLUX_LAYER2_BOOST_URL_SOURCES
+            CONFIGURE_DEPENDS
+            "${FLUX_LAYER2_BOOST_ROOT}/libs/url/src/*.cpp")
 
-if(NOT TARGET ada::ada)
-    if(NOT ASYNC_UV_LAYER2_FETCH_ADA)
-        message(FATAL_ERROR "layer2 requires ada::ada. Install ada-url or set ASYNC_UV_LAYER2_FETCH_ADA=ON")
+        add_library(flux_layer2_boost_url STATIC ${FLUX_LAYER2_BOOST_URL_SOURCES})
+        target_include_directories(flux_layer2_boost_url PUBLIC ${FLUX_LAYER2_BOOST_ROOT})
+        target_link_libraries(flux_layer2_boost_url PUBLIC Boost::headers)
+        target_compile_definitions(
+            flux_layer2_boost_url
+            PUBLIC BOOST_URL_NO_LIB=1 BOOST_URL_STATIC_LINK=1
+            PRIVATE BOOST_URL_SOURCE=1)
+        add_library(Boost::url ALIAS flux_layer2_boost_url)
+    else()
+        find_package(Boost QUIET COMPONENTS url)
+        if(NOT TARGET Boost::url)
+            message(FATAL_ERROR
+                "layer2 requires Boost.URL compiled library; "
+                "set FLUX_LAYER2_FETCH_BOOST=ON or install Boost::url")
+        endif()
     endif()
+endif()
 
-    FetchContent_Declare(
-        ada_url
-        URL https://codeload.github.com/ada-url/ada/tar.gz/refs/tags/v2.9.1
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-    )
+if(NOT TARGET Boost::charconv)
+    if(FLUX_LAYER2_BOOST_ROOT AND
+       EXISTS "${FLUX_LAYER2_BOOST_ROOT}/libs/charconv/src")
+        set(FLUX_LAYER2_BOOST_CHARCONV_SOURCES
+            "${FLUX_LAYER2_BOOST_ROOT}/libs/charconv/src/from_chars.cpp"
+            "${FLUX_LAYER2_BOOST_ROOT}/libs/charconv/src/to_chars.cpp")
 
-    FetchContent_MakeAvailable(ada_url)
-
-    if(NOT TARGET ada::ada)
-        if(EXISTS "${ada_url_SOURCE_DIR}/include")
-            add_library(ada::ada INTERFACE IMPORTED GLOBAL)
-            target_include_directories(ada::ada INTERFACE "${ada_url_SOURCE_DIR}/include")
-        else()
-            message(FATAL_ERROR "Failed to provide ada::ada target")
+        add_library(flux_layer2_boost_charconv STATIC ${FLUX_LAYER2_BOOST_CHARCONV_SOURCES})
+        target_include_directories(flux_layer2_boost_charconv PUBLIC ${FLUX_LAYER2_BOOST_ROOT})
+        target_link_libraries(flux_layer2_boost_charconv PUBLIC Boost::headers)
+        target_compile_definitions(
+            flux_layer2_boost_charconv
+            PUBLIC BOOST_CHARCONV_NO_LIB=1
+            PRIVATE BOOST_CHARCONV_SOURCE=1)
+        add_library(Boost::charconv ALIAS flux_layer2_boost_charconv)
+    else()
+        find_package(Boost QUIET COMPONENTS charconv)
+        if(NOT TARGET Boost::charconv)
+            message(FATAL_ERROR
+                "layer2 mysql requires Boost.Charconv; "
+                "set FLUX_LAYER2_FETCH_BOOST=ON or install Boost::charconv")
         endif()
     endif()
 endif()

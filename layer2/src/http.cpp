@@ -1,50 +1,43 @@
-#include "async_uv_http/http.h"
+#include "flux_http/http.h"
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 
-#include <curl/curl.h>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/system/error_code.hpp>
+#include <boost/url/encoding_opts.hpp>
+#include <boost/url/parse.hpp>
+#include <boost/url/pct_string_view.hpp>
+#include <boost/url/url.hpp>
+#include <openssl/ssl.h>
 
-#include "async_uv/fd.h"
-#include "async_uv/fs.h"
-#include "async_uv/message.h"
-#include "async_uv/once_cell.h"
-#include "async_uv/scope.h"
+#include "flux/fs.h"
 
-namespace async_uv::http {
+namespace flux::http {
 namespace {
 
-struct CurlInitState {
-    CURLcode code = CURLE_OK;
-};
-
-inline bool is_unreserved_char(unsigned char ch) {
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
-           ch == '-' || ch == '_' || ch == '.' || ch == '~';
-}
-
-void ensure_curl_global_init() {
-    static async_uv::OnceCell<CurlInitState> cell;
-    const auto &state = cell.get_or_init([]() {
-        CurlInitState init;
-        init.code = curl_global_init(CURL_GLOBAL_DEFAULT);
-        return init;
-    });
-
-    if (state.code != CURLE_OK) {
-        throw HttpError(
-            "curl_global_init failed", HttpErrorCode::curl_failure, static_cast<int>(state.code));
-    }
-}
+namespace beast = boost::beast;
+namespace beast_http = boost::beast::http;
+namespace beast_net = boost::asio;
+namespace beast_ssl = boost::asio::ssl;
+using BeastTcp = beast_net::ip::tcp;
 
 std::string trim(std::string value) {
     auto not_space = [](unsigned char ch) {
@@ -165,34 +158,64 @@ std::optional<std::string_view> content_type_for_request_format(RequestFormat fo
     return std::nullopt;
 }
 
-std::string percent_decode(std::string_view text) {
-    return ada::unicode::percent_decode(text, text.find('%'));
+std::string decode_component(std::string_view text, bool plus_as_space) {
+    boost::urls::encoding_opts opts;
+    opts.space_as_plus = plus_as_space;
+    const auto decoded_input = boost::urls::make_pct_string_view(text);
+    if (!decoded_input) {
+        std::string fallback(text);
+        if (plus_as_space) {
+            std::replace(fallback.begin(), fallback.end(), '+', ' ');
+        }
+        return fallback;
+    }
+
+    const auto decoded = decoded_input->decode(opts);
+    return std::string(decoded.begin(), decoded.end());
 }
 
-TransportErrorKind map_transport_error_kind(int code) {
-    const auto curl_code = static_cast<CURLcode>(code);
-    switch (curl_code) {
-        case CURLE_OPERATION_TIMEDOUT:
-            return TransportErrorKind::timeout;
-        case CURLE_COULDNT_RESOLVE_HOST:
-        case CURLE_COULDNT_RESOLVE_PROXY:
-            return TransportErrorKind::dns;
-        case CURLE_SSL_CONNECT_ERROR:
-        case CURLE_PEER_FAILED_VERIFICATION:
-        case CURLE_SSL_CERTPROBLEM:
-        case CURLE_SSL_CIPHER:
-            return TransportErrorKind::tls;
-        case CURLE_COULDNT_CONNECT:
-            return TransportErrorKind::connect;
-        case CURLE_SEND_ERROR:
-            return TransportErrorKind::send;
-        case CURLE_RECV_ERROR:
-            return TransportErrorKind::recv;
-        case CURLE_GOT_NOTHING:
-            return TransportErrorKind::reset;
-        default:
-            return TransportErrorKind::unknown;
+TransportErrorKind map_transport_error_kind(const boost::system::error_code &ec) {
+    if (!ec) {
+        return TransportErrorKind::none;
     }
+
+    if (ec == boost::asio::error::timed_out || ec == boost::beast::error::timeout) {
+        return TransportErrorKind::timeout;
+    }
+
+    if (ec == boost::asio::error::host_not_found ||
+        ec == boost::asio::error::host_not_found_try_again ||
+        ec == boost::asio::error::network_unreachable) {
+        return TransportErrorKind::dns;
+    }
+
+    if (ec == boost::asio::error::connection_refused ||
+        ec == boost::asio::error::connection_aborted ||
+        ec == boost::asio::error::host_unreachable) {
+        return TransportErrorKind::connect;
+    }
+
+    if (ec.category() == beast_net::error::get_ssl_category()) {
+        return TransportErrorKind::tls;
+    }
+
+    if (ec == boost::asio::error::broken_pipe || ec == boost::asio::error::connection_reset ||
+        ec == boost::asio::error::eof || ec == beast_http::error::end_of_stream) {
+        return TransportErrorKind::reset;
+    }
+
+    return TransportErrorKind::unknown;
+}
+
+[[noreturn]] void throw_beast_transport_error(std::string_view where,
+                                              const boost::system::error_code &ec) {
+    std::ostringstream oss;
+    oss << where << " failed: " << ec.message();
+    throw HttpError(oss.str(),
+                    HttpErrorCode::curl_failure,
+                    ec.value(),
+                    0,
+                    map_transport_error_kind(ec));
 }
 
 bool is_idempotent_method(std::string_view method) {
@@ -223,6 +246,608 @@ bool should_retry_error(const RetryPolicy &policy,
     return false;
 }
 
+bool equals_ci(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) !=
+            std::tolower(static_cast<unsigned char>(right[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string to_lower(std::string_view value) {
+    std::string out(value);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return out;
+}
+
+std::optional<std::string_view> find_header_value(const std::vector<Header> &headers,
+                                                  std::string_view name) {
+    for (const auto &header : headers) {
+        if (equals_ci(header.name, name)) {
+            return std::string_view(header.value);
+        }
+    }
+    return std::nullopt;
+}
+
+void erase_header(std::vector<Header> &headers, std::string_view name) {
+    headers.erase(std::remove_if(headers.begin(),
+                                 headers.end(),
+                                 [&](const Header &header) {
+                                     return equals_ci(header.name, name);
+                                 }),
+                  headers.end());
+}
+
+void set_or_replace_header(std::vector<Header> &headers,
+                           std::string_view name,
+                           std::string value) {
+    for (auto &header : headers) {
+        if (equals_ci(header.name, name)) {
+            header.value = std::move(value);
+            return;
+        }
+    }
+    headers.push_back(Header{std::string(name), std::move(value)});
+}
+
+bool is_redirect_status(long status_code) {
+    return status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 ||
+           status_code == 308;
+}
+
+std::optional<std::string> resolve_redirect_url(std::string_view base_url, std::string_view location) {
+    const auto parsed_location = boost::urls::parse_uri_reference(location);
+    if (!parsed_location) {
+        return std::nullopt;
+    }
+
+    if (parsed_location->has_scheme()) {
+        return std::string(parsed_location->buffer());
+    }
+
+    const auto parsed_base = boost::urls::parse_uri(base_url);
+    if (!parsed_base) {
+        return std::nullopt;
+    }
+
+    boost::urls::url resolved(*parsed_base);
+    if (!resolved.resolve(*parsed_location)) {
+        return std::nullopt;
+    }
+    return std::string(resolved.buffer());
+}
+
+std::string make_default_port(std::string_view scheme) {
+    if (equals_ci(scheme, "https")) {
+        return "443";
+    }
+    return "80";
+}
+
+std::string make_http_target(const boost::urls::url_view_base &url) {
+    std::string target = std::string(url.encoded_path());
+    if (target.empty()) {
+        target = "/";
+    }
+    if (url.has_query()) {
+        target.push_back('?');
+        target += url.encoded_query();
+    }
+    return target;
+}
+
+std::string random_multipart_boundary() {
+    std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<unsigned long long> dist;
+    std::ostringstream oss;
+    oss << "flux-boundary-" << std::hex << dist(rng) << dist(rng);
+    return oss.str();
+}
+
+std::string quote_multipart_token(std::string_view value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (const char ch : value) {
+        if (ch == '"' || ch == '\\') {
+            out.push_back('\\');
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
+
+std::string read_file_binary(const std::filesystem::path &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw HttpError("multipart file open failed: " + path.string(), HttpErrorCode::invalid_request);
+    }
+
+    in.seekg(0, std::ios::end);
+    const auto size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (size < 0) {
+        throw HttpError("multipart file stat failed: " + path.string(), HttpErrorCode::invalid_request);
+    }
+
+    std::string data;
+    data.resize(static_cast<std::size_t>(size));
+    if (!data.empty()) {
+        in.read(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!in) {
+            throw HttpError(
+                "multipart file read failed: " + path.string(), HttpErrorCode::invalid_request);
+        }
+    }
+    return data;
+}
+
+std::string build_multipart_body(const std::vector<Request::MultipartPart> &parts,
+                                 const std::string &boundary) {
+    std::string body;
+    for (const auto &part : parts) {
+        body += "--";
+        body += boundary;
+        body += "\r\n";
+        body += "Content-Disposition: form-data; name=\"";
+        body += quote_multipart_token(part.name);
+        body += "\"";
+        if (part.file_name.has_value()) {
+            body += "; filename=\"";
+            body += quote_multipart_token(*part.file_name);
+            body += "\"";
+        }
+        body += "\r\n";
+        if (part.content_type.has_value()) {
+            body += "Content-Type: ";
+            body += *part.content_type;
+            body += "\r\n";
+        }
+        body += "\r\n";
+
+        if (part.file_path.has_value()) {
+            body += read_file_binary(*part.file_path);
+        } else {
+            body += part.value;
+        }
+
+        body += "\r\n";
+    }
+    body += "--";
+    body += boundary;
+    body += "--\r\n";
+    return body;
+}
+
+struct CookieEntry {
+    std::string domain;
+    std::string path = "/";
+    std::string name;
+    std::string value;
+    bool secure = false;
+};
+
+bool cookie_domain_matches(std::string_view request_host, std::string_view cookie_domain) {
+    const std::string host = to_lower(request_host);
+    std::string domain = to_lower(cookie_domain);
+    if (!domain.empty() && domain.front() == '.') {
+        domain.erase(domain.begin());
+    }
+    if (domain.empty()) {
+        return false;
+    }
+    if (host == domain) {
+        return true;
+    }
+    return host.size() > domain.size() && host.ends_with(domain) &&
+           host[host.size() - domain.size() - 1] == '.';
+}
+
+bool cookie_path_matches(std::string_view request_path, std::string_view cookie_path) {
+    const std::string_view normalized = cookie_path.empty() ? std::string_view("/") : cookie_path;
+    return request_path.starts_with(normalized);
+}
+
+std::vector<CookieEntry> load_cookie_jar_file(const std::filesystem::path &path) {
+    std::vector<CookieEntry> cookies;
+    std::ifstream in(path);
+    if (!in) {
+        return cookies;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream row(line);
+        CookieEntry item;
+        std::string secure;
+        if (!std::getline(row, item.domain, '\t') || !std::getline(row, item.path, '\t') ||
+            !std::getline(row, secure, '\t') || !std::getline(row, item.name, '\t') ||
+            !std::getline(row, item.value)) {
+            continue;
+        }
+        item.secure = secure == "1";
+        if (!item.domain.empty() && !item.name.empty()) {
+            cookies.push_back(std::move(item));
+        }
+    }
+
+    return cookies;
+}
+
+void save_cookie_jar_file(const std::filesystem::path &path, const std::vector<CookieEntry> &cookies) {
+    if (path.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    out << "# flux beast cookie jar v1\n";
+    for (const auto &cookie : cookies) {
+        out << cookie.domain << '\t' << cookie.path << '\t' << (cookie.secure ? '1' : '0') << '\t'
+            << cookie.name << '\t' << cookie.value << '\n';
+    }
+}
+
+void upsert_cookie(std::vector<CookieEntry> &cookies, CookieEntry entry) {
+    auto it = std::find_if(cookies.begin(), cookies.end(), [&](const CookieEntry &existing) {
+        return equals_ci(existing.domain, entry.domain) && existing.path == entry.path &&
+               existing.name == entry.name;
+    });
+    if (it == cookies.end()) {
+        cookies.push_back(std::move(entry));
+    } else {
+        *it = std::move(entry);
+    }
+}
+
+std::optional<CookieEntry> parse_set_cookie(std::string_view header,
+                                            const boost::urls::url_view_base &request_url) {
+    auto next_token = [](std::string_view &rest) -> std::string_view {
+        const auto pos = rest.find(';');
+        const auto token = pos == std::string_view::npos ? rest : rest.substr(0, pos);
+        rest = pos == std::string_view::npos ? std::string_view{} : rest.substr(pos + 1);
+        return token;
+    };
+
+    std::string_view rest = header;
+    const auto first = trim(std::string(next_token(rest)));
+    const auto eq = first.find('=');
+    if (eq == std::string::npos || eq == 0) {
+        return std::nullopt;
+    }
+
+    CookieEntry cookie;
+    cookie.name = first.substr(0, eq);
+    cookie.value = first.substr(eq + 1);
+    cookie.domain = to_lower(request_url.host());
+    cookie.path = "/";
+
+    const std::string request_path =
+        request_url.encoded_path().empty() ? "/" : std::string(request_url.encoded_path());
+    if (!request_path.empty() && request_path.front() == '/') {
+        const auto slash = request_path.find_last_of('/');
+        if (slash != std::string::npos && slash > 0) {
+            cookie.path = request_path.substr(0, slash);
+        }
+    }
+
+    while (!rest.empty()) {
+        const auto raw_token = trim(std::string(next_token(rest)));
+        if (raw_token.empty()) {
+            continue;
+        }
+        const auto attr_eq = raw_token.find('=');
+        const std::string attr_name = to_lower(raw_token.substr(0, attr_eq));
+        const std::string attr_value =
+            attr_eq == std::string::npos ? std::string() : raw_token.substr(attr_eq + 1);
+
+        if (attr_name == "domain" && !attr_value.empty()) {
+            cookie.domain = to_lower(attr_value);
+        } else if (attr_name == "path" && !attr_value.empty()) {
+            cookie.path = attr_value;
+        } else if (attr_name == "secure") {
+            cookie.secure = true;
+        }
+    }
+
+    if (cookie.path.empty()) {
+        cookie.path = "/";
+    }
+    if (cookie.domain.empty()) {
+        cookie.domain = to_lower(request_url.host());
+    }
+    return cookie;
+}
+
+std::string build_cookie_header(const std::vector<CookieEntry> &cookies,
+                                const boost::urls::url_view_base &request_url) {
+    const std::string scheme = to_lower(request_url.scheme());
+    const std::string host = to_lower(request_url.host());
+    const std::string path =
+        request_url.encoded_path().empty() ? "/" : std::string(request_url.encoded_path());
+    const bool is_https = scheme == "https";
+
+    std::string header;
+    for (const auto &cookie : cookies) {
+        if (cookie.secure && !is_https) {
+            continue;
+        }
+        if (!cookie_domain_matches(host, cookie.domain)) {
+            continue;
+        }
+        if (!cookie_path_matches(path, cookie.path)) {
+            continue;
+        }
+        if (!header.empty()) {
+            header += "; ";
+        }
+        header += cookie.name;
+        header += '=';
+        header += cookie.value;
+    }
+    return header;
+}
+
+bool should_switch_to_get_on_redirect(long status_code, std::string_view method) {
+    return status_code == 303 ||
+           ((status_code == 301 || status_code == 302) && equals_ci(method, "POST"));
+}
+
+struct BeastExecRequest {
+    std::string method;
+    std::string url;
+    std::string body;
+    std::vector<Header> headers;
+    std::optional<ProxyOptions> proxy;
+    CookieJarOptions cookie_jar;
+    std::string user_agent;
+    std::chrono::milliseconds timeout{0};
+    std::chrono::milliseconds connect_timeout{0};
+    bool follow_redirects = false;
+    bool aggregate_response_body = true;
+    std::function<void(std::string_view)> on_chunk;
+    int max_redirects = 8;
+};
+
+Response execute_with_beast_blocking(BeastExecRequest request) {
+    std::string current_url = std::move(request.url);
+    std::string current_method = std::move(request.method);
+    std::string current_body = std::move(request.body);
+    std::vector<Header> current_headers = std::move(request.headers);
+    std::vector<CookieEntry> cookies;
+    if (request.cookie_jar.enabled && request.cookie_jar.file_path.has_value()) {
+        cookies = load_cookie_jar_file(*request.cookie_jar.file_path);
+    }
+
+    for (int redirect_count = 0; redirect_count <= request.max_redirects; ++redirect_count) {
+        const auto parsed = boost::urls::parse_uri(current_url);
+        if (!parsed) {
+            throw HttpError("invalid request url for beast backend", HttpErrorCode::invalid_request);
+        }
+        const bool use_tls = equals_ci(parsed->scheme(), "https");
+        if (!equals_ci(parsed->scheme(), "http") && !use_tls) {
+            throw HttpError("unsupported url scheme for beast backend",
+                            HttpErrorCode::invalid_request);
+        }
+
+        const std::string host(parsed->host());
+        const std::string port = parsed->has_port() ? std::string(parsed->port())
+                                                    : make_default_port(parsed->scheme());
+        std::string connect_host = host;
+        std::string connect_port = port;
+        std::string target = make_http_target(*parsed);
+
+        if (request.proxy.has_value() && !request.proxy->url.empty()) {
+            const auto proxy_url = boost::urls::parse_uri(request.proxy->url);
+            if (!proxy_url || !equals_ci(proxy_url->scheme(), "http")) {
+                throw HttpError("unsupported proxy url for beast backend",
+                                HttpErrorCode::curl_failure,
+                                0,
+                                0,
+                                TransportErrorKind::connect);
+            }
+            if (use_tls) {
+                throw HttpError("https over proxy is not supported in beast backend yet",
+                                HttpErrorCode::curl_failure,
+                                0,
+                                0,
+                                TransportErrorKind::connect);
+            }
+            connect_host = std::string(proxy_url->host());
+            connect_port =
+                proxy_url->has_port() ? std::string(proxy_url->port()) : std::string("80");
+            target = current_url;
+        }
+
+        const bool non_default_port = parsed->has_port() && parsed->port() != make_default_port(parsed->scheme());
+        const std::string host_header = non_default_port ? (host + ":" + port) : host;
+
+        boost::system::error_code ec;
+        beast_net::io_context io_context;
+        BeastTcp::resolver resolver(io_context);
+
+        std::vector<Header> sending_headers = current_headers;
+        if (request.cookie_jar.enabled) {
+            erase_header(sending_headers, "Cookie");
+            const auto cookie_header = build_cookie_header(cookies, *parsed);
+            if (!cookie_header.empty()) {
+                sending_headers.push_back(Header{"Cookie", cookie_header});
+            }
+        }
+
+        const auto endpoints = resolver.resolve(connect_host, connect_port, ec);
+        if (ec) {
+            throw_beast_transport_error("dns resolve", ec);
+        }
+
+        beast_http::request<beast_http::string_body> req;
+        req.version(11);
+        req.method_string(current_method);
+        req.target(target);
+
+        for (const auto &header : sending_headers) {
+            req.set(header.name, header.value);
+        }
+        if (!has_header(sending_headers, "Host")) {
+            req.set(beast_http::field::host, host_header);
+        }
+        if (!has_header(sending_headers, "User-Agent") && !request.user_agent.empty()) {
+            req.set(beast_http::field::user_agent, request.user_agent);
+        }
+
+        req.body() = current_body;
+        req.prepare_payload();
+
+        beast::flat_buffer buffer;
+        beast_http::response<beast_http::string_body> res;
+
+        if (use_tls) {
+            beast_ssl::context ssl_ctx(beast_ssl::context::tls_client);
+            bool verify_peer = true;
+            try {
+                ssl_ctx.set_default_verify_paths();
+            } catch (...) {
+                verify_peer = false;
+            }
+
+            beast::ssl_stream<beast::tcp_stream> stream(io_context, ssl_ctx);
+            if (verify_peer) {
+                stream.set_verify_mode(beast_ssl::verify_peer);
+                stream.set_verify_callback(beast_ssl::host_name_verification(host));
+            } else {
+                stream.set_verify_mode(beast_ssl::verify_none);
+            }
+
+            if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
+                throw HttpError("tls sni setup failed",
+                                HttpErrorCode::curl_failure,
+                                0,
+                                0,
+                                TransportErrorKind::tls);
+            }
+
+            beast::get_lowest_layer(stream).expires_after(request.connect_timeout);
+            beast::get_lowest_layer(stream).connect(endpoints, ec);
+            if (ec) {
+                throw_beast_transport_error("tcp connect", ec);
+            }
+
+            beast::get_lowest_layer(stream).expires_after(request.timeout);
+            stream.handshake(beast_ssl::stream_base::client, ec);
+            if (ec) {
+                throw_beast_transport_error("tls handshake", ec);
+            }
+
+            beast_http::write(stream, req, ec);
+            if (ec) {
+                throw_beast_transport_error("http write", ec);
+            }
+
+            beast_http::read(stream, buffer, res, ec);
+            if (ec) {
+                throw_beast_transport_error("http read", ec);
+            }
+
+            stream.shutdown(ec);
+            if (ec && ec != beast::errc::not_connected &&
+                ec != beast_net::error::eof) {
+                throw_beast_transport_error("tls shutdown", ec);
+            }
+        } else {
+            beast::tcp_stream stream(io_context);
+            stream.expires_after(request.connect_timeout);
+            stream.connect(endpoints, ec);
+            if (ec) {
+                throw_beast_transport_error("tcp connect", ec);
+            }
+
+            stream.expires_after(request.timeout);
+            beast_http::write(stream, req, ec);
+            if (ec) {
+                throw_beast_transport_error("http write", ec);
+            }
+
+            beast_http::read(stream, buffer, res, ec);
+            if (ec) {
+                throw_beast_transport_error("http read", ec);
+            }
+
+            boost::system::error_code ignored;
+            stream.socket().shutdown(BeastTcp::socket::shutdown_both, ignored);
+        }
+
+        Response response;
+        response.status_code = static_cast<long>(res.result_int());
+        response.effective_url = current_url;
+        for (const auto &field : res.base()) {
+            response.headers.push_back(
+                Header{std::string(field.name_string()), std::string(field.value())});
+        }
+
+        if (request.aggregate_response_body) {
+            response.body = res.body();
+        }
+        if (request.on_chunk && !res.body().empty()) {
+            request.on_chunk(res.body());
+        }
+
+        if (request.cookie_jar.enabled) {
+            for (const auto &header : response.headers) {
+                if (!equals_ci(header.name, "Set-Cookie")) {
+                    continue;
+                }
+                auto parsed_cookie = parse_set_cookie(header.value, *parsed);
+                if (parsed_cookie.has_value()) {
+                    upsert_cookie(cookies, std::move(*parsed_cookie));
+                }
+            }
+            if (request.cookie_jar.file_path.has_value()) {
+                save_cookie_jar_file(*request.cookie_jar.file_path, cookies);
+            }
+        }
+
+        if (!request.follow_redirects || !is_redirect_status(response.status_code)) {
+            return response;
+        }
+
+        const auto location = find_header_value(response.headers, "Location");
+        if (!location.has_value() || location->empty()) {
+            return response;
+        }
+        if (redirect_count >= request.max_redirects) {
+            throw HttpError("too many redirects", HttpErrorCode::curl_failure);
+        }
+
+        auto resolved = resolve_redirect_url(current_url, *location);
+        if (!resolved.has_value()) {
+            return response;
+        }
+
+        current_url = std::move(*resolved);
+        if (should_switch_to_get_on_redirect(response.status_code, current_method)) {
+            current_method = "GET";
+            current_body.clear();
+            erase_header(current_headers, "Content-Length");
+            erase_header(current_headers, "Content-Type");
+        }
+    }
+
+    throw HttpError("too many redirects", HttpErrorCode::curl_failure);
+}
+
 std::chrono::milliseconds retry_backoff(const RetryPolicy &policy, int attempt_index) {
     std::uint64_t factor = 1;
     for (int i = 1; i < attempt_index; ++i) {
@@ -249,10 +874,10 @@ std::map<std::string, std::string> parse_form_body(std::string_view text) {
         if (!token.empty()) {
             const auto eq = token.find('=');
             if (eq == std::string_view::npos) {
-                out.emplace(percent_decode(token), "");
+                out.emplace(decode_component(token, true), "");
             } else {
-                out.emplace(percent_decode(token.substr(0, eq)),
-                            percent_decode(token.substr(eq + 1)));
+                out.emplace(decode_component(token.substr(0, eq), true),
+                            decode_component(token.substr(eq + 1), true));
             }
         }
         if (amp == std::string_view::npos) {
@@ -319,217 +944,39 @@ void notify_error_interceptors(const Client::Config &config,
 }
 
 std::string build_url_with_query(std::string_view base_url,
-                                  const std::vector<std::pair<std::string, std::string>> &query_items) {
+                                 const std::vector<std::pair<std::string, std::string>> &query_items) {
     if (query_items.empty()) {
         return std::string(base_url);
     }
 
-    auto url_result = ada::parse<ada::url>(base_url);
-    if (!url_result) {
-        std::string result(base_url);
-        bool has_query = result.contains('?');
-        result.push_back(has_query ? '&' : '?');
-        
-        ada::url_search_params params;
+    if (const auto parsed = boost::urls::parse_uri_reference(base_url); parsed) {
+        boost::urls::url url(*parsed);
+        auto params = url.params();
         for (const auto &[k, v] : query_items) {
-            params.append(k, v);
+            params.append(boost::urls::param_view{k, v});
         }
-        result += params.to_string();
-        return result;
+        return std::string(url.buffer());
     }
 
-    ada::url url = std::move(*url_result);
-    ada::url_search_params params(url.get_search());
-    
+    std::string result(base_url);
+    result.push_back(result.find('?') != std::string::npos ? '&' : '?');
+
+    bool first = true;
     for (const auto &[k, v] : query_items) {
-        params.append(k, v);
-    }
-    
-    url.set_search(params.to_string());
-
-    return std::string(url.get_href());
-}
-
-struct ResponseBodySink {
-    std::string *body = nullptr;
-    bool aggregate = true;
-    const std::function<void(std::string_view)> *on_chunk = nullptr;
-};
-
-std::size_t
-write_body_callback(char *buffer, std::size_t size, std::size_t nitems, void *userdata) {
-    const std::size_t total = size * nitems;
-    auto *sink = static_cast<ResponseBodySink *>(userdata);
-    if (sink->aggregate && sink->body != nullptr) {
-        sink->body->append(buffer, total);
-    }
-    if (sink->on_chunk != nullptr && *sink->on_chunk) {
-        (*sink->on_chunk)(std::string_view(buffer, total));
-    }
-    return total;
-}
-
-std::size_t
-write_header_callback(char *buffer, std::size_t size, std::size_t nitems, void *userdata) {
-    const std::size_t total = size * nitems;
-    auto *headers = static_cast<std::vector<Header> *>(userdata);
-
-    std::string line(buffer, total);
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
-        line.pop_back();
-    }
-
-    if (line.empty()) {
-        return total;
-    }
-
-    const auto colon_pos = line.find(':');
-    if (colon_pos == std::string::npos) {
-        return total;
-    }
-
-    headers->push_back(Header{trim(line.substr(0, colon_pos)), trim(line.substr(colon_pos + 1))});
-    return total;
-}
-
-struct SocketState {
-    int what = CURL_POLL_NONE;
-    std::optional<async_uv::FdWatcher> watcher;
-};
-
-struct MultiContext {
-    std::unordered_map<curl_socket_t, SocketState> sockets;
-    long timeout_ms = 50;
-};
-
-int socket_callback(CURL *, curl_socket_t socket, int what, void *userp, void *) {
-    auto *context = static_cast<MultiContext *>(userp);
-    if (what == CURL_POLL_REMOVE) {
-        context->sockets.erase(socket);
-        return 0;
-    }
-
-    auto &state = context->sockets[socket];
-    if (state.what != what) {
-        state.what = what;
-        state.watcher.reset();
-    }
-    return 0;
-}
-
-int timer_callback(CURLM *, long timeout_ms, void *userp) {
-    auto *context = static_cast<MultiContext *>(userp);
-    context->timeout_ms = timeout_ms;
-    return 0;
-}
-
-int to_uv_events(int what) {
-    int events = 0;
-    if ((what & CURL_POLL_IN) != 0) {
-        events |= static_cast<int>(async_uv::FdEventFlags::readable);
-    }
-    if ((what & CURL_POLL_OUT) != 0) {
-        events |= static_cast<int>(async_uv::FdEventFlags::writable);
-    }
-    if (events == 0) {
-        events = static_cast<int>(async_uv::FdEventFlags::readable) |
-                 static_cast<int>(async_uv::FdEventFlags::writable);
-    }
-    return events;
-}
-
-int to_curl_select_mask(const async_uv::FdEvent &event) {
-    int mask = 0;
-    if (event.readable()) {
-        mask |= CURL_CSELECT_IN;
-    }
-    if (event.writable()) {
-        mask |= CURL_CSELECT_OUT;
-    }
-    if (!event.ok()) {
-        mask |= CURL_CSELECT_ERR;
-    }
-    return mask;
-}
-
-Task<void> drive_multi_until_done(CURLM *multi, MultiContext &context, int &running_handles) {
-    while (running_handles > 0) {
-        if (context.timeout_ms == 0) {
-            const auto rc =
-                curl_multi_socket_action(multi, CURL_SOCKET_TIMEOUT, 0, &running_handles);
-            if (rc != CURLM_OK) {
-                throw HttpError("curl_multi_socket_action(timeout) failed",
-                                HttpErrorCode::curl_failure,
-                                static_cast<int>(rc));
-            }
-            continue;
+        if (!first) {
+            result.push_back('&');
         }
-
-        curl_socket_t active_socket = CURL_SOCKET_BAD;
-        SocketState *active_state = nullptr;
-        for (auto &[socket, state] : context.sockets) {
-            if (state.what == CURL_POLL_REMOVE) {
-                continue;
-            }
-            active_socket = socket;
-            active_state = &state;
-            break;
-        }
-
-        const long timeout_ms = context.timeout_ms < 0 ? 50 : std::max<long>(1, context.timeout_ms);
-
-        if (active_state == nullptr || active_socket == CURL_SOCKET_BAD) {
-            co_await async_uv::sleep_for(std::chrono::milliseconds(timeout_ms));
-            const auto rc =
-                curl_multi_socket_action(multi, CURL_SOCKET_TIMEOUT, 0, &running_handles);
-            if (rc != CURLM_OK) {
-                throw HttpError("curl_multi_socket_action(timeout) failed",
-                                HttpErrorCode::curl_failure,
-                                static_cast<int>(rc));
-            }
-            continue;
-        }
-
-        const int uv_events = to_uv_events(active_state->what);
-        if (!active_state->watcher.has_value()) {
-            active_state->watcher.emplace(co_await async_uv::FdWatcher::watch(
-                static_cast<uv_os_sock_t>(active_socket), uv_events));
-        }
-
-        std::optional<async_uv::FdEvent> event;
-        try {
-            event = co_await active_state->watcher->next_for(std::chrono::milliseconds(timeout_ms));
-        } catch (const async_uv::Error &error) {
-            if (error.code() != UV_ETIMEDOUT) {
-                throw;
-            }
-        }
-        if (!event.has_value()) {
-            const auto rc =
-                curl_multi_socket_action(multi, CURL_SOCKET_TIMEOUT, 0, &running_handles);
-            if (rc != CURLM_OK) {
-                throw HttpError("curl_multi_socket_action(timeout) failed",
-                                HttpErrorCode::curl_failure,
-                                static_cast<int>(rc));
-            }
-            continue;
-        }
-
-        const int mask = to_curl_select_mask(*event);
-        const auto rc = curl_multi_socket_action(multi, active_socket, mask, &running_handles);
-        if (rc != CURLM_OK) {
-            throw HttpError("curl_multi_socket_action(socket) failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(rc));
-        }
+        first = false;
+        result += detail::percent_encode_component(k);
+        result.push_back('=');
+        result += detail::percent_encode_component(v);
     }
+    return result;
 }
 
 Task<Response> execute_async(const Client::Config &config, Request request) {
     try {
-        ensure_curl_global_init();
-
-        auto *current_runtime = async_uv::Runtime::current();
+        auto *current_runtime = co_await flux::get_current_runtime();
         if (current_runtime == nullptr) {
             throw HttpError("http client requires a current runtime",
                             HttpErrorCode::invalid_request);
@@ -586,234 +1033,41 @@ Task<Response> execute_async(const Client::Config &config, Request request) {
                             HttpErrorCode::invalid_request);
         }
 
-        Response response;
-        const bool aggregate_response_body =
-            request.aggregate_response_body.value_or(config.aggregate_response_body);
-        const auto &on_chunk_handler =
-            request.on_response_chunk ? request.on_response_chunk : config.on_response_chunk;
-        ResponseBodySink body_sink{&response.body, aggregate_response_body, &on_chunk_handler};
-
-        CURL *raw_easy = curl_easy_init();
-        if (raw_easy == nullptr) {
-            throw HttpError("curl_easy_init failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(CURLE_FAILED_INIT));
-        }
-        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> easy(raw_easy, &curl_easy_cleanup);
-
-        curl_mime *raw_mime = nullptr;
-        std::unique_ptr<curl_mime, decltype(&curl_mime_free)> mime(nullptr, &curl_mime_free);
-
-        curl_slist *header_list = nullptr;
-        std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(
-            nullptr, &curl_slist_free_all);
-        for (const auto &header : final_headers) {
-            const std::string line = header.name + ": " + header.value;
-            auto *new_list = curl_slist_append(header_list, line.c_str());
-            if (new_list == nullptr) {
-                throw HttpError("curl_slist_append failed",
-                                HttpErrorCode::curl_failure,
-                                static_cast<int>(CURLE_OUT_OF_MEMORY));
-            }
-            header_list = new_list;
-        }
-        header_guard.reset(header_list);
-
-        const std::string effective_request_url =
-            build_url_with_query(request.url, request.query_items);
-        curl_easy_setopt(easy.get(), CURLOPT_URL, effective_request_url.c_str());
-        curl_easy_setopt(easy.get(), CURLOPT_FOLLOWLOCATION, follow_redirects ? 1L : 0L);
-        curl_easy_setopt(easy.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(timeout.count()));
-        curl_easy_setopt(
-            easy.get(), CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(connect_timeout.count()));
-        curl_easy_setopt(easy.get(), CURLOPT_WRITEFUNCTION, &write_body_callback);
-        curl_easy_setopt(easy.get(), CURLOPT_WRITEDATA, &body_sink);
-        curl_easy_setopt(easy.get(), CURLOPT_HEADERFUNCTION, &write_header_callback);
-        curl_easy_setopt(easy.get(), CURLOPT_HEADERDATA, &response.headers);
-        const std::string user_agent = request.user_agent.value_or(config.user_agent);
-        if (!user_agent.empty()) {
-            curl_easy_setopt(easy.get(), CURLOPT_USERAGENT, user_agent.c_str());
+        std::string request_body = request.body;
+        if (!request.multipart_parts.empty()) {
+            const auto boundary = random_multipart_boundary();
+            request_body = build_multipart_body(request.multipart_parts, boundary);
+            set_or_replace_header(
+                final_headers, "Content-Type", "multipart/form-data; boundary=" + boundary);
         }
 
         auto proxy_options = request.proxy ? request.proxy : config.proxy;
+        const std::string effective_request_url =
+            build_url_with_query(request.url, request.query_items);
         if (!proxy_options.has_value()) {
-            proxy_options = proxy_from_env_for_url(request.url);
-        }
-        if (proxy_options.has_value() && !proxy_options->url.empty()) {
-            curl_easy_setopt(easy.get(), CURLOPT_PROXY, proxy_options->url.c_str());
-            if (proxy_options->username.has_value()) {
-                curl_easy_setopt(
-                    easy.get(), CURLOPT_PROXYUSERNAME, proxy_options->username->c_str());
-            }
-            if (proxy_options->password.has_value()) {
-                curl_easy_setopt(
-                    easy.get(), CURLOPT_PROXYPASSWORD, proxy_options->password->c_str());
-            }
+            proxy_options = proxy_from_env_for_url(effective_request_url);
         }
 
-        if (config.cookie_jar.enabled) {
-            curl_easy_setopt(easy.get(), CURLOPT_COOKIEFILE, "");
-            if (config.cookie_jar.file_path.has_value()) {
-                curl_easy_setopt(
-                    easy.get(), CURLOPT_COOKIEJAR, config.cookie_jar.file_path->c_str());
-                curl_easy_setopt(
-                    easy.get(), CURLOPT_COOKIEFILE, config.cookie_jar.file_path->c_str());
-            }
-        }
+        BeastExecRequest beast_request;
+        beast_request.method = method;
+        beast_request.url = effective_request_url;
+        beast_request.body = std::move(request_body);
+        beast_request.headers = final_headers;
+        beast_request.proxy = std::move(proxy_options);
+        beast_request.cookie_jar = config.cookie_jar;
+        beast_request.user_agent = request.user_agent.value_or(config.user_agent);
+        beast_request.timeout = timeout;
+        beast_request.connect_timeout = connect_timeout;
+        beast_request.follow_redirects = follow_redirects;
+        beast_request.aggregate_response_body =
+            request.aggregate_response_body.value_or(config.aggregate_response_body);
+        beast_request.on_chunk =
+            request.on_response_chunk ? request.on_response_chunk : config.on_response_chunk;
 
-        if (method != "GET") {
-            curl_easy_setopt(easy.get(), CURLOPT_CUSTOMREQUEST, method.c_str());
-        }
-
-        if (!request.multipart_parts.empty()) {
-            raw_mime = curl_mime_init(easy.get());
-            if (raw_mime == nullptr) {
-                throw HttpError("curl_mime_init failed",
-                                HttpErrorCode::curl_failure,
-                                static_cast<int>(CURLE_OUT_OF_MEMORY));
-            }
-            mime.reset(raw_mime);
-
-            for (const auto &part : request.multipart_parts) {
-                curl_mimepart *mime_part = curl_mime_addpart(mime.get());
-                if (mime_part == nullptr) {
-                    throw HttpError("curl_mime_addpart failed",
-                                    HttpErrorCode::curl_failure,
-                                    static_cast<int>(CURLE_OUT_OF_MEMORY));
-                }
-
-                if (curl_mime_name(mime_part, part.name.c_str()) != CURLE_OK) {
-                    throw HttpError("curl_mime_name failed", HttpErrorCode::curl_failure);
-                }
-
-                if (part.file_path.has_value()) {
-                    const auto rc = curl_mime_filedata(mime_part, part.file_path->c_str());
-                    if (rc != CURLE_OK) {
-                        throw HttpError("curl_mime_filedata failed",
-                                        HttpErrorCode::curl_failure,
-                                        static_cast<int>(rc),
-                                        0,
-                                        map_transport_error_kind(static_cast<int>(rc)));
-                    }
-
-                    if (part.file_name.has_value()) {
-                        const auto name_rc = curl_mime_filename(mime_part, part.file_name->c_str());
-                        if (name_rc != CURLE_OK) {
-                            throw HttpError("curl_mime_filename failed",
-                                            HttpErrorCode::curl_failure,
-                                            static_cast<int>(name_rc),
-                                            0,
-                                            map_transport_error_kind(static_cast<int>(name_rc)));
-                        }
-                    }
-                } else {
-                    const auto rc = curl_mime_data(
-                        mime_part, part.value.c_str(), static_cast<size_t>(part.value.size()));
-                    if (rc != CURLE_OK) {
-                        throw HttpError("curl_mime_data failed",
-                                        HttpErrorCode::curl_failure,
-                                        static_cast<int>(rc),
-                                        0,
-                                        map_transport_error_kind(static_cast<int>(rc)));
-                    }
-
-                    if (part.file_name.has_value()) {
-                        const auto name_rc = curl_mime_filename(mime_part, part.file_name->c_str());
-                        if (name_rc != CURLE_OK) {
-                            throw HttpError("curl_mime_filename failed",
-                                            HttpErrorCode::curl_failure,
-                                            static_cast<int>(name_rc),
-                                            0,
-                                            map_transport_error_kind(static_cast<int>(name_rc)));
-                        }
-                    }
-                }
-
-                if (part.content_type.has_value()) {
-                    const auto type_rc = curl_mime_type(mime_part, part.content_type->c_str());
-                    if (type_rc != CURLE_OK) {
-                        throw HttpError("curl_mime_type failed",
-                                        HttpErrorCode::curl_failure,
-                                        static_cast<int>(type_rc),
-                                        0,
-                                        map_transport_error_kind(static_cast<int>(type_rc)));
-                    }
-                }
-            }
-
-            curl_easy_setopt(easy.get(), CURLOPT_MIMEPOST, mime.get());
-        } else if (!request.body.empty()) {
-            curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDS, request.body.data());
-            curl_easy_setopt(easy.get(),
-                             CURLOPT_POSTFIELDSIZE_LARGE,
-                             static_cast<curl_off_t>(request.body.size()));
-        }
-
-        if (header_list != nullptr) {
-            curl_easy_setopt(easy.get(), CURLOPT_HTTPHEADER, header_list);
-        }
-
-        CURLM *raw_multi = curl_multi_init();
-        if (raw_multi == nullptr) {
-            throw HttpError("curl_multi_init failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(CURLM_INTERNAL_ERROR));
-        }
-        std::unique_ptr<CURLM, decltype(&curl_multi_cleanup)> multi(raw_multi, &curl_multi_cleanup);
-
-        MultiContext context;
-        curl_multi_setopt(multi.get(), CURLMOPT_SOCKETFUNCTION, &socket_callback);
-        curl_multi_setopt(multi.get(), CURLMOPT_SOCKETDATA, &context);
-        curl_multi_setopt(multi.get(), CURLMOPT_TIMERFUNCTION, &timer_callback);
-        curl_multi_setopt(multi.get(), CURLMOPT_TIMERDATA, &context);
-
-        const auto add_rc = curl_multi_add_handle(multi.get(), easy.get());
-        if (add_rc != CURLM_OK) {
-            throw HttpError("curl_multi_add_handle failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(add_rc));
-        }
-
-        int running_handles = 0;
-        const auto start_rc =
-            curl_multi_socket_action(multi.get(), CURL_SOCKET_TIMEOUT, 0, &running_handles);
-        if (start_rc != CURLM_OK) {
-            curl_multi_remove_handle(multi.get(), easy.get());
-            throw HttpError("curl_multi_socket_action(start) failed",
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(start_rc));
-        }
-
-        co_await drive_multi_until_done(multi.get(), context, running_handles);
-
-        CURLMsg *message = nullptr;
-        int remaining = 0;
-        CURLcode done_code = CURLE_OK;
-        while ((message = curl_multi_info_read(multi.get(), &remaining)) != nullptr) {
-            if (message->msg == CURLMSG_DONE && message->easy_handle == easy.get()) {
-                done_code = message->data.result;
-                break;
-            }
-        }
-
-        curl_multi_remove_handle(multi.get(), easy.get());
-
-        if (done_code != CURLE_OK) {
-            std::ostringstream oss;
-            oss << "curl request failed: " << curl_easy_strerror(done_code);
-            throw HttpError(oss.str(),
-                            HttpErrorCode::curl_failure,
-                            static_cast<int>(done_code),
-                            0,
-                            map_transport_error_kind(static_cast<int>(done_code)));
-        }
-
-        curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &response.status_code);
-        char *effective_url = nullptr;
-        curl_easy_getinfo(easy.get(), CURLINFO_EFFECTIVE_URL, &effective_url);
-        if (effective_url != nullptr) {
-            response.effective_url = effective_url;
-        }
+        auto response = co_await current_runtime->spawn_blocking(
+            [beast_request = std::move(beast_request)]() mutable {
+                return execute_with_beast_blocking(std::move(beast_request));
+            });
 
         apply_response_interceptors(config, request, response);
 
@@ -1041,7 +1295,7 @@ Task<Response> Client::execute(Request request) const {
                 throw;
             }
         }
-        co_await async_uv::sleep_for(retry_backoff(policy, attempt));
+        co_await flux::sleep_for(retry_backoff(policy, attempt));
     }
     throw last_error.value_or(HttpError("request not executed", HttpErrorCode::invalid_request));
 }
@@ -1049,7 +1303,7 @@ Task<Response> Client::execute(Request request) const {
 Task<DownloadResult> Client::download_to_file(std::string url,
                                               std::filesystem::path output,
                                               DownloadOptions options) const {
-    auto *runtime = co_await async_uv::get_current_runtime();
+    auto *runtime = co_await flux::get_current_runtime();
     if (runtime == nullptr) {
         throw HttpError("download_to_file requires a current runtime",
                         HttpErrorCode::invalid_request);
@@ -1063,7 +1317,7 @@ Task<DownloadResult> Client::download_to_file(std::string url,
     }
 
     if (output.has_parent_path()) {
-        co_await async_uv::Fs::create_directories(output.parent_path().string());
+        co_await flux::Fs::create_directories(output.parent_path().string());
     }
 
     const std::filesystem::path temp_path = [&]() -> std::filesystem::path {
@@ -1076,90 +1330,47 @@ Task<DownloadResult> Client::download_to_file(std::string url,
 
         const std::string base = output.parent_path().string();
         const std::string name = output.filename().string() + ".part";
-        return std::filesystem::path(async_uv::path::join(base, name));
+        return std::filesystem::path(flux::path::join(base, name));
     }();
 
     std::uintmax_t offset = 0;
-    if (options.resume && co_await async_uv::Fs::exists(temp_path.string())) {
-        const auto info = co_await async_uv::Fs::stat(temp_path.string());
+    if (options.resume && co_await flux::Fs::exists(temp_path.string())) {
+        const auto info = co_await flux::Fs::stat(temp_path.string());
         offset = info.size;
     }
 
-    struct DownloadChunk {
-        std::string data;
-        DownloadChunk() = default;
-        explicit DownloadChunk(std::string value) : data(std::move(value)) {}
-        DownloadChunk(const DownloadChunk &) = delete;
-        DownloadChunk &operator=(const DownloadChunk &) = delete;
-        DownloadChunk(DownloadChunk &&) noexcept = default;
-        DownloadChunk &operator=(DownloadChunk &&) noexcept = default;
-    };
-
     auto run_once =
         [&](std::uintmax_t start_offset, bool append_mode, bool use_range) -> Task<Response> {
-        auto mailbox = co_await async_uv::Mailbox<std::optional<DownloadChunk>>::create(*runtime);
-        auto sender = mailbox.sender();
-        bool queue_failed = false;
+        std::string streamed;
 
-        co_return co_await async_uv::with_task_scope([&](async_uv::TaskScope &scope)
-                                                         -> Task<Response> {
-            (void)scope.spawn(
-                [mailbox = std::move(mailbox), temp_path, append_mode]() mutable -> Task<void> {
-                    const auto flags =
-                        append_mode
-                            ? (async_uv::OpenFlags::create | async_uv::OpenFlags::write_only |
-                               async_uv::OpenFlags::append)
-                            : (async_uv::OpenFlags::create | async_uv::OpenFlags::write_only |
-                               async_uv::OpenFlags::truncate);
+        auto builder =
+            get(url)
+                .response_format(ResponseFormat::text)
+                .stream_response(
+                    [&](std::string_view chunk) {
+                        streamed.append(chunk.data(), chunk.size());
+                    },
+                    false)
+                .follow_redirects(true);
 
-                    auto file = co_await async_uv::File::open(temp_path.string(), flags, 0644);
-                    while (auto item = co_await mailbox.recv()) {
-                        if (!item->has_value()) {
-                            break;
-                        }
-                        co_await file.write_all(item->value().data);
-                    }
-                    co_await file.close();
-                }());
+        if (use_range && start_offset > 0) {
+            builder.header("Range", "bytes=" + std::to_string(start_offset) + "-");
+        }
 
-            auto builder =
-                get(url)
-                    .response_format(ResponseFormat::text)
-                    .stream_response(
-                        [&](std::string_view chunk) {
-                            if (queue_failed) {
-                                return;
-                            }
-                            std::optional<DownloadChunk> packet{DownloadChunk{std::string(chunk)}};
-                            if (!sender.try_send(std::move(packet))) {
-                                queue_failed = true;
-                            }
-                        },
-                        false)
-                    .follow_redirects(true);
+        auto response = co_await builder.send().raw();
 
-            if (use_range && start_offset > 0) {
-                builder.header("Range", "bytes=" + std::to_string(start_offset) + "-");
-            }
+        const auto flags =
+            append_mode ? (flux::OpenFlags::create | flux::OpenFlags::write_only |
+                           flux::OpenFlags::append)
+                        : (flux::OpenFlags::create | flux::OpenFlags::write_only |
+                           flux::OpenFlags::truncate);
+        auto file = co_await flux::File::open(temp_path.string(), flags, 0644);
+        if (!streamed.empty()) {
+            (void)co_await file.write_all(streamed);
+        }
+        co_await file.close();
 
-            auto response = co_await builder.send().raw();
-
-            std::optional<DownloadChunk> done{};
-            if (!sender.try_send(std::move(done))) {
-                std::optional<DownloadChunk> done2{};
-                const bool ok = co_await sender.send_for(done2, std::chrono::seconds(1));
-                if (!ok) {
-                    throw HttpError("failed to notify download writer completion",
-                                    HttpErrorCode::invalid_request);
-                }
-            }
-
-            if (queue_failed) {
-                throw HttpError("download stream queue overflow", HttpErrorCode::invalid_request);
-            }
-
-            co_return response;
-        });
+        co_return response;
     };
 
     bool resumed = false;
@@ -1172,23 +1383,23 @@ Task<DownloadResult> Client::download_to_file(std::string url,
     }
 
     if (options.use_temp_file) {
-        if (co_await async_uv::Fs::exists(output.string())) {
+        if (co_await flux::Fs::exists(output.string())) {
             if (!options.overwrite) {
                 throw HttpError("output file exists and overwrite is disabled",
                                 HttpErrorCode::invalid_request);
             }
-            co_await async_uv::Fs::remove(output.string());
+            co_await flux::Fs::remove(output.string());
         }
 
-        co_await async_uv::Fs::rename(temp_path.string(), output.string());
+        co_await flux::Fs::rename(temp_path.string(), output.string());
     }
 
     DownloadResult result;
     result.output_path = output;
     result.resumed = resumed;
     result.status_code = response.status_code;
-    if (co_await async_uv::Fs::exists(output.string())) {
-        result.size = (co_await async_uv::Fs::stat(output.string())).size;
+    if (co_await flux::Fs::exists(output.string())) {
+        result.size = (co_await flux::Fs::stat(output.string())).size;
     }
     co_return result;
 }
@@ -1221,4 +1432,4 @@ Client::RequestBuilder Client::del(std::string url) const {
     return RequestBuilder(this, std::move(request));
 }
 
-} // namespace async_uv::http
+} // namespace flux::http

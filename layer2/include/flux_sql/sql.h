@@ -10,9 +10,11 @@
 #include <variant>
 #include <vector>
 
-#include "async_uv/task.h"
+#include <stdexec/execution.hpp>
 
-namespace async_uv::sql {
+#include "flux/task.h"
+
+namespace flux::sql {
 
 enum class Driver {
     postgres,
@@ -168,6 +170,23 @@ struct QueryResult {
     std::uint64_t last_insert_id = 0;
 };
 
+using VoidSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using BoolSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using QuerySender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(QueryResult),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using IndexSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+
 class Connection {
 public:
     Connection();
@@ -179,36 +198,116 @@ public:
     Connection(const Connection &) = delete;
     Connection &operator=(const Connection &) = delete;
 
-    Task<void> open(ConnectionOptions options);
-    Task<void> close();
-    Task<bool> is_open() const;
+    [[nodiscard]] auto open(ConnectionOptions options) {
+        return stdexec::just(std::move(options))
+             | stdexec::let_value(
+                   [this](ConnectionOptions opts) { return this->open_task(std::move(opts)); });
+    }
+    [[nodiscard]] auto close() {
+        return stdexec::just() | stdexec::let_value([this] { return this->close_task(); });
+    }
+    [[nodiscard]] auto is_open() const {
+        return stdexec::just() | stdexec::let_value([this] { return this->is_open_task(); });
+    }
     ConnectionOptions options() const;
-    Task<void> cancel();
+    [[nodiscard]] auto cancel() {
+        return stdexec::just() | stdexec::let_value([this] { return this->cancel_task(); });
+    }
 
-    Task<QueryResult> query(std::string sql);
-    Task<QueryResult> query(std::string sql, std::vector<SqlParam> params);
-    Task<QueryResult> query(std::string sql, QueryOptions options);
-    Task<QueryResult> query(std::string sql, std::vector<SqlParam> params, QueryOptions options);
-    Task<QueryResult> execute(std::string sql);
-    Task<QueryResult> execute(std::string sql, std::vector<SqlParam> params);
-    Task<QueryResult> execute(std::string sql, QueryOptions options);
-    Task<QueryResult> execute(std::string sql, std::vector<SqlParam> params, QueryOptions options);
+    [[nodiscard]] auto query(std::string sql) {
+        return stdexec::just(std::move(sql)) | stdexec::let_value([this](std::string q) {
+                   return this->query_task(std::move(q));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql, std::vector<SqlParam> params) {
+        return stdexec::just(std::move(sql), std::move(params))
+             | stdexec::let_value([this](std::string q, std::vector<SqlParam> p) {
+                   return this->query_task(std::move(q), std::move(p));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql, QueryOptions options) {
+        return stdexec::just(std::move(sql), std::move(options))
+             | stdexec::let_value([this](std::string q, QueryOptions o) {
+                   return this->query_task(std::move(q), std::move(o));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql,
+                             std::vector<SqlParam> params,
+                             QueryOptions options) {
+        return stdexec::just(std::move(sql), std::move(params), std::move(options))
+             | stdexec::let_value(
+                   [this](std::string q, std::vector<SqlParam> p, QueryOptions o) {
+                       return this->query_task(std::move(q), std::move(p), std::move(o));
+                   });
+    }
 
-    Task<void> begin();
-    Task<void> commit();
-    Task<void> rollback();
+    [[nodiscard]] auto begin() {
+        return stdexec::just() | stdexec::let_value([this] { return this->begin_task(); });
+    }
+    [[nodiscard]] auto commit() {
+        return stdexec::just() | stdexec::let_value([this] { return this->commit_task(); });
+    }
+    [[nodiscard]] auto rollback() {
+        return stdexec::just() | stdexec::let_value([this] { return this->rollback_task(); });
+    }
 
 private:
+    VoidSender open_task(ConnectionOptions options);
+    VoidSender close_task();
+    BoolSender is_open_task() const;
+    VoidSender cancel_task();
+
+    QuerySender query_task(std::string sql);
+    QuerySender query_task(std::string sql, std::vector<SqlParam> params);
+    QuerySender query_task(std::string sql, QueryOptions options);
+    QuerySender query_task(std::string sql,
+                           std::vector<SqlParam> params,
+                           QueryOptions options);
+
+    VoidSender begin_task();
+    VoidSender commit_task();
+    VoidSender rollback_task();
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-Task<QueryResult> query(ConnectionOptions options, std::string sql);
-Task<QueryResult> query(ConnectionOptions options, std::string sql, std::vector<SqlParam> params);
-Task<QueryResult> query(ConnectionOptions options,
-                        std::string sql,
-                        std::vector<SqlParam> params,
-                        QueryOptions query_options);
+namespace detail {
+QuerySender query_task(ConnectionOptions options, std::string sql);
+QuerySender query_task(ConnectionOptions options,
+                       std::string sql,
+                       std::vector<SqlParam> params);
+QuerySender query_task(ConnectionOptions options,
+                       std::string sql,
+                       std::vector<SqlParam> params,
+                       QueryOptions query_options);
+} // namespace detail
+
+[[nodiscard]] inline auto query(ConnectionOptions options, std::string sql) {
+    return stdexec::just(std::move(options), std::move(sql))
+         | stdexec::let_value([](ConnectionOptions o, std::string q) {
+               return detail::query_task(std::move(o), std::move(q));
+           });
+}
+[[nodiscard]] inline auto query(ConnectionOptions options,
+                                std::string sql,
+                                std::vector<SqlParam> params) {
+    return stdexec::just(std::move(options), std::move(sql), std::move(params))
+         | stdexec::let_value([](ConnectionOptions o, std::string q, std::vector<SqlParam> p) {
+               return detail::query_task(std::move(o), std::move(q), std::move(p));
+           });
+}
+[[nodiscard]] inline auto query(ConnectionOptions options,
+                                std::string sql,
+                                std::vector<SqlParam> params,
+                                QueryOptions query_options) {
+    return stdexec::just(
+               std::move(options), std::move(sql), std::move(params), std::move(query_options))
+         | stdexec::let_value(
+               [](ConnectionOptions o, std::string q, std::vector<SqlParam> p, QueryOptions qo) {
+                   return detail::query_task(std::move(o), std::move(q), std::move(p), std::move(qo));
+               });
+}
 
 struct ConnectionPoolOptions {
     ConnectionOptions connection;
@@ -242,6 +341,16 @@ struct ConnectionPoolOptions {
 
 class ConnectionPool {
 public:
+    class PooledConnection;
+    using CreateSender = exec::any_receiver_ref<
+        stdexec::completion_signatures<stdexec::set_value_t(ConnectionPool),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>>::any_sender<>;
+    using PooledConnectionSender = exec::any_receiver_ref<
+        stdexec::completion_signatures<stdexec::set_value_t(PooledConnection),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>>::any_sender<>;
+
     ConnectionPool();
     ~ConnectionPool();
 
@@ -251,19 +360,124 @@ public:
     ConnectionPool(const ConnectionPool &) = delete;
     ConnectionPool &operator=(const ConnectionPool &) = delete;
 
-    static Task<ConnectionPool> create(ConnectionPoolOptions options);
+    [[nodiscard]] static auto create(ConnectionPoolOptions options) {
+        return stdexec::just(std::move(options))
+             | stdexec::let_value(
+                   [](ConnectionPoolOptions opts) { return create_task(std::move(opts)); });
+    }
 
-    Task<QueryResult> query(std::string sql);
-    Task<QueryResult> query(std::string sql, std::vector<SqlParam> params);
-    Task<QueryResult> query(std::string sql, std::vector<SqlParam> params, QueryOptions options);
-    Task<QueryResult> execute(std::string sql);
-    Task<QueryResult> execute(std::string sql, std::vector<SqlParam> params);
-    Task<QueryResult> execute(std::string sql, std::vector<SqlParam> params, QueryOptions options);
-    Task<void> close();
+    [[nodiscard]] auto acquire();
+    [[nodiscard]] auto query(std::string sql) {
+        return stdexec::just(std::move(sql)) | stdexec::let_value([this](std::string q) {
+                   return this->query_task(std::move(q));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql, std::vector<SqlParam> params) {
+        return stdexec::just(std::move(sql), std::move(params))
+             | stdexec::let_value([this](std::string q, std::vector<SqlParam> p) {
+                   return this->query_task(std::move(q), std::move(p));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql,
+                             std::vector<SqlParam> params,
+                             QueryOptions options) {
+        return stdexec::just(std::move(sql), std::move(params), std::move(options))
+             | stdexec::let_value(
+                   [this](std::string q, std::vector<SqlParam> p, QueryOptions o) {
+                       return this->query_task(std::move(q), std::move(p), std::move(o));
+                   });
+    }
+    [[nodiscard]] auto close() {
+        return stdexec::just() | stdexec::let_value([this] { return this->close_task(); });
+    }
 
 private:
+    static CreateSender create_task(ConnectionPoolOptions options);
+
+    PooledConnectionSender acquire_task();
+    QuerySender query_task(std::string sql);
+    QuerySender query_task(std::string sql, std::vector<SqlParam> params);
+    QuerySender query_task(std::string sql,
+                           std::vector<SqlParam> params,
+                           QueryOptions options);
+    VoidSender close_task();
+
     class Impl;
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace async_uv::sql
+class ConnectionPool::PooledConnection {
+public:
+    PooledConnection() = default;
+    ~PooledConnection();
+
+    PooledConnection(const PooledConnection &) = delete;
+    PooledConnection &operator=(const PooledConnection &) = delete;
+    PooledConnection(PooledConnection &&other) noexcept;
+    PooledConnection &operator=(PooledConnection &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept;
+    void release() noexcept;
+
+    [[nodiscard]] auto query(std::string sql) {
+        return stdexec::just(std::move(sql)) | stdexec::let_value([this](std::string q) {
+                   return this->query_task(std::move(q));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql, std::vector<SqlParam> params) {
+        return stdexec::just(std::move(sql), std::move(params))
+             | stdexec::let_value([this](std::string q, std::vector<SqlParam> p) {
+                   return this->query_task(std::move(q), std::move(p));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql, QueryOptions options) {
+        return stdexec::just(std::move(sql), std::move(options))
+             | stdexec::let_value([this](std::string q, QueryOptions o) {
+                   return this->query_task(std::move(q), std::move(o));
+               });
+    }
+    [[nodiscard]] auto query(std::string sql,
+                             std::vector<SqlParam> params,
+                             QueryOptions options) {
+        return stdexec::just(std::move(sql), std::move(params), std::move(options))
+             | stdexec::let_value(
+                   [this](std::string q, std::vector<SqlParam> p, QueryOptions o) {
+                       return this->query_task(std::move(q), std::move(p), std::move(o));
+                   });
+    }
+    [[nodiscard]] auto begin() {
+        return stdexec::just() | stdexec::let_value([this] { return this->begin_task(); });
+    }
+    [[nodiscard]] auto commit() {
+        return stdexec::just() | stdexec::let_value([this] { return this->commit_task(); });
+    }
+    [[nodiscard]] auto rollback() {
+        return stdexec::just() | stdexec::let_value([this] { return this->rollback_task(); });
+    }
+
+private:
+    friend class ConnectionPool;
+
+    QuerySender query_task(std::string sql);
+    QuerySender query_task(std::string sql, std::vector<SqlParam> params);
+    QuerySender query_task(std::string sql, QueryOptions options);
+    QuerySender query_task(std::string sql,
+                           std::vector<SqlParam> params,
+                           QueryOptions options);
+
+    VoidSender begin_task();
+    VoidSender commit_task();
+    VoidSender rollback_task();
+
+    explicit PooledConnection(std::shared_ptr<ConnectionPool::Impl> impl, std::size_t index) noexcept;
+
+    std::shared_ptr<ConnectionPool::Impl> impl_;
+    std::size_t index_ = 0;
+    bool held_ = false;
+};
+
+inline auto ConnectionPool::acquire() {
+    return stdexec::just() | stdexec::let_value([this] { return this->acquire_task(); });
+}
+
+} // namespace flux::sql

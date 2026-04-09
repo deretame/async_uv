@@ -1,765 +1,897 @@
-#include "async_uv_ws/ws.h"
+#include "flux_ws/ws.h"
 
-#include <algorithm>
-#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <deque>
-#include <exception>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
-#include <string_view>
-#include <type_traits>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <async_simple/Promise.h>
-#include <async_simple/coro/FutureAwaiter.h>
-#include <libwebsockets.h>
-#include <uv.h>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/address.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/system/error_code.hpp>
+#include <openssl/ssl.h>
 
-namespace async_uv::ws {
+#include <stdexec/execution.hpp>
+
+namespace flux::ws {
 namespace {
 
-template <typename T, typename Fn>
-Task<T> post_to_runtime(Runtime &runtime, Fn &&fn) {
-    auto promise = std::make_shared<async_simple::Promise<T>>();
-    auto future = promise->getFuture().via(&runtime);
-    auto fn_holder = std::make_shared<std::decay_t<Fn>>(std::forward<Fn>(fn));
+namespace beast = boost::beast;
+namespace net = boost::asio;
+namespace ssl = net::ssl;
+namespace websocket = beast::websocket;
+using tcp = net::ip::tcp;
 
-    runtime.post([promise, fn_holder]() mutable {
-        try {
-            if constexpr (std::is_void_v<T>) {
-                (*fn_holder)();
-                promise->setValue();
-            } else {
-                promise->setValue((*fn_holder)());
-            }
-        } catch (...) {
-            promise->setException(std::current_exception());
-        }
-    });
-
-    if constexpr (std::is_void_v<T>) {
-        co_await std::move(future);
-        co_return;
-    } else {
-        co_return co_await std::move(future);
-    }
-}
-
-std::pair<int, std::string> parse_close_payload(const void *in, size_t len) {
-    if (in == nullptr || len < 2) {
-        return {0, {}};
-    }
-
-    const auto *bytes = static_cast<const unsigned char *>(in);
-    const int code = (static_cast<int>(bytes[0]) << 8) | static_cast<int>(bytes[1]);
-    std::string reason;
-    if (len > 2) {
-        reason.assign(reinterpret_cast<const char *>(bytes + 2), len - 2);
-    }
-    return {code, std::move(reason)};
-}
-
-int stream_write_flags(const StreamChunk &chunk) {
-    int flags = 0;
-    if (chunk.is_first_fragment) {
-        flags = chunk.type == MessageType::binary ? LWS_WRITE_BINARY : LWS_WRITE_TEXT;
-    } else {
-        flags = LWS_WRITE_CONTINUATION;
-    }
-    if (!chunk.is_final_fragment) {
-        flags |= LWS_WRITE_NO_FIN;
-    }
-    return flags;
-}
+constexpr std::size_t kReadChunkSize = 16 * 1024;
 
 template <typename T>
-struct AsyncQueue {
-    Runtime *runtime = nullptr;
-    std::deque<T> pending;
-    std::deque<std::shared_ptr<async_simple::Promise<std::optional<T>>>> waiters;
-    bool closed = false;
-
-    explicit AsyncQueue(Runtime *rt) : runtime(rt) {}
-
+class EventQueue {
+public:
     void push(T value) {
-        if (!waiters.empty()) {
-            auto waiter = std::move(waiters.front());
-            waiters.pop_front();
-            waiter->setValue(std::optional<T>(std::move(value)));
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) {
             return;
         }
-        pending.push_back(std::move(value));
+        queue_.push_back(std::move(value));
     }
 
     void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        while (!waiters.empty()) {
-            auto waiter = std::move(waiters.front());
-            waiters.pop_front();
-            waiter->setValue(std::optional<T>{});
-        }
-        pending.clear();
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
     }
 
-    Task<std::optional<T>> next() {
-        auto promise = std::make_shared<async_simple::Promise<std::optional<T>>>();
-        auto future = promise->getFuture().via(runtime);
-
-        runtime->post([this, promise]() mutable {
-            if (!pending.empty()) {
-                auto value = std::move(pending.front());
-                pending.pop_front();
-                promise->setValue(std::optional<T>(std::move(value)));
-                return;
+    Task<std::optional<T>> pop() {
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!queue_.empty()) {
+                    T value = std::move(queue_.front());
+                    queue_.pop_front();
+                    co_return std::optional<T>(std::move(value));
+                }
+                if (closed_) {
+                    co_return std::nullopt;
+                }
             }
-
-            if (closed) {
-                promise->setValue(std::optional<T>{});
-                return;
-            }
-
-            waiters.push_back(std::move(promise));
-        });
-
-        co_return co_await std::move(future);
+            co_await flux::sleep_for(std::chrono::milliseconds(1));
+        }
     }
+
+private:
+    std::mutex mutex_;
+    std::deque<T> queue_;
+    bool closed_ = false;
 };
 
-template <typename StateT>
-void close_service_timer(StateT &state) {
-    if (!state.service_timer_initialized || state.service_timer_closing) {
-        return;
+std::string ensure_path(std::string value) {
+    if (value.empty()) {
+        return "/";
+    }
+    if (value.front() != '/') {
+        value.insert(value.begin(), '/');
+    }
+    return value;
+}
+
+std::shared_ptr<ssl::context> create_server_tls_context(const Server::Config &config) {
+    if (config.tls_cert_file.empty() || config.tls_private_key_file.empty()) {
+        throw WebSocketError("websocket tls server requires cert and private key file");
     }
 
-    uv_timer_stop(&state.service_timer);
-    if (uv_is_closing(reinterpret_cast<uv_handle_t *>(&state.service_timer)) != 0) {
-        return;
+    auto ctx = std::make_shared<ssl::context>(ssl::context::tls_server);
+    ctx->set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 |
+                     ssl::context::single_dh_use);
+
+    boost::system::error_code ec;
+    ctx->use_certificate_chain_file(config.tls_cert_file, ec);
+    if (ec) {
+        throw WebSocketError("failed to load websocket tls cert: " + ec.message());
     }
 
-    state.service_timer_closing = true;
-    state.timer_keepalive = state.shared_from_this();
-    uv_close(reinterpret_cast<uv_handle_t *>(&state.service_timer), [](uv_handle_t *handle) {
-        auto *self = static_cast<StateT *>(handle->data);
-        if (self == nullptr) {
+    ctx->use_private_key_file(config.tls_private_key_file, ssl::context::pem, ec);
+    if (ec) {
+        throw WebSocketError("failed to load websocket tls key: " + ec.message());
+    }
+
+    if (!config.tls_ca_file.empty()) {
+        ctx->load_verify_file(config.tls_ca_file, ec);
+        if (ec) {
+            throw WebSocketError("failed to load websocket tls CA file: " + ec.message());
+        }
+    }
+
+    return ctx;
+}
+
+std::shared_ptr<ssl::context> create_client_tls_context(const Client::Config &config) {
+    auto ctx = std::make_shared<ssl::context>(ssl::context::tls_client);
+    boost::system::error_code ec;
+
+    if (config.tls_allow_insecure) {
+        ctx->set_verify_mode(ssl::verify_none, ec);
+    } else {
+        ctx->set_verify_mode(ssl::verify_peer, ec);
+        if (ec) {
+            throw WebSocketError("failed to set websocket tls verify mode: " + ec.message());
+        }
+
+        if (!config.tls_ca_file.empty()) {
+            ctx->load_verify_file(config.tls_ca_file, ec);
+            if (ec) {
+                throw WebSocketError("failed to load websocket client CA file: " + ec.message());
+            }
+        } else {
+            ctx->set_default_verify_paths(ec);
+            if (ec) {
+                throw WebSocketError(
+                    "failed to load default websocket TLS verify paths: " + ec.message());
+            }
+        }
+    }
+
+    return ctx;
+}
+
+class SessionHandle {
+public:
+    virtual ~SessionHandle() = default;
+    virtual void start() = 0;
+    virtual bool send(StreamChunk chunk) = 0;
+    virtual bool close(int code, std::string reason) = 0;
+    virtual void stop() = 0;
+};
+
+template <class WsStream>
+class WebSocketSession final : public SessionHandle,
+                               public std::enable_shared_from_this<WebSocketSession<WsStream>> {
+public:
+    using MessageHandler = std::function<void(Message)>;
+    using CloseHandler = std::function<void(int, std::string)>;
+
+    WebSocketSession(WsStream ws,
+                     MessageHandler on_message,
+                     CloseHandler on_close,
+                     std::vector<std::shared_ptr<void>> keep_alive = {})
+        : keep_alive_(std::move(keep_alive)),
+          ws_(std::move(ws)),
+          on_message_(std::move(on_message)),
+          on_close_(std::move(on_close)) {}
+
+    ~WebSocketSession() override {
+        stop();
+        join_reader();
+    }
+
+    void start() override {
+        auto self = this->shared_from_this();
+        reader_thread_ = std::thread([self = std::move(self)] {
+            self->read_loop();
+        });
+    }
+
+    bool send(StreamChunk chunk) override {
+        if (stopped_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        if (stopped_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        if (chunk.is_first_fragment || !outbound_message_active_) {
+            ws_.binary(chunk.type == MessageType::binary);
+            outbound_message_active_ = true;
+        }
+
+        boost::system::error_code ec;
+        ws_.write_some(chunk.is_final_fragment, net::buffer(chunk.payload), ec);
+        if (ec) {
+            outbound_message_active_ = false;
+            request_transport_stop();
+            if (ec == websocket::error::closed) {
+                const auto reason = ws_.reason();
+                report_close_once(static_cast<int>(reason.code), std::string(reason.reason));
+            } else {
+                report_close_once(1006, ec.message());
+            }
+            return false;
+        }
+
+        outbound_message_active_ = !chunk.is_final_fragment;
+        return true;
+    }
+
+    bool close(int code, std::string reason) override {
+        if (stopped_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        report_close_once(code, std::move(reason));
+        request_transport_stop();
+        return true;
+    }
+
+    void stop() override {
+        request_transport_stop();
+    }
+
+private:
+    void read_loop() {
+        while (!stopped_.load(std::memory_order_acquire)) {
+            beast::flat_buffer buffer;
+            boost::system::error_code ec;
+
+            const std::size_t bytes = ws_.read_some(buffer.prepare(kReadChunkSize), ec);
+            if (ec) {
+                if (ec == websocket::error::closed) {
+                    const auto reason = ws_.reason();
+                    report_close_once(static_cast<int>(reason.code), std::string(reason.reason));
+                } else {
+                    report_close_once(1006, ec.message());
+                }
+                request_transport_stop();
+                break;
+            }
+
+            buffer.commit(bytes);
+
+            Message message;
+            message.type = ws_.got_text() ? MessageType::text : MessageType::binary;
+            message.payload = beast::buffers_to_string(buffer.data());
+            message.is_first_fragment = next_inbound_is_first_fragment_;
+            message.is_final_fragment = ws_.is_message_done();
+            next_inbound_is_first_fragment_ = message.is_final_fragment;
+
+            if (on_message_) {
+                on_message_(std::move(message));
+            }
+
+            buffer.consume(buffer.size());
+        }
+    }
+
+    void request_transport_stop() {
+        bool expected = false;
+        if (!stopped_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
             return;
         }
-        self->service_timer_initialized = false;
-        self->service_timer_closing = false;
-        self->timer_keepalive.reset();
-    });
+
+        boost::system::error_code ignored;
+        auto &lowest = beast::get_lowest_layer(ws_);
+        lowest.socket().shutdown(tcp::socket::shutdown_both, ignored);
+        lowest.socket().close(ignored);
+    }
+
+    void report_close_once(int code, std::string reason) {
+        bool expected = false;
+        if (!close_reported_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+
+        if (on_close_) {
+            on_close_(code, std::move(reason));
+        }
+    }
+
+    void join_reader() {
+        if (!reader_thread_.joinable()) {
+            return;
+        }
+
+        if (reader_thread_.get_id() == std::this_thread::get_id()) {
+            reader_thread_.detach();
+            return;
+        }
+
+        reader_thread_.join();
+    }
+
+    std::vector<std::shared_ptr<void>> keep_alive_;
+    WsStream ws_;
+    MessageHandler on_message_;
+    CloseHandler on_close_;
+
+    std::mutex write_mutex_;
+    std::thread reader_thread_;
+    std::atomic<bool> stopped_{false};
+    std::atomic<bool> close_reported_{false};
+    bool outbound_message_active_ = false;
+    bool next_inbound_is_first_fragment_ = true;
+};
+
+struct ServerState;
+
+std::shared_ptr<SessionHandle> make_server_plain_session(tcp::socket socket,
+                                                         std::uint64_t connection_id,
+                                                         const std::shared_ptr<ServerState> &state);
+
+std::shared_ptr<SessionHandle> make_server_tls_session(tcp::socket socket,
+                                                       std::uint64_t connection_id,
+                                                       const std::shared_ptr<ServerState> &state,
+                                                       const std::shared_ptr<ssl::context> &tls_ctx);
+
+struct ServerState {
+    explicit ServerState(Server::Config cfg) : config(std::move(cfg)) {}
+
+    Server::Config config;
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<SessionHandle>> connections;
+    std::uint64_t next_connection_id = 1;
+    int bound_port = 0;
+    bool started = false;
+    bool stopping = false;
+
+    std::shared_ptr<net::io_context> accept_ioc;
+    std::shared_ptr<tcp::acceptor> acceptor;
+    std::shared_ptr<ssl::context> tls_ctx;
+    std::thread accept_thread;
+
+    EventQueue<ServerEvent> events;
+};
+
+std::optional<tcp::endpoint> parse_listen_endpoint(std::string_view host, int port) {
+    if (port < 0 || port > 65535) {
+        return std::nullopt;
+    }
+
+    boost::system::error_code ec;
+    const auto address = net::ip::make_address(host, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+
+    return tcp::endpoint(address, static_cast<unsigned short>(port));
+}
+
+void emit_server_close(const std::shared_ptr<ServerState> &state,
+                       std::uint64_t connection_id,
+                       int code,
+                       std::string reason) {
+    if (!state) {
+        return;
+    }
+
+    ServerEvent event;
+    event.kind = ServerEvent::Kind::close;
+    event.connection_id = connection_id;
+    event.close_code = code;
+    event.close_reason = std::move(reason);
+    state->events.push(std::move(event));
+}
+
+void emit_server_message(const std::shared_ptr<ServerState> &state,
+                         std::uint64_t connection_id,
+                         Message message) {
+    if (!state) {
+        return;
+    }
+
+    ServerEvent event;
+    event.kind = ServerEvent::Kind::message;
+    event.connection_id = connection_id;
+    event.message = std::move(message);
+    state->events.push(std::move(event));
+}
+
+void remove_server_connection(const std::shared_ptr<ServerState> &state,
+                              std::uint64_t connection_id,
+                              int code,
+                              std::string reason) {
+    if (!state) {
+        return;
+    }
+
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto it = state->connections.find(connection_id);
+        if (it != state->connections.end()) {
+            state->connections.erase(it);
+            removed = true;
+        }
+    }
+
+    if (removed) {
+        emit_server_close(state, connection_id, code, std::move(reason));
+    }
+}
+
+std::shared_ptr<SessionHandle> make_server_plain_session(tcp::socket socket,
+                                                         std::uint64_t connection_id,
+                                                         const std::shared_ptr<ServerState> &state) {
+    websocket::stream<beast::tcp_stream> ws(std::move(socket));
+    ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+
+    boost::system::error_code ec;
+    ws.accept(ec);
+    if (ec) {
+        return nullptr;
+    }
+
+    auto weak_state = std::weak_ptr<ServerState>(state);
+    auto session = std::make_shared<WebSocketSession<decltype(ws)>>(
+        std::move(ws),
+        [weak_state, connection_id](Message message) mutable {
+            if (auto locked = weak_state.lock()) {
+                emit_server_message(locked, connection_id, std::move(message));
+            }
+        },
+        [weak_state, connection_id](int code, std::string reason) mutable {
+            if (auto locked = weak_state.lock()) {
+                remove_server_connection(locked, connection_id, code, std::move(reason));
+            }
+        });
+
+    return session;
+}
+
+std::shared_ptr<SessionHandle> make_server_tls_session(tcp::socket socket,
+                                                       std::uint64_t connection_id,
+                                                       const std::shared_ptr<ServerState> &state,
+                                                       const std::shared_ptr<ssl::context> &tls_ctx) {
+    if (!tls_ctx) {
+        return nullptr;
+    }
+
+    websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws(std::move(socket), *tls_ctx);
+    ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+
+    boost::system::error_code ec;
+    ws.next_layer().handshake(ssl::stream_base::server, ec);
+    if (ec) {
+        return nullptr;
+    }
+
+    ws.accept(ec);
+    if (ec) {
+        return nullptr;
+    }
+
+    auto weak_state = std::weak_ptr<ServerState>(state);
+    auto session = std::make_shared<WebSocketSession<decltype(ws)>>(
+        std::move(ws),
+        [weak_state, connection_id](Message message) mutable {
+            if (auto locked = weak_state.lock()) {
+                emit_server_message(locked, connection_id, std::move(message));
+            }
+        },
+        [weak_state, connection_id](int code, std::string reason) mutable {
+            if (auto locked = weak_state.lock()) {
+                remove_server_connection(locked, connection_id, code, std::move(reason));
+            }
+        });
+
+    return session;
+}
+
+void run_accept_loop(const std::shared_ptr<ServerState> &state) {
+    while (true) {
+        std::shared_ptr<tcp::acceptor> acceptor;
+        std::shared_ptr<net::io_context> ioc;
+        std::shared_ptr<ssl::context> tls_ctx;
+        bool use_tls = false;
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->started || state->stopping || !state->acceptor || !state->accept_ioc) {
+                break;
+            }
+            acceptor = state->acceptor;
+            ioc = state->accept_ioc;
+            tls_ctx = state->tls_ctx;
+            use_tls = state->config.use_tls;
+        }
+
+        tcp::socket socket(*ioc);
+        boost::system::error_code ec;
+        acceptor->accept(socket, ec);
+        if (ec) {
+            if (ec == net::error::would_block || ec == net::error::try_again) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->stopping || !state->started || ec == net::error::operation_aborted ||
+                ec == net::error::bad_descriptor) {
+                break;
+            }
+            continue;
+        }
+
+        std::uint64_t connection_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->started || state->stopping) {
+                boost::system::error_code ignored;
+                socket.shutdown(tcp::socket::shutdown_both, ignored);
+                socket.close(ignored);
+                break;
+            }
+            connection_id = state->next_connection_id++;
+        }
+
+        std::shared_ptr<SessionHandle> session;
+        if (use_tls) {
+            session = make_server_tls_session(
+                std::move(socket), connection_id, state, std::move(tls_ctx));
+        } else {
+            session = make_server_plain_session(std::move(socket), connection_id, state);
+        }
+
+        if (!session) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->started || state->stopping) {
+                session->stop();
+                break;
+            }
+            state->connections.insert_or_assign(connection_id, session);
+        }
+
+        ServerEvent event;
+        event.kind = ServerEvent::Kind::open;
+        event.connection_id = connection_id;
+        state->events.push(std::move(event));
+
+        session->start();
+    }
+}
+
+struct ClientState {
+    explicit ClientState(Client::Config cfg) : config(std::move(cfg)) {}
+
+    Client::Config config;
+    std::mutex mutex;
+    std::shared_ptr<SessionHandle> session;
+    std::shared_ptr<net::io_context> io_context;
+    bool connected = false;
+    std::uint64_t generation = 0;
+    EventQueue<Client::Event> events;
+};
+
+std::shared_ptr<SessionHandle> make_client_plain_session(const Client::Config &config,
+                                                         const std::shared_ptr<ClientState> &state,
+                                                         std::uint64_t generation,
+                                                         const std::shared_ptr<net::io_context> &io_context) {
+    tcp::resolver resolver(*io_context);
+    boost::system::error_code ec;
+
+    auto endpoints = resolver.resolve(config.address, std::to_string(config.port), ec);
+    if (ec) {
+        throw WebSocketError("websocket resolve failed: " + ec.message());
+    }
+
+    websocket::stream<beast::tcp_stream> ws(*io_context);
+    ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+
+    beast::get_lowest_layer(ws).connect(endpoints, ec);
+    if (ec) {
+        throw WebSocketError("websocket connect failed: " + ec.message());
+    }
+
+    const std::string host = config.host.empty() ? config.address : config.host;
+    const std::string path = ensure_path(config.path);
+    ws.handshake(host, path, ec);
+    if (ec) {
+        throw WebSocketError("websocket handshake failed: " + ec.message());
+    }
+
+    auto weak_state = std::weak_ptr<ClientState>(state);
+    auto session = std::make_shared<WebSocketSession<decltype(ws)>>(
+        std::move(ws),
+        [weak_state, generation](Message message) mutable {
+            if (auto locked = weak_state.lock()) {
+                Client::Event event;
+                event.kind = Client::Event::Kind::message;
+                event.message = std::move(message);
+                locked->events.push(std::move(event));
+            }
+        },
+        [weak_state, generation](int code, std::string reason) mutable {
+            if (auto locked = weak_state.lock()) {
+                {
+                    std::lock_guard<std::mutex> lock(locked->mutex);
+                    if (locked->generation != generation) {
+                        return;
+                    }
+                    locked->connected = false;
+                    locked->session.reset();
+                    locked->io_context.reset();
+                }
+
+                Client::Event event;
+                event.kind = Client::Event::Kind::close;
+                event.close_code = code;
+                event.close_reason = std::move(reason);
+                locked->events.push(std::move(event));
+            }
+        },
+        std::vector<std::shared_ptr<void>>{io_context});
+
+    return session;
+}
+
+std::shared_ptr<SessionHandle> make_client_tls_session(const Client::Config &config,
+                                                       const std::shared_ptr<ClientState> &state,
+                                                       std::uint64_t generation,
+                                                       const std::shared_ptr<net::io_context> &io_context) {
+    tcp::resolver resolver(*io_context);
+    boost::system::error_code ec;
+
+    auto endpoints = resolver.resolve(config.address, std::to_string(config.port), ec);
+    if (ec) {
+        throw WebSocketError("websocket resolve failed: " + ec.message());
+    }
+
+    auto tls_ctx = create_client_tls_context(config);
+    websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws(*io_context, *tls_ctx);
+    ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+
+    beast::get_lowest_layer(ws).connect(endpoints, ec);
+    if (ec) {
+        throw WebSocketError("websocket connect failed: " + ec.message());
+    }
+
+    const std::string host = config.host.empty() ? config.address : config.host;
+
+    if (!SSL_set_tlsext_host_name(ws.next_layer().native_handle(), host.c_str())) {
+        throw WebSocketError("failed to set websocket TLS SNI host");
+    }
+
+    ws.next_layer().handshake(ssl::stream_base::client, ec);
+    if (ec) {
+        throw WebSocketError("websocket TLS handshake failed: " + ec.message());
+    }
+
+    const std::string path = ensure_path(config.path);
+    ws.handshake(host, path, ec);
+    if (ec) {
+        throw WebSocketError("websocket handshake failed: " + ec.message());
+    }
+
+    auto weak_state = std::weak_ptr<ClientState>(state);
+    auto session = std::make_shared<WebSocketSession<decltype(ws)>>(
+        std::move(ws),
+        [weak_state, generation](Message message) mutable {
+            if (auto locked = weak_state.lock()) {
+                Client::Event event;
+                event.kind = Client::Event::Kind::message;
+                event.message = std::move(message);
+                locked->events.push(std::move(event));
+            }
+        },
+        [weak_state, generation](int code, std::string reason) mutable {
+            if (auto locked = weak_state.lock()) {
+                {
+                    std::lock_guard<std::mutex> lock(locked->mutex);
+                    if (locked->generation != generation) {
+                        return;
+                    }
+                    locked->connected = false;
+                    locked->session.reset();
+                    locked->io_context.reset();
+                }
+
+                Client::Event event;
+                event.kind = Client::Event::Kind::close;
+                event.close_code = code;
+                event.close_reason = std::move(reason);
+                locked->events.push(std::move(event));
+            }
+        },
+        std::vector<std::shared_ptr<void>>{io_context, tls_ctx});
+
+    return session;
 }
 
 } // namespace
 
-struct Server::State : std::enable_shared_from_this<Server::State> {
-    struct PendingWrite {
-        std::vector<unsigned char> payload;
-        int flags = 0;
-    };
-
-    struct Connection {
-        std::uint64_t id = 0;
-        lws *wsi = nullptr;
-        std::deque<PendingWrite> writes;
-        bool close_pending = false;
-        int close_code = 1000;
-        std::string close_reason;
-        int peer_close_code = 0;
-        std::string peer_close_reason;
-    };
-
-    struct PerSessionData {
-        std::uint64_t connection_id = 0;
-    };
-
-    explicit State(Config init_config)
-        : config(std::move(init_config)), event_queue(config.runtime) {}
-
-    static State *from_wsi(lws *wsi) {
-        if (wsi == nullptr) {
-            return nullptr;
-        }
-        if (const auto *protocol = lws_get_protocol(wsi); protocol != nullptr && protocol->user) {
-            return static_cast<State *>(protocol->user);
-        }
-        return nullptr;
-    }
-
-    bool queue_write(std::uint64_t connection_id, StreamChunk chunk) {
-        const auto it = connections_by_id.find(connection_id);
-        if (it == connections_by_id.end()) {
-            return false;
-        }
-
-        auto pending = PendingWrite{};
-        pending.flags = stream_write_flags(chunk);
-        pending.payload.resize(LWS_PRE + chunk.payload.size());
-        if (!chunk.payload.empty()) {
-            std::memcpy(
-                pending.payload.data() + LWS_PRE, chunk.payload.data(), chunk.payload.size());
-        }
-
-        auto &connection = *it->second;
-        connection.writes.push_back(std::move(pending));
-        lws_callback_on_writable(connection.wsi);
-        if (auto *ctx = lws_get_context(connection.wsi); ctx != nullptr) {
-            lws_cancel_service(ctx);
-        }
-        return true;
-    }
-
-    static int callback(lws *wsi, lws_callback_reasons reason, void *user, void *in, size_t len) {
-        if (reason == LWS_CALLBACK_PROTOCOL_INIT || reason == LWS_CALLBACK_PROTOCOL_DESTROY) {
-            return 0;
-        }
-        if (reason == LWS_CALLBACK_GET_THREAD_ID) {
-#if defined(_WIN32)
-            return static_cast<int>(::GetCurrentThreadId());
-#else
-            return 0;
-#endif
-        }
-
-        State *state = from_wsi(wsi);
-        if (state == nullptr) {
-            return 0;
-        }
-
-        auto *pss = static_cast<PerSessionData *>(user);
-
-        switch (reason) {
-            case LWS_CALLBACK_ESTABLISHED: {
-                auto connection = std::make_shared<Connection>();
-                connection->id = state->next_connection_id++;
-                connection->wsi = wsi;
-                if (pss != nullptr) {
-                    pss->connection_id = connection->id;
-                }
-
-                state->connections_by_id[connection->id] = connection;
-                state->connections_by_wsi[wsi] = connection;
-
-                if (state->bound_port < 0) {
-                    if (auto *vh = lws_get_vhost(wsi)) {
-                        state->bound_port = lws_get_vhost_listen_port(vh);
-                    }
-                }
-
-                ServerEvent event;
-                event.kind = ServerEvent::Kind::open;
-                event.connection_id = connection->id;
-                state->event_queue.push(std::move(event));
-                break;
-            }
-            case LWS_CALLBACK_RECEIVE: {
-                const auto it = state->connections_by_wsi.find(wsi);
-                if (it == state->connections_by_wsi.end()) {
-                    break;
-                }
-
-                ServerEvent event;
-                event.kind = ServerEvent::Kind::message;
-                event.connection_id = it->second->id;
-
-                Message msg;
-                msg.type = lws_frame_is_binary(wsi) ? MessageType::binary : MessageType::text;
-                if (in != nullptr && len > 0) {
-                    msg.payload.assign(static_cast<const char *>(in), len);
-                }
-                msg.is_first_fragment = lws_is_first_fragment(wsi) != 0;
-                msg.is_final_fragment = lws_is_final_fragment(wsi) != 0;
-                event.message = std::move(msg);
-                state->event_queue.push(std::move(event));
-                break;
-            }
-            case LWS_CALLBACK_SERVER_WRITEABLE: {
-                const auto it = state->connections_by_wsi.find(wsi);
-                if (it == state->connections_by_wsi.end()) {
-                    break;
-                }
-
-                auto &conn = *it->second;
-                if (conn.close_pending) {
-                    lws_close_reason(wsi,
-                                     static_cast<lws_close_status>(conn.close_code),
-                                     reinterpret_cast<unsigned char *>(conn.close_reason.data()),
-                                     conn.close_reason.size());
-                    return -1;
-                }
-
-                if (!conn.writes.empty()) {
-                    auto &pending = conn.writes.front();
-                    const int payload_size = static_cast<int>(pending.payload.size() - LWS_PRE);
-                    const int written = lws_write(wsi,
-                                                  pending.payload.data() + LWS_PRE,
-                                                  static_cast<unsigned int>(payload_size),
-                                                  static_cast<lws_write_protocol>(pending.flags));
-                    if (written != payload_size) {
-                        return -1;
-                    }
-                    conn.writes.pop_front();
-                    if (!conn.writes.empty()) {
-                        lws_callback_on_writable(wsi);
-                    }
-                }
-                break;
-            }
-            case LWS_CALLBACK_WS_PEER_INITIATED_CLOSE: {
-                const auto it = state->connections_by_wsi.find(wsi);
-                if (it == state->connections_by_wsi.end()) {
-                    break;
-                }
-                auto [code, reason_text] = parse_close_payload(in, len);
-                it->second->peer_close_code = code;
-                it->second->peer_close_reason = std::move(reason_text);
-                break;
-            }
-            case LWS_CALLBACK_CLOSED: {
-                const auto it = state->connections_by_wsi.find(wsi);
-                if (it == state->connections_by_wsi.end()) {
-                    break;
-                }
-                auto conn = it->second;
-                state->connections_by_wsi.erase(it);
-                state->connections_by_id.erase(conn->id);
-
-                ServerEvent event;
-                event.kind = ServerEvent::Kind::close;
-                event.connection_id = conn->id;
-                event.close_code = conn->peer_close_code;
-                event.close_reason = conn->peer_close_reason;
-                state->event_queue.push(std::move(event));
-                break;
-            }
-            default:
-                break;
-        }
-
-        return 0;
-    }
-
-    Config config;
-    lws_context *context = nullptr;
-    std::array<lws_protocols, 2> protocols{};
-    std::array<void *, 1> foreign_loops{};
-    uv_timer_t service_timer{};
-    bool service_timer_initialized = false;
-    bool service_timer_closing = false;
-    std::shared_ptr<State> timer_keepalive;
-
-    std::atomic<bool> is_started{false};
-    std::atomic<int> bound_port{-1};
-    std::uint64_t next_connection_id = 1;
-    std::unordered_map<std::uint64_t, std::shared_ptr<Connection>> connections_by_id;
-    std::unordered_map<lws *, std::shared_ptr<Connection>> connections_by_wsi;
-    AsyncQueue<ServerEvent> event_queue;
+struct Server::State : ServerState {
+    explicit State(Config cfg) : ServerState(std::move(cfg)) {}
 };
 
-struct Client::State : std::enable_shared_from_this<Client::State> {
-    struct PendingWrite {
-        std::vector<unsigned char> payload;
-        int flags = 0;
-    };
-
-    struct PerSessionData {
-        int peer_close_code = 0;
-        std::string peer_close_reason;
-    };
-
-    explicit State(Config init_config)
-        : config(std::move(init_config)), event_queue(config.runtime) {}
-
-    static State *from_wsi(lws *wsi) {
-        if (wsi == nullptr) {
-            return nullptr;
-        }
-        if (const auto *protocol = lws_get_protocol(wsi); protocol != nullptr && protocol->user) {
-            return static_cast<State *>(protocol->user);
-        }
-        return nullptr;
-    }
-
-    bool queue_write(StreamChunk chunk) {
-        if (!is_connected.load() || active_wsi == nullptr) {
-            return false;
-        }
-
-        PendingWrite pending;
-        pending.flags = stream_write_flags(chunk);
-        pending.payload.resize(LWS_PRE + chunk.payload.size());
-        if (!chunk.payload.empty()) {
-            std::memcpy(
-                pending.payload.data() + LWS_PRE, chunk.payload.data(), chunk.payload.size());
-        }
-
-        writes.push_back(std::move(pending));
-        lws_callback_on_writable(active_wsi);
-        if (auto *ctx = lws_get_context(active_wsi); ctx != nullptr) {
-            lws_cancel_service(ctx);
-        }
-        return true;
-    }
-
-    void finish_connect_success() {
-        if (auto promise = std::move(connect_promise); promise) {
-            promise->setValue();
-        }
-    }
-
-    void finish_connect_error(std::string message) {
-        if (auto promise = std::move(connect_promise); promise) {
-            promise->setException(std::make_exception_ptr(WebSocketError(std::move(message))));
-        }
-    }
-
-    void ensure_context() {
-        if (context != nullptr) {
-            return;
-        }
-
-        protocols[0] = lws_protocols{
-            "async_uv_layer2_ws",
-            +[](lws *wsi, lws_callback_reasons reason, void *user, void *in, size_t len) -> int {
-                return State::callback(wsi, reason, user, in, len);
-            },
-            sizeof(PerSessionData),
-            0,
-            0,
-            this,
-            0,
-        };
-        protocols[1] = lws_protocols{nullptr, nullptr, 0, 0, 0, nullptr, 0};
-
-        lws_context_creation_info info{};
-        info.port = CONTEXT_PORT_NO_LISTEN;
-        info.protocols = protocols.data();
-        info.pvo = nullptr;
-        info.timeout_secs = 1;
-        info.options = LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_LIBUV;
-        foreign_loops[0] = config.runtime->loop();
-        info.foreign_loops = foreign_loops.data();
-        if (config.use_tls) {
-#if defined(LWS_WITH_TLS)
-            info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-            if (!config.tls_ca_file.empty()) {
-                info.client_ssl_ca_filepath = config.tls_ca_file.c_str();
-            }
-#endif
-        }
-        info.fd_limit_per_thread = 4;
-        info.user = this;
-
-        context = lws_create_context(&info);
-        if (context == nullptr) {
-            throw WebSocketError("libwebsockets client context creation failed");
-        }
-    }
-
-    static int callback(lws *wsi, lws_callback_reasons reason, void *user, void *in, size_t len) {
-        if (reason == LWS_CALLBACK_PROTOCOL_INIT || reason == LWS_CALLBACK_PROTOCOL_DESTROY) {
-            return 0;
-        }
-        if (reason == LWS_CALLBACK_GET_THREAD_ID) {
-#if defined(_WIN32)
-            return static_cast<int>(::GetCurrentThreadId());
-#else
-            return 0;
-#endif
-        }
-
-        auto *state = from_wsi(wsi);
-        if (state == nullptr) {
-            return 0;
-        }
-        auto *pss = static_cast<PerSessionData *>(user);
-
-        switch (reason) {
-            case LWS_CALLBACK_CLIENT_ESTABLISHED: {
-                state->active_wsi = wsi;
-                state->is_connected.store(true);
-
-                Client::Event event;
-                event.kind = Client::Event::Kind::open;
-                state->event_queue.push(std::move(event));
-                state->finish_connect_success();
-                break;
-            }
-            case LWS_CALLBACK_CLIENT_CONNECTION_ERROR: {
-                state->active_wsi = nullptr;
-                state->is_connected.store(false);
-
-                std::string message =
-                    in ? static_cast<const char *>(in) : "websocket client connection error";
-                Client::Event event;
-                event.kind = Client::Event::Kind::error;
-                event.error = message;
-                state->event_queue.push(std::move(event));
-                state->finish_connect_error(message);
-                break;
-            }
-            case LWS_CALLBACK_CLIENT_RECEIVE: {
-                Client::Event event;
-                event.kind = Client::Event::Kind::message;
-                Message msg;
-                msg.type = lws_frame_is_binary(wsi) ? MessageType::binary : MessageType::text;
-                if (in != nullptr && len > 0) {
-                    msg.payload.assign(static_cast<const char *>(in), len);
-                }
-                msg.is_first_fragment = lws_is_first_fragment(wsi) != 0;
-                msg.is_final_fragment = lws_is_final_fragment(wsi) != 0;
-                event.message = std::move(msg);
-                state->event_queue.push(std::move(event));
-                break;
-            }
-            case LWS_CALLBACK_CLIENT_WRITEABLE: {
-                if (state->close_pending) {
-                    lws_close_reason(wsi,
-                                     static_cast<lws_close_status>(state->close_code),
-                                     reinterpret_cast<unsigned char *>(state->close_reason.data()),
-                                     state->close_reason.size());
-                    return -1;
-                }
-
-                if (!state->writes.empty()) {
-                    auto &pending = state->writes.front();
-                    const int payload_size = static_cast<int>(pending.payload.size() - LWS_PRE);
-                    const int written = lws_write(wsi,
-                                                  pending.payload.data() + LWS_PRE,
-                                                  static_cast<unsigned int>(payload_size),
-                                                  static_cast<lws_write_protocol>(pending.flags));
-                    if (written != payload_size) {
-                        return -1;
-                    }
-                    state->writes.pop_front();
-                    if (!state->writes.empty()) {
-                        lws_callback_on_writable(wsi);
-                    }
-                }
-                break;
-            }
-            case LWS_CALLBACK_WS_PEER_INITIATED_CLOSE: {
-                if (pss != nullptr) {
-                    auto [code, reason_text] = parse_close_payload(in, len);
-                    pss->peer_close_code = code;
-                    pss->peer_close_reason = std::move(reason_text);
-                }
-                break;
-            }
-            case LWS_CALLBACK_CLOSED: {
-                state->active_wsi = nullptr;
-                state->is_connected.store(false);
-                state->close_pending = false;
-                state->writes.clear();
-
-                Client::Event event;
-                event.kind = Client::Event::Kind::close;
-                if (pss != nullptr) {
-                    event.close_code = pss->peer_close_code;
-                    event.close_reason = pss->peer_close_reason;
-                }
-                state->event_queue.push(std::move(event));
-
-                state->finish_connect_error("connection closed");
-                break;
-            }
-            default:
-                break;
-        }
-
-        return 0;
-    }
-
-    Config config;
-    lws_context *context = nullptr;
-    lws *active_wsi = nullptr;
-    std::array<lws_protocols, 2> protocols{};
-    std::array<void *, 1> foreign_loops{};
-    uv_timer_t service_timer{};
-    bool service_timer_initialized = false;
-    bool service_timer_closing = false;
-    std::shared_ptr<State> timer_keepalive;
-
-    std::atomic<bool> is_connected{false};
-    bool close_pending = false;
-    int close_code = 1000;
-    std::string close_reason;
-    std::deque<PendingWrite> writes;
-    std::shared_ptr<async_simple::Promise<void>> connect_promise;
-    AsyncQueue<Client::Event> event_queue;
+struct Client::State : ClientState {
+    explicit State(Config cfg) : ClientState(std::move(cfg)) {}
 };
 
-Server::Server() = default;
+Server Server::create(Config config) {
+    return Server(std::make_shared<State>(std::move(config)));
+}
+
+Server::Server() : state_(std::make_shared<State>(Config{})) {}
+
 Server::Server(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+Server::~Server() {
+    if (!state_) {
+        return;
+    }
+    try {
+        stdexec::sync_wait(stop());
+    } catch (...) {
+    }
+}
+
 Server::Server(Server &&other) noexcept : state_(std::move(other.state_)) {}
 
 Server &Server::operator=(Server &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
     state_ = std::move(other.state_);
     return *this;
 }
 
-Server::~Server() {
-    if (!state_ || state_->config.runtime == nullptr) {
-        return;
-    }
-    auto state = state_;
-    state->config.runtime->post([state]() {
-        if (state->service_timer_initialized) {
-            close_service_timer(*state);
-        }
-        state->connections_by_id.clear();
-        state->connections_by_wsi.clear();
-        if (state->context != nullptr) {
-            lws_context_destroy(state->context);
-            state->context = nullptr;
-        }
-        state->bound_port.store(-1);
-        state->is_started.store(false);
-        state->event_queue.close();
-    });
-}
-
-Server Server::create(Config config) {
-    if (config.runtime == nullptr) {
-        throw WebSocketError("websocket server requires a valid async_uv::Runtime");
-    }
-    if (config.use_tls) {
-#if !defined(LWS_WITH_TLS)
-        throw WebSocketError("websocket server TLS requested but libwebsockets TLS is unavailable");
-#else
-        if (config.tls_cert_file.empty()) {
-            throw WebSocketError("websocket server TLS requires tls_cert_file");
-        }
-        if (config.tls_private_key_file.empty()) {
-            throw WebSocketError("websocket server TLS requires tls_private_key_file");
-        }
-#endif
-    }
-    return Server(std::make_shared<State>(std::move(config)));
-}
-
 Task<void> Server::start() {
     if (!state_) {
-        throw WebSocketError("websocket server is not initialized");
+        throw WebSocketError("websocket server state is null");
     }
-    auto state = state_;
-    auto &runtime = *state->config.runtime;
+    if (!state_->config.runtime) {
+        throw WebSocketError("websocket server requires runtime");
+    }
 
-    co_await post_to_runtime<void>(runtime, [state]() {
-        if (state->is_started.load()) {
-            return;
+    auto endpoint = parse_listen_endpoint(state_->config.host, state_->config.port);
+    if (!endpoint.has_value()) {
+        throw WebSocketError("invalid websocket server host or port");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->started) {
+            co_return;
         }
 
-        state->protocols[0] = lws_protocols{
-            "async_uv_layer2_ws",
-            +[](lws *wsi, lws_callback_reasons reason, void *user, void *in, size_t len) -> int {
-                return State::callback(wsi, reason, user, in, len);
-            },
-            sizeof(State::PerSessionData),
-            0,
-            0,
-            state.get(),
-            0};
-        state->protocols[1] = lws_protocols{nullptr, nullptr, 0, 0, 0, nullptr, 0};
+        state_->accept_ioc = std::make_shared<net::io_context>(1);
+        state_->acceptor = std::make_shared<tcp::acceptor>(*state_->accept_ioc);
 
-        lws_context_creation_info info{};
-        info.port = state->config.port;
-#ifdef _WIN32
-        info.iface = state->config.host.empty() ? nullptr : state->config.host.c_str();
-#else
-        info.iface = nullptr;
-#endif
-        info.protocols = state->protocols.data();
-        info.timeout_secs = 1;
-        info.options = LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_LIBUV;
-        state->foreign_loops[0] = state->config.runtime->loop();
-        info.foreign_loops = state->foreign_loops.data();
-        if (state->config.use_tls) {
-#if defined(LWS_WITH_TLS)
-            info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-            info.ssl_cert_filepath = state->config.tls_cert_file.c_str();
-            info.ssl_private_key_filepath = state->config.tls_private_key_file.c_str();
-            if (!state->config.tls_ca_file.empty()) {
-                info.ssl_ca_filepath = state->config.tls_ca_file.c_str();
-            }
-#endif
-        }
-        info.user = state.get();
-        info.pt_serv_buf_size = static_cast<unsigned int>(std::max<std::size_t>(
-            static_cast<std::size_t>(state->config.max_payload_length), 4096));
-
-        state->context = lws_create_context(&info);
-        if (state->context == nullptr) {
-            throw WebSocketError("libwebsockets context creation failed");
+        boost::system::error_code ec;
+        state_->acceptor->open(endpoint->protocol(), ec);
+        if (ec) {
+            throw WebSocketError("websocket acceptor open failed: " + ec.message());
         }
 
-        if (state->config.port != 0) {
-            state->bound_port.store(state->config.port);
+        state_->acceptor->set_option(net::socket_base::reuse_address(true), ec);
+        if (ec) {
+            throw WebSocketError("websocket acceptor reuse_address failed: " + ec.message());
+        }
+
+        state_->acceptor->bind(*endpoint, ec);
+        if (ec) {
+            throw WebSocketError("websocket acceptor bind failed: " + ec.message());
+        }
+
+        state_->acceptor->listen(net::socket_base::max_listen_connections, ec);
+        if (ec) {
+            throw WebSocketError("websocket acceptor listen failed: " + ec.message());
+        }
+
+        state_->acceptor->non_blocking(true, ec);
+        if (ec) {
+            throw WebSocketError("websocket acceptor non_blocking failed: " + ec.message());
+        }
+
+        state_->bound_port = static_cast<int>(state_->acceptor->local_endpoint().port());
+        state_->stopping = false;
+        state_->started = true;
+
+        if (state_->config.use_tls) {
+            state_->tls_ctx = create_server_tls_context(state_->config);
         } else {
-            auto *vh = lws_get_vhost_by_name(state->context, "default");
-            state->bound_port.store(vh ? lws_get_vhost_listen_port(vh) : -1);
+            state_->tls_ctx.reset();
         }
+    }
 
-        state->is_started.store(true);
+    auto state = state_;
+    state_->accept_thread = std::thread([state = std::move(state)] {
+        run_accept_loop(state);
     });
+
+    co_return;
 }
 
 Task<void> Server::stop() {
-    if (!state_ || state_->config.runtime == nullptr) {
+    if (!state_) {
         co_return;
     }
 
-    auto state = state_;
-    auto &runtime = *state->config.runtime;
-    co_await post_to_runtime<void>(runtime, [state]() {
-        if (!state->is_started.load()) {
-            return;
+    std::vector<std::shared_ptr<SessionHandle>> sessions;
+    std::thread accept_thread;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->started) {
+            state_->events.close();
+            co_return;
         }
-        if (state->service_timer_initialized) {
-            close_service_timer(*state);
+
+        state_->started = false;
+        state_->stopping = true;
+        state_->bound_port = 0;
+
+        for (auto &[_, session] : state_->connections) {
+            sessions.push_back(session);
         }
-        state->connections_by_id.clear();
-        state->connections_by_wsi.clear();
-        if (state->context != nullptr) {
-            lws_context_destroy(state->context);
-            state->context = nullptr;
+        state_->connections.clear();
+
+        if (state_->acceptor) {
+            boost::system::error_code ignored;
+            state_->acceptor->cancel(ignored);
+            state_->acceptor->close(ignored);
         }
-        state->bound_port.store(-1);
-        state->is_started.store(false);
-        state->event_queue.close();
-    });
+
+        accept_thread = std::move(state_->accept_thread);
+    }
+
+    if (accept_thread.joinable()) {
+        accept_thread.join();
+    }
+
+    for (auto &session : sessions) {
+        if (session) {
+            (void)session->close(1001, "server stopped");
+            session->stop();
+        }
+    }
+    sessions.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->acceptor.reset();
+        state_->accept_ioc.reset();
+        state_->tls_ctx.reset();
+    }
+
+    state_->events.close();
+    co_return;
 }
 
 int Server::port() const noexcept {
-    return state_ ? state_->bound_port.load() : -1;
+    if (!state_) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->bound_port;
 }
 
 bool Server::started() const noexcept {
-    return state_ && state_->is_started.load();
+    if (!state_) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->started;
 }
 
 Server::task_type Server::next() {
-    if (!state_ || state_->config.runtime == nullptr) {
-        throw WebSocketError("websocket server is not initialized");
+    if (!state_) {
+        co_return std::nullopt;
     }
-    co_return co_await state_->event_queue.next();
+    co_return co_await state_->events.pop();
 }
 
 Server::stream_type Server::events() {
     auto state = state_;
-    if (!state || state->config.runtime == nullptr) {
-        return {};
-    }
-    return stream_type([state]() -> task_type {
-        co_return co_await state->event_queue.next();
+    return stream_type([state = std::move(state)]() -> task_type {
+        if (!state) {
+            co_return std::nullopt;
+        }
+        co_return co_await state->events.pop();
     });
 }
 
@@ -767,6 +899,8 @@ Task<bool> Server::send_text(std::uint64_t connection_id, std::string_view paylo
     StreamChunk chunk;
     chunk.type = MessageType::text;
     chunk.payload = std::string(payload);
+    chunk.is_first_fragment = true;
+    chunk.is_final_fragment = true;
     co_return co_await send_stream(connection_id, std::move(chunk));
 }
 
@@ -774,197 +908,212 @@ Task<bool> Server::send_binary(std::uint64_t connection_id, std::string_view pay
     StreamChunk chunk;
     chunk.type = MessageType::binary;
     chunk.payload = std::string(payload);
+    chunk.is_first_fragment = true;
+    chunk.is_final_fragment = true;
     co_return co_await send_stream(connection_id, std::move(chunk));
 }
 
 Task<bool> Server::send_stream(std::uint64_t connection_id, StreamChunk chunk) {
-    if (!state_ || state_->config.runtime == nullptr) {
+    if (!state_) {
         co_return false;
     }
-    auto state = state_;
-    auto &runtime = *state->config.runtime;
-    co_return co_await post_to_runtime<bool>(
-        runtime, [state, connection_id, chunk = std::move(chunk)]() mutable {
-            if (!state->is_started.load()) {
-                return false;
-            }
-            return state->queue_write(connection_id, std::move(chunk));
-        });
+
+    std::shared_ptr<SessionHandle> session;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->started) {
+            co_return false;
+        }
+        const auto it = state_->connections.find(connection_id);
+        if (it == state_->connections.end()) {
+            co_return false;
+        }
+        session = it->second;
+    }
+
+    if (!session) {
+        co_return false;
+    }
+
+    if (state_->config.runtime != nullptr) {
+        co_return co_await state_->config.runtime->spawn_blocking(
+            [session = std::move(session), chunk = std::move(chunk)]() mutable {
+                return session->send(std::move(chunk));
+            });
+    }
+
+    co_return session->send(std::move(chunk));
 }
 
 Task<bool> Server::close(std::uint64_t connection_id, int code, std::string reason) {
-    if (!state_ || state_->config.runtime == nullptr) {
+    if (!state_) {
         co_return false;
     }
-    auto state = state_;
-    auto &runtime = *state->config.runtime;
-    co_return co_await post_to_runtime<bool>(
-        runtime, [state, connection_id, code, reason = std::move(reason)]() mutable {
-            if (!state->is_started.load()) {
-                return false;
-            }
-            const auto it = state->connections_by_id.find(connection_id);
-            if (it == state->connections_by_id.end()) {
-                return false;
-            }
-            it->second->close_pending = true;
-            it->second->close_code = code;
-            it->second->close_reason = std::move(reason);
-            lws_callback_on_writable(it->second->wsi);
-            if (auto *ctx = lws_get_context(it->second->wsi); ctx != nullptr) {
-                lws_cancel_service(ctx);
-            }
-            return true;
-        });
+
+    std::shared_ptr<SessionHandle> session;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        const auto it = state_->connections.find(connection_id);
+        if (it == state_->connections.end()) {
+            co_return false;
+        }
+        session = it->second;
+    }
+
+    if (!session) {
+        co_return false;
+    }
+
+    if (state_->config.runtime != nullptr) {
+        co_return co_await state_->config.runtime->spawn_blocking(
+            [session = std::move(session), code, reason = std::move(reason)]() mutable {
+                return session->close(code, std::move(reason));
+            });
+    }
+
+    co_return session->close(code, std::move(reason));
 }
 
-Client::Client() = default;
+Client Client::create(Config config) {
+    return Client(std::make_shared<State>(std::move(config)));
+}
+
+Client::Client() : state_(std::make_shared<State>(Config{})) {}
+
 Client::Client(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+Client::~Client() {
+    if (!state_) {
+        return;
+    }
+    try {
+        stdexec::sync_wait(close(1000, "client destroyed"));
+    } catch (...) {
+    }
+}
+
 Client::Client(Client &&other) noexcept : state_(std::move(other.state_)) {}
 
 Client &Client::operator=(Client &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
     state_ = std::move(other.state_);
     return *this;
 }
 
-Client::~Client() {
-    if (!state_ || state_->config.runtime == nullptr) {
-        return;
-    }
-    auto state = state_;
-    state->config.runtime->post([state]() {
-        if (state->service_timer_initialized) {
-            close_service_timer(*state);
-        }
-        state->writes.clear();
-        state->active_wsi = nullptr;
-        state->is_connected.store(false);
-        if (state->context != nullptr) {
-            lws_context_destroy(state->context);
-            state->context = nullptr;
-        }
-        state->event_queue.close();
-        state->finish_connect_error("websocket client destroyed");
-    });
-}
-
-Client Client::create(Config config) {
-    if (config.runtime == nullptr) {
-        throw WebSocketError("websocket client requires a valid async_uv::Runtime");
-    }
-    if (config.port <= 0 || config.port > 65535) {
-        throw WebSocketError("websocket client requires a valid destination port");
-    }
-#if !defined(LWS_WITH_TLS)
-    if (config.use_tls) {
-        throw WebSocketError("websocket client TLS requested but libwebsockets TLS is unavailable");
-    }
-#endif
-    if (config.use_tls && config.host.empty()) {
-        config.host = config.address;
-    }
-    return Client(std::make_shared<State>(std::move(config)));
-}
-
 Task<void> Client::connect() {
-    if (!state_ || state_->config.runtime == nullptr) {
-        throw WebSocketError("websocket client is not initialized");
+    if (!state_) {
+        throw WebSocketError("websocket client state is null");
     }
 
-    auto state = state_;
-    auto &runtime = *state->config.runtime;
-    auto connect_promise = std::make_shared<async_simple::Promise<void>>();
-    auto connect_future = connect_promise->getFuture().via(&runtime);
+    auto *runtime = state_->config.runtime;
+    if (!runtime) {
+        throw WebSocketError("websocket client requires runtime");
+    }
 
-    co_await post_to_runtime<void>(runtime, [state, connect_promise]() mutable {
-        state->ensure_context();
-
-        if (state->is_connected.load()) {
-            connect_promise->setValue();
-            return;
+    std::uint64_t generation = 0;
+    auto io_context = std::make_shared<net::io_context>(1);
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->connected) {
+            co_return;
         }
-        if (state->connect_promise) {
-            connect_promise->setException(std::make_exception_ptr(
-                WebSocketError("websocket client connect already in progress")));
-            return;
-        }
+        generation = ++state_->generation;
+    }
 
-        state->connect_promise = connect_promise;
-
-        lws_client_connect_info info{};
-        info.context = state->context;
-        info.address = state->config.address.c_str();
-        info.port = state->config.port;
-        info.path = state->config.path.c_str();
-        info.host =
-            state->config.host.empty() ? state->config.address.c_str() : state->config.host.c_str();
-        info.origin = state->config.origin.empty() ? info.host : state->config.origin.c_str();
-        info.protocol = state->protocols[0].name;
-        info.local_protocol_name = state->protocols[0].name;
-        info.ietf_version_or_minus_one = -1;
-        info.pwsi = &state->active_wsi;
-        info.vhost = lws_get_vhost_by_name(state->context, "default");
-        if (state->config.use_tls) {
-#if defined(LWS_WITH_TLS)
-            info.ssl_connection = LCCSCF_USE_SSL;
-            if (state->config.tls_allow_insecure) {
-                info.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
-                info.ssl_connection |= LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
-                info.ssl_connection |= LCCSCF_ALLOW_INSECURE;
-            }
-#endif
+    auto session = co_await runtime->spawn_blocking([config = state_->config,
+                                                     state = state_,
+                                                     generation,
+                                                     io_context]() mutable {
+        if (config.port <= 0 || config.port > 65535) {
+            throw WebSocketError("invalid websocket client port");
         }
 
-        if (!lws_client_connect_via_info(&info)) {
-            state->finish_connect_error("libwebsockets client connect creation failed");
-            Client::Event event;
-            event.kind = Client::Event::Kind::error;
-            event.error = "libwebsockets client connect creation failed";
-            state->event_queue.push(std::move(event));
+        if (config.use_tls) {
+            return make_client_tls_session(config, state, generation, io_context);
         }
+        return make_client_plain_session(config, state, generation, io_context);
     });
 
-    co_await std::move(connect_future);
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->generation != generation) {
+            if (session) {
+                session->stop();
+            }
+            throw WebSocketError("websocket client connect interrupted by a newer connect attempt");
+        }
+        state_->session = session;
+        state_->io_context = io_context;
+        state_->connected = (session != nullptr);
+    }
+
+    if (!session) {
+        throw WebSocketError("websocket client failed to create session");
+    }
+
+    Client::Event open;
+    open.kind = Client::Event::Kind::open;
+    state_->events.push(std::move(open));
+
+    session->start();
+    co_return;
 }
 
 Task<void> Client::close(int code, std::string reason) {
-    if (!state_ || state_->config.runtime == nullptr) {
+    if (!state_) {
         co_return;
     }
-    auto state = state_;
-    auto &runtime = *state->config.runtime;
-    co_await post_to_runtime<void>(runtime, [state, code, reason = std::move(reason)]() mutable {
-        if (!state->is_connected.load() || state->active_wsi == nullptr) {
-            return;
+
+    auto *runtime = state_->config.runtime;
+    if (!runtime) {
+        throw WebSocketError("websocket client requires runtime");
+    }
+
+    std::shared_ptr<SessionHandle> session;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->connected || !state_->session) {
+            co_return;
         }
-        state->close_pending = true;
-        state->close_code = code;
-        state->close_reason = std::move(reason);
-        lws_callback_on_writable(state->active_wsi);
-        if (auto *ctx = lws_get_context(state->active_wsi); ctx != nullptr) {
-            lws_cancel_service(ctx);
-        }
-    });
+        state_->connected = false;
+        session = state_->session;
+        state_->session.reset();
+        state_->io_context.reset();
+    }
+
+    co_await runtime->spawn_blocking(
+        [session = std::move(session), code, reason = std::move(reason)]() mutable {
+            (void)session->close(code, std::move(reason));
+            session->stop();
+        });
+
+    co_return;
 }
 
 bool Client::connected() const noexcept {
-    return state_ && state_->is_connected.load();
+    if (!state_) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->connected;
 }
 
 Client::task_type Client::next() {
-    if (!state_ || state_->config.runtime == nullptr) {
-        throw WebSocketError("websocket client is not initialized");
+    if (!state_) {
+        co_return std::nullopt;
     }
-    co_return co_await state_->event_queue.next();
+    co_return co_await state_->events.pop();
 }
 
 Client::stream_type Client::events() {
     auto state = state_;
-    if (!state || state->config.runtime == nullptr) {
-        return {};
-    }
-    return stream_type([state]() -> task_type {
-        co_return co_await state->event_queue.next();
+    return stream_type([state = std::move(state)]() -> task_type {
+        if (!state) {
+            co_return std::nullopt;
+        }
+        co_return co_await state->events.pop();
     });
 }
 
@@ -972,6 +1121,8 @@ Task<bool> Client::send_text(std::string_view payload) {
     StreamChunk chunk;
     chunk.type = MessageType::text;
     chunk.payload = std::string(payload);
+    chunk.is_first_fragment = true;
+    chunk.is_final_fragment = true;
     co_return co_await send_stream(std::move(chunk));
 }
 
@@ -979,18 +1130,34 @@ Task<bool> Client::send_binary(std::string_view payload) {
     StreamChunk chunk;
     chunk.type = MessageType::binary;
     chunk.payload = std::string(payload);
+    chunk.is_first_fragment = true;
+    chunk.is_final_fragment = true;
     co_return co_await send_stream(std::move(chunk));
 }
 
 Task<bool> Client::send_stream(StreamChunk chunk) {
-    if (!state_ || state_->config.runtime == nullptr) {
+    if (!state_) {
         co_return false;
     }
-    auto state = state_;
-    auto &runtime = *state_->config.runtime;
-    co_return co_await post_to_runtime<bool>(runtime, [state, chunk = std::move(chunk)]() mutable {
-        return state->queue_write(std::move(chunk));
-    });
+
+    auto *runtime = state_->config.runtime;
+    if (!runtime) {
+        throw WebSocketError("websocket client requires runtime");
+    }
+
+    std::shared_ptr<SessionHandle> session;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->connected || !state_->session) {
+            co_return false;
+        }
+        session = state_->session;
+    }
+
+    co_return co_await runtime->spawn_blocking(
+        [session = std::move(session), chunk = std::move(chunk)]() mutable {
+            return session->send(std::move(chunk));
+        });
 }
 
-} // namespace async_uv::ws
+} // namespace flux::ws

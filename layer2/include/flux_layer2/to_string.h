@@ -4,13 +4,13 @@
 #include <string>
 #include <type_traits>
 
-#include "async_uv_http/http.h"
-#include "async_uv_layer2/error.h"
-#include "async_uv_redis/redis.h"
-#include "async_uv_sql/sql.h"
-#include "async_uv_ws/ws.h"
+#include "flux_http/http.h"
+#include "flux_layer2/error.h"
+#include "flux_redis/redis.h"
+#include "flux_sql/sql.h"
+#include "flux_ws/ws.h"
 
-namespace async_uv::layer2 {
+namespace flux::layer2 {
 
 inline const char *to_string_view(ErrorKind value) {
     switch (value) {
@@ -254,4 +254,4 @@ inline std::string to_string(const T &value) {
     }
 }
 
-} // namespace async_uv::layer2
+} // namespace flux::layer2

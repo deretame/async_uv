@@ -18,12 +18,13 @@
 #include <utility>
 #include <vector>
 
-#include <ada.h>
+#include <boost/url/encode.hpp>
+#include <boost/url/rfc/unreserved_chars.hpp>
 
-#include "async_uv/runtime.h"
-#include "async_uv/task.h"
+#include "flux/runtime.h"
+#include "flux/task.h"
 
-namespace async_uv::http {
+namespace flux::http {
 
 namespace detail {
 
@@ -43,7 +44,7 @@ concept HasStdToString = requires(const T &value) {
 };
 
 inline std::string percent_encode_component(std::string_view text) {
-    return ada::unicode::percent_encode(text, ada::character_sets::WWW_FORM_URLENCODED_PERCENT_ENCODE);
+    return boost::urls::encode(text, boost::urls::unreserved_chars);
 }
 
 template <typename T>
@@ -357,7 +358,7 @@ public:
     struct Config {
         Runtime *runtime = nullptr;
         std::vector<Header> default_headers;
-        std::string user_agent = "async_uv_http/0.4";
+        std::string user_agent = "flux_http/0.4";
         std::chrono::milliseconds timeout = std::chrono::seconds(30);
         std::chrono::milliseconds connect_timeout = std::chrono::seconds(10);
         bool follow_redirects = true;
@@ -723,4 +724,4 @@ Client::RequestBuilder &Client::RequestBuilder::form_map_like(const MapLike &map
     return form_urlencoded(std::move(text));
 }
 
-} // namespace async_uv::http
+} // namespace flux::http

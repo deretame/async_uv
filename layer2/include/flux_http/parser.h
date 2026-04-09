@@ -8,10 +8,10 @@
 #include <vector>
 #include <filesystem>
 
-#include "async_uv_http/http.h"
-#include "async_uv/task.h"
+#include "flux_http/http.h"
+#include "flux/task.h"
 
-namespace async_uv::http {
+namespace flux::http {
 
 enum class ParseMode {
     request,
@@ -169,4 +169,4 @@ Task<std::optional<HttpMessage>> parse_first_message(std::string_view raw,
 Task<std::vector<HttpMessage>> parse_all_messages(std::string_view raw,
                                                   ParseMode mode = ParseMode::response);
 
-} // namespace async_uv::http
+} // namespace flux::http

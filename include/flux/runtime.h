@@ -27,6 +27,10 @@
 
 #include "flux/task.h"
 
+namespace boost::asio {
+class io_context;
+}
+
 namespace flux {
 
 class Runtime;
@@ -37,9 +41,8 @@ using AnySchedulerCompletions =
     stdexec::completion_signatures<stdexec::set_value_t(),
                                    stdexec::set_error_t(std::exception_ptr),
                                    stdexec::set_stopped_t()>;
-using AnyReceiver = exec::any_receiver<AnySchedulerCompletions>;
-using AnySender = exec::any_sender<AnyReceiver>;
-using AnyScheduler = exec::any_scheduler<AnySender>;
+using AnySender = exec::any_receiver_ref<AnySchedulerCompletions>::any_sender<>;
+using AnyScheduler = AnySender::any_scheduler<>;
 
 struct get_io_scheduler_t : stdexec::__query<get_io_scheduler_t> {
     using stdexec::__query<get_io_scheduler_t>::operator();
@@ -169,6 +172,8 @@ public:
         return Builder{};
     }
 
+    static Runtime *current() noexcept;
+
     explicit Runtime(RuntimeOptions options = {});
     ~Runtime() noexcept;
 
@@ -181,6 +186,8 @@ public:
     [[nodiscard]] exec::asio::asio_impl::any_io_executor executor() const noexcept;
     [[nodiscard]] exec::asio::asio_impl::any_io_executor blocking_executor() noexcept;
     [[nodiscard]] exec::asio::asio_impl::any_io_executor blocking_executor() const noexcept;
+    [[nodiscard]] boost::asio::io_context &io_context() noexcept;
+    [[nodiscard]] const boost::asio::io_context &io_context() const noexcept;
     [[nodiscard]] execution::AnyScheduler io_scheduler();
     [[nodiscard]] execution::AnyScheduler io_scheduler() const;
     [[nodiscard]] std::optional<execution::AnyScheduler> custom_io_scheduler() const;
@@ -268,6 +275,8 @@ public:
     [[nodiscard]] bool in_blocking_thread() const noexcept;
 
 private:
+    struct BoostIoState;
+
     template <typename Sender>
     auto with_execution_env(Sender &&sender) const {
         return static_cast<Sender &&>(sender)
@@ -318,6 +327,7 @@ private:
     RuntimeOptions options_;
     exec::asio::asio_thread_pool io_pool_;
     exec::asio::asio_thread_pool blocking_pool_;
+    std::unique_ptr<BoostIoState> boost_io_state_;
     exec::async_scope spawn_scope_;
     std::atomic<bool> shutdown_started_{false};
     mutable std::mutex scheduler_mutex_;

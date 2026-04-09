@@ -4,6 +4,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -690,6 +691,113 @@ private:
     explicit MessageBus(std::shared_ptr<State> state)
         : state_(std::move(state)) {}
 
+    std::shared_ptr<State> state_;
+};
+
+template <typename T>
+class Mailbox {
+public:
+    struct State;
+
+    class Sender {
+    public:
+        Sender() = default;
+
+        template <typename U>
+            requires std::same_as<std::remove_cvref_t<U>, T>
+        bool try_send(U &&value) const {
+            if (!state_ || state_->closed.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (state_->closed.load(std::memory_order_acquire)) {
+                return false;
+            }
+            if (state_->queue.size() >= state_->capacity) {
+                return false;
+            }
+            state_->queue.push_back(std::forward<U>(value));
+            return true;
+        }
+
+        template <typename Rep, typename Period>
+        Task<bool> send_for(T value, std::chrono::duration<Rep, Period> timeout) const {
+            if (!state_ || state_->closed.load(std::memory_order_acquire)) {
+                co_return false;
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                {
+                    std::lock_guard<std::mutex> lock(state_->mutex);
+                    if (!state_->closed.load(std::memory_order_acquire) &&
+                        state_->queue.size() < state_->capacity) {
+                        state_->queue.push_back(std::move(value));
+                        co_return true;
+                    }
+                }
+                co_await flux::sleep_for(std::chrono::milliseconds(1));
+            }
+            co_return false;
+        }
+
+    private:
+        friend class Mailbox;
+        explicit Sender(std::shared_ptr<State> state) : state_(std::move(state)) {}
+        std::shared_ptr<State> state_;
+    };
+
+    Mailbox() = default;
+
+    static Task<Mailbox> create(Runtime &runtime, std::size_t capacity = 1024) {
+        (void)runtime;
+        Mailbox mailbox;
+        mailbox.state_ = std::make_shared<State>();
+        mailbox.state_->capacity = capacity == 0 ? 1 : capacity;
+        co_return mailbox;
+    }
+
+    [[nodiscard]] Sender sender() const {
+        return Sender(state_);
+    }
+
+    Task<std::optional<T>> recv() const {
+        if (!state_) {
+            co_return std::nullopt;
+        }
+
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                if (!state_->queue.empty()) {
+                    T value = std::move(state_->queue.front());
+                    state_->queue.pop_front();
+                    co_return std::optional<T>(std::move(value));
+                }
+                if (state_->closed.load(std::memory_order_acquire)) {
+                    co_return std::nullopt;
+                }
+            }
+            co_await flux::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    Task<void> close() const {
+        if (state_) {
+            state_->closed.store(true, std::memory_order_release);
+        }
+        co_return;
+    }
+
+public:
+    struct State {
+        mutable std::mutex mutex;
+        std::deque<T> queue;
+        std::size_t capacity = 1024;
+        std::atomic<bool> closed{false};
+    };
+
+private:
     std::shared_ptr<State> state_;
 };
 

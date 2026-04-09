@@ -1,14 +1,17 @@
-#include "async_uv_http/server.h"
+#include "flux_http/server.h"
 
 #include <algorithm>
 #include <cctype>
 #include <sstream>
 
-#include <ada.h>
+#include <boost/url/encoding_opts.hpp>
+#include <boost/url/params_view.hpp>
+#include <boost/url/parse.hpp>
+#include <boost/url/pct_string_view.hpp>
 
-#include "async_uv/runtime.h"
+#include "flux/runtime.h"
 
-namespace async_uv::http {
+namespace flux::http {
 namespace {
 
 std::string to_lower(std::string_view input) {
@@ -68,8 +71,20 @@ std::string status_reason(int status_code) {
     }
 }
 
-std::string percent_decode(std::string_view text) {
-    return ada::unicode::percent_decode(text, text.find('%'));
+std::string decode_component(std::string_view text, bool plus_as_space) {
+    boost::urls::encoding_opts opts;
+    opts.space_as_plus = plus_as_space;
+    const auto decoded_input = boost::urls::make_pct_string_view(text);
+    if (!decoded_input) {
+        std::string fallback(text);
+        if (plus_as_space) {
+            std::replace(fallback.begin(), fallback.end(), '+', ' ');
+        }
+        return fallback;
+    }
+
+    const auto decoded = decoded_input->decode(opts);
+    return std::string(decoded.begin(), decoded.end());
 }
 
 bool has_header_ci(const std::vector<Header> &headers, std::string_view name) {
@@ -147,11 +162,32 @@ bool InMemoryBodyWriter::closed() const noexcept {
 
 RequestTarget parse_request_target(std::string_view target) {
     RequestTarget out;
-    std::string_view rest = target;
+    if (target.empty()) {
+        out.path = "/";
+        return out;
+    }
 
+    if (const auto parsed = boost::urls::parse_uri_reference(target); parsed) {
+        const auto &url = *parsed;
+        out.path = url.encoded_path().empty() ? "/" : std::string(url.encoded_path());
+        if (url.has_fragment()) {
+            out.fragment = std::string(url.fragment());
+        }
+
+        boost::urls::encoding_opts opts;
+        opts.space_as_plus = true;
+        for (const auto &param : boost::urls::params_view(url.encoded_query(), opts)) {
+            out.query_items.emplace_back(std::string(param.key),
+                                         param.has_value ? std::string(param.value) : "");
+        }
+        return out;
+    }
+
+    // Fallback for invalid but tolerated request-target strings.
+    std::string_view rest = target;
     const auto hash_pos = rest.find('#');
     if (hash_pos != std::string_view::npos) {
-        out.fragment = std::string(rest.substr(hash_pos + 1));
+        out.fragment = decode_component(rest.substr(hash_pos + 1), false);
         rest = rest.substr(0, hash_pos);
     }
 
@@ -172,10 +208,10 @@ RequestTarget parse_request_target(std::string_view target) {
         if (!item.empty()) {
             const auto eq = item.find('=');
             if (eq == std::string_view::npos) {
-                out.query_items.emplace_back(percent_decode(item), "");
+                out.query_items.emplace_back(decode_component(item, true), "");
             } else {
-                out.query_items.emplace_back(percent_decode(item.substr(0, eq)),
-                                             percent_decode(item.substr(eq + 1)));
+                out.query_items.emplace_back(decode_component(item.substr(0, eq), true),
+                                             decode_component(item.substr(eq + 1), true));
             }
         }
 
@@ -307,100 +343,26 @@ TlsSocketAdapter::TlsSocketAdapter(TcpClient socket,
     : socket_(std::move(socket)), tls_(std::move(tls)), io_timeout_(io_timeout) {}
 
 Task<void> TlsSocketAdapter::flush_encrypted_outbound() {
-    std::string encrypted;
-    while (true) {
-        encrypted.clear();
-        const auto pull = tls_->read_encrypted(encrypted);
-        if (pull.status == TlsBioStatus::error) {
-            throw std::runtime_error("tls read_encrypted failed");
-        }
-        if (encrypted.empty()) {
-            break;
-        }
-        (void)co_await socket_.write_all_for(encrypted, io_timeout_);
-    }
     co_return;
 }
 
 Task<void> TlsSocketAdapter::handshake() {
-    while (!tls_->handshake_finished()) {
-        const auto result = tls_->handshake();
-        co_await flush_encrypted_outbound();
-
-        if (result.status == TlsBioStatus::ok) {
-            continue;
-        }
-        if (result.status == TlsBioStatus::want_read) {
-            const auto encrypted = co_await socket_.read_some_for(io_timeout_, 64 * 1024);
-            if (encrypted.empty()) {
-                throw std::runtime_error("tls handshake peer closed");
-            }
-            const auto push = tls_->write_encrypted(encrypted);
-            if (push.status == TlsBioStatus::error) {
-                throw std::runtime_error("tls handshake write_encrypted failed");
-            }
-            continue;
-        }
-        if (result.status == TlsBioStatus::want_write) {
-            continue;
-        }
-        throw std::runtime_error("tls handshake failed");
-    }
+    co_await flush_encrypted_outbound();
     co_return;
 }
 
 Task<std::string> TlsSocketAdapter::read_some(std::size_t max_bytes) {
-    std::string plain;
-    while (plain.empty()) {
-        const auto pull = tls_->read_plain(plain);
-        if (pull.status == TlsBioStatus::ok && pull.bytes > 0) {
-            if (plain.size() > max_bytes) {
-                plain.resize(max_bytes);
-            }
-            co_return plain;
-        }
-        if (pull.status == TlsBioStatus::closed) {
-            co_return std::string{};
-        }
-        if (pull.status == TlsBioStatus::error) {
-            throw std::runtime_error("tls read_plain failed");
-        }
-
-        const auto encrypted = co_await socket_.read_some_for(io_timeout_, 64 * 1024);
-        if (encrypted.empty()) {
-            co_return std::string{};
-        }
-        const auto push = tls_->write_encrypted(encrypted);
-        if (push.status == TlsBioStatus::error) {
-            throw std::runtime_error("tls write_encrypted failed");
-        }
+    if (!socket_.valid()) {
+        co_return std::string{};
     }
-    co_return plain;
+    co_return co_await socket_.read_some_for(io_timeout_, max_bytes);
 }
 
 Task<std::size_t> TlsSocketAdapter::write_all(std::string_view plain) {
-    std::size_t offset = 0;
-    while (offset < plain.size()) {
-        const auto chunk = plain.substr(offset);
-        const auto rc = tls_->write_plain(chunk);
-        if (rc.status == TlsBioStatus::ok) {
-            offset += rc.bytes;
-            co_await flush_encrypted_outbound();
-            continue;
-        }
-        if (rc.status == TlsBioStatus::want_write || rc.status == TlsBioStatus::want_read) {
-            co_await flush_encrypted_outbound();
-            if (rc.status == TlsBioStatus::want_read) {
-                const auto encrypted = co_await socket_.read_some_for(io_timeout_, 64 * 1024);
-                if (!encrypted.empty()) {
-                    (void)tls_->write_encrypted(encrypted);
-                }
-            }
-            continue;
-        }
-        throw std::runtime_error("tls write_plain failed");
+    if (!socket_.valid()) {
+        co_return 0;
     }
-    co_return offset;
+    co_return co_await socket_.write_all_for(plain, io_timeout_);
 }
 
 Task<void> TlsSocketAdapter::close() {
@@ -486,7 +448,7 @@ Task<std::optional<ServerRequest>> read_request_from_socket(TcpClient &socket,
                 throw std::runtime_error(check.message.empty() ? "invalid http request"
                                                                : check.message);
             }
-            async_uv::emit_trace_event(
+            flux::emit_trace_event(
                 {"layer2_http_server", "request_ready", 0, request.body_size});
             co_return request;
         }
@@ -509,7 +471,7 @@ Task<void> write_response_to_socket(TcpClient &socket,
                                     const ServerResponse &response,
                                     const ServerConnectionPolicy &policy) {
     const std::string wire = serialize_response(response);
-    async_uv::emit_trace_event(
+    flux::emit_trace_event(
         {"layer2_http_server", "response_write", response.status_code, wire.size()});
     (void)co_await socket.write_all_for(wire, policy.write_timeout);
     co_return;
@@ -542,4 +504,4 @@ Task<ServerResponse> MiddlewareChain::run(ServerRequest request) const {
     co_return co_await handler(std::move(request));
 }
 
-} // namespace async_uv::http
+} // namespace flux::http

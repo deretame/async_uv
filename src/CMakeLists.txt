@@ -22,6 +22,7 @@ target_link_libraries(flux
     PUBLIC
         flux_stdexec_headers
         flux_asio_headers
+        Boost::headers
         Threads::Threads
 )
 

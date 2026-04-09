@@ -1,10 +1,11 @@
-#include "async_uv_sql/sql.h"
+#include "flux_sql/sql.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <cstdint>
 #include <deque>
@@ -13,34 +14,44 @@
 #include <mutex>
 #include <sstream>
 #include <string_view>
+#include <system_error>
+#include <functional>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
-#if ASYNC_UV_SQL_HAS_LIBPQ
+#include <asio/steady_timer.hpp>
+
+#if FLUX_SQL_HAS_LIBPQ
 #include <libpq-fe.h>
 #endif
 
-#if ASYNC_UV_SQL_HAS_MYSQL && __has_include(<mysql.h>)
-#include <mysql.h>
-#elif ASYNC_UV_SQL_HAS_MYSQL && __has_include(<mysql/mysql.h>)
-#include <mysql/mysql.h>
-#elif ASYNC_UV_SQL_HAS_MYSQL && __has_include(<mariadb/mysql.h>)
-#include <mariadb/mysql.h>
-#elif ASYNC_UV_SQL_HAS_MYSQL
-#error "MySQL client header not found"
+#if FLUX_SQL_HAS_MYSQL
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl/context.hpp>
+#include <boost/mysql/any_connection.hpp>
+#include <boost/mysql/connect_params.hpp>
+#include <boost/mysql/error_with_diagnostics.hpp>
+#include <boost/mysql/field.hpp>
+#include <boost/mysql/field_view.hpp>
+#include <boost/mysql/results.hpp>
+#include <boost/mysql/src.hpp>
 #endif
 
-#if ASYNC_UV_SQL_HAS_SQLITE3
+#if FLUX_SQL_HAS_SQLITE3
 #include <sqlite3.h>
 #endif
 
-#include "async_uv/fd.h"
-#include "async_uv/cancel.h"
-#include "async_uv/error.h"
-#include "async_uv/runtime.h"
+#include "flux/cancel.h"
+#include "flux/async_semaphore.h"
+#include "flux/error.h"
+#include "flux/fd.h"
+#include "flux/runtime.h"
 
-namespace async_uv::sql {
+namespace flux::sql {
 
 SqlParam::SqlParam(std::nullptr_t) : value_(std::monostate{}) {}
 
@@ -301,6 +312,7 @@ private:
     std::atomic_bool &flag_;
 };
 
+#if FLUX_SQL_HAS_LIBPQ
 std::uint64_t parse_u64(std::string_view text) {
     if (text.empty()) {
         return 0;
@@ -314,8 +326,9 @@ std::uint64_t parse_u64(std::string_view text) {
     }
     return value;
 }
+#endif
 
-#if ASYNC_UV_SQL_HAS_LIBPQ
+#if FLUX_SQL_HAS_LIBPQ
 std::string postgres_ssl_mode_to_string(PostgresSslMode mode) {
     switch (mode) {
         case PostgresSslMode::disable:
@@ -428,9 +441,238 @@ std::size_t count_placeholders(std::string_view sql) {
 }
 #endif
 
-#if ASYNC_UV_SQL_HAS_MYSQL
-int mysql_socket_fd(MYSQL *mysql) {
-    return static_cast<int>(mysql->net.fd);
+#if FLUX_SQL_HAS_MYSQL
+std::string mysql_error_message(const boost::system::error_code &error,
+                                const boost::mysql::diagnostics &diagnostics) {
+    std::string message = error.message();
+    const auto server_message = diagnostics.server_message();
+    if (!server_message.empty()) {
+        if (!message.empty()) {
+            message += ": ";
+        }
+        message += std::string(server_message);
+    }
+    if (!message.empty()) {
+        return message;
+    }
+    return "mysql operation failed";
+}
+
+boost::mysql::field mysql_param_to_field(const SqlParam &param) {
+    switch (param.type()) {
+        case SqlParam::Type::null:
+            return boost::mysql::field(nullptr);
+        case SqlParam::Type::text:
+            return boost::mysql::field(param.as_text());
+        case SqlParam::Type::int64:
+            return boost::mysql::field(std::stoll(param.as_text()));
+        case SqlParam::Type::float64:
+            return boost::mysql::field(std::stod(param.as_text()));
+        case SqlParam::Type::boolean:
+            return boost::mysql::field(param.as_text() == "1" ? 1 : 0);
+    }
+    return boost::mysql::field(nullptr);
+}
+
+Cell mysql_field_to_cell(boost::mysql::field_view field) {
+    if (field.is_null()) {
+        return std::nullopt;
+    }
+
+    if (field.is_string()) {
+        return std::string(field.as_string());
+    }
+    if (field.is_blob()) {
+        const auto blob = field.as_blob();
+        return std::string(reinterpret_cast<const char *>(blob.data()), blob.size());
+    }
+    if (field.is_int64()) {
+        return std::to_string(field.as_int64());
+    }
+    if (field.is_uint64()) {
+        return std::to_string(field.as_uint64());
+    }
+    if (field.is_float()) {
+        std::ostringstream out;
+        out << field.as_float();
+        return out.str();
+    }
+    if (field.is_double()) {
+        std::ostringstream out;
+        out << field.as_double();
+        return out.str();
+    }
+    if (field.is_date()) {
+        std::ostringstream out;
+        out << field.as_date();
+        return out.str();
+    }
+    if (field.is_datetime()) {
+        std::ostringstream out;
+        out << field.as_datetime();
+        return out.str();
+    }
+    if (field.is_time()) {
+        return std::to_string(field.as_time().count());
+    }
+
+    return std::string{};
+}
+
+QueryResult mysql_results_to_query_result(const boost::mysql::results &results) {
+    QueryResult out;
+    out.affected_rows = results.affected_rows();
+    out.last_insert_id = results.last_insert_id();
+
+    const auto meta = results.meta();
+    out.columns.reserve(meta.size());
+    for (const auto &column : meta) {
+        out.columns.emplace_back(column.column_name());
+    }
+
+    const auto rows = results.rows();
+    out.rows.reserve(rows.size());
+    for (const auto row_view : rows) {
+        Row row;
+        row.values.reserve(row_view.size());
+        for (const auto value : row_view) {
+            row.values.push_back(mysql_field_to_cell(value));
+        }
+        out.rows.push_back(std::move(row));
+    }
+
+    return out;
+}
+
+template <typename StartFn>
+class MysqlErrorSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(boost::system::error_code),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    explicit MysqlErrorSender(StartFn start) : start_(std::move(start)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const MysqlErrorSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+private:
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        StartFn start;
+        Receiver receiver;
+
+        void start_impl() noexcept {
+            try {
+                start([this](boost::system::error_code ec) mutable noexcept {
+                    stdexec::set_value(std::move(receiver), ec);
+                });
+            } catch (...) {
+                stdexec::set_error(std::move(receiver), std::current_exception());
+            }
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start_impl();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, MysqlErrorSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.start_), std::move(receiver)};
+    }
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const MysqlErrorSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.start_, std::move(receiver)};
+    }
+
+    StartFn start_;
+};
+
+template <typename Value, typename StartFn>
+class MysqlValueSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    struct Result {
+        boost::system::error_code ec{};
+        std::optional<Value> value;
+    };
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(Result),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    explicit MysqlValueSender(StartFn start) : start_(std::move(start)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const MysqlValueSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+private:
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        StartFn start;
+        Receiver receiver;
+
+        void start_impl() noexcept {
+            try {
+                start([this](boost::system::error_code ec, Value value) mutable noexcept {
+                    Result result;
+                    result.ec = ec;
+                    if (!ec) {
+                        result.value.emplace(std::move(value));
+                    }
+                    stdexec::set_value(std::move(receiver), std::move(result));
+                });
+            } catch (...) {
+                stdexec::set_error(std::move(receiver), std::current_exception());
+            }
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start_impl();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, MysqlValueSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.start_), std::move(receiver)};
+    }
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const MysqlValueSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.start_, std::move(receiver)};
+    }
+
+    StartFn start_;
+};
+
+template <typename StartFn>
+auto make_mysql_error_sender(StartFn &&start) {
+    return MysqlErrorSender<std::remove_cvref_t<StartFn>>(std::forward<StartFn>(start));
+}
+
+template <typename Value, typename StartFn>
+auto make_mysql_value_sender(StartFn &&start) {
+    return MysqlValueSender<Value, std::remove_cvref_t<StartFn>>(std::forward<StartFn>(start));
 }
 #endif
 
@@ -445,29 +687,11 @@ std::optional<int> choose_timeout_ms(const ConnectionOptions &connection_options
     return std::nullopt;
 }
 
-template <typename Fn>
-Task<QueryResult> run_with_query_timeout(const ConnectionOptions &connection_options,
-                                         const QueryOptions &query_options,
-                                         Fn &&fn) {
-    const auto timeout_ms = choose_timeout_ms(connection_options, query_options);
-    try {
-        if (timeout_ms.has_value()) {
-            co_return co_await async_uv::with_timeout(std::chrono::milliseconds(*timeout_ms),
-                                                      std::forward<Fn>(fn)());
-        }
-        co_return co_await std::forward<Fn>(fn)();
-    } catch (const async_uv::Error &e) {
-        if (e.code() == UV_ETIMEDOUT) {
-            throw SqlError("sql query timeout", SqlErrorKind::query_failed);
-        }
-        throw;
-    }
-}
-
 std::string default_sqlite_file(const ConnectionOptions &options) {
     return options.file.empty() ? ":memory:" : options.file;
 }
 
+#if FLUX_SQL_HAS_LIBPQ || FLUX_SQL_HAS_MYSQL
 int default_port(const ConnectionOptions &options) {
     if (options.port > 0) {
         return options.port;
@@ -482,57 +706,149 @@ int default_port(const ConnectionOptions &options) {
     }
     return 0;
 }
+#endif
 
-Task<void> safe_stop_watcher(FdWatcher &watcher) {
-    try {
-        co_await watcher.stop();
-    } catch (...) {
+class CurrentRuntimeSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures =
+        stdexec::completion_signatures<stdexec::set_value_t(Runtime *),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+
+    explicit CurrentRuntimeSender(std::string message) : message_(std::move(message)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const CurrentRuntimeSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
     }
-    co_return;
+
+private:
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        Receiver receiver;
+        std::string message;
+
+        void start() noexcept {
+            try {
+                Runtime *runtime = nullptr;
+                auto env = stdexec::get_env(receiver);
+                if constexpr (requires { flux::execution::get_runtime(env); }) {
+                    runtime = flux::execution::get_runtime(env);
+                }
+                if (runtime == nullptr) {
+                    runtime = Runtime::current();
+                }
+                if (runtime == nullptr) {
+                    throw SqlError(message, SqlErrorKind::runtime_missing);
+                }
+                stdexec::set_value(std::move(receiver), runtime);
+            } catch (...) {
+                stdexec::set_error(std::move(receiver), std::current_exception());
+            }
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, CurrentRuntimeSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(receiver), std::move(self.message_)};
+    }
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const CurrentRuntimeSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(receiver), self.message_};
+    }
+
+    std::string message_;
+};
+
+CurrentRuntimeSender current_runtime_sender(std::string message) {
+    return CurrentRuntimeSender(std::move(message));
 }
 
-Task<void>
-wait_fd_ready(uv_os_sock_t fd, bool readable, bool writable, std::optional<int> timeout_ms) {
+#if FLUX_SQL_HAS_LIBPQ
+using LibpqVoidSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using LibpqQuerySender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(QueryResult),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+
+LibpqVoidSender throw_sql_error_sender(std::string message, SqlErrorKind kind) {
+    return stdexec::just() | stdexec::then([message = std::move(message), kind]() {
+               throw SqlError(message, kind);
+           });
+}
+
+LibpqVoidSender wait_fd_ready_sender(Runtime *runtime,
+                                     int fd,
+                                     bool readable,
+                                     bool writable,
+                                     std::optional<int> timeout_ms) {
     if (fd < 0) {
-        throw SqlError("invalid database socket fd", SqlErrorKind::internal_error);
+        return throw_sql_error_sender(
+            "invalid database socket fd", SqlErrorKind::internal_error);
     }
 
     int events = 0;
     if (readable) {
-        events |= UV_READABLE;
+        events |= static_cast<int>(FdEventFlags::readable);
     }
     if (writable) {
-        events |= UV_WRITABLE;
+        events |= static_cast<int>(FdEventFlags::writable);
     }
     if (events == 0) {
-        co_return;
+        return stdexec::just();
     }
 
-    auto watcher = co_await FdWatcher::watch(fd, events);
-    std::optional<FdEvent> event;
-
-    if (timeout_ms.has_value()) {
-        event = co_await watcher.next_for(std::chrono::milliseconds(*timeout_ms));
-    } else {
-        event = co_await watcher.next();
-    }
-
-    co_await safe_stop_watcher(watcher);
-
-    if (!event.has_value()) {
-        throw SqlError("database socket wait timeout", SqlErrorKind::query_failed);
-    }
-    if (!event->ok()) {
-        throw SqlError("database socket wait returned error", SqlErrorKind::query_failed);
-    }
-}
-
-#if ASYNC_UV_SQL_HAS_MYSQL
-void ensure_mysql_library_initialized() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        (void)mysql_library_init(0, nullptr, nullptr);
-    });
+    return FdWatcher::watch_sender(fd, events, runtime)
+         | stdexec::let_value([timeout_ms](FdWatcher watcher) -> LibpqVoidSender {
+               auto watcher_holder = std::make_shared<FdWatcher>(std::move(watcher));
+               auto wait_sender = timeout_ms.has_value()
+                                      ? watcher_holder->next_for_sender(
+                                            std::chrono::milliseconds(std::max(0, *timeout_ms)))
+                                      : watcher_holder->next_sender();
+               return std::move(wait_sender)
+                    | stdexec::let_value(
+                          [watcher_holder](std::optional<FdEvent> event) -> LibpqVoidSender {
+                              return watcher_holder->stop_sender()
+                                   | stdexec::then([event = std::move(event)]() mutable {
+                                         if (!event.has_value()) {
+                                             throw SqlError(
+                                                 "database socket wait timeout",
+                                                 SqlErrorKind::query_failed);
+                                         }
+                                         if (!event->ok()) {
+                                             if (event->error()) {
+                                                 throw SqlError(event->error().message(),
+                                                                SqlErrorKind::query_failed);
+                                             }
+                                             throw SqlError("database socket wait returned error",
+                                                            SqlErrorKind::query_failed);
+                                         }
+                                     });
+                          })
+                    | stdexec::let_error(
+                          [watcher_holder](std::exception_ptr error) -> LibpqVoidSender {
+                              return watcher_holder->stop_sender()
+                                   | stdexec::then([error] { std::rethrow_exception(error); })
+                                   | stdexec::upon_error([error](std::exception_ptr) {
+                                         std::rethrow_exception(error);
+                                     });
+                          });
+           });
 }
 #endif
 
@@ -543,19 +859,19 @@ public:
     bool is_open() const noexcept {
         switch (options_.driver) {
             case Driver::postgres:
-#if ASYNC_UV_SQL_HAS_LIBPQ
+#if FLUX_SQL_HAS_LIBPQ
                 return pg_ != nullptr;
 #else
                 return false;
 #endif
             case Driver::mysql:
-#if ASYNC_UV_SQL_HAS_MYSQL
-                return mysql_ != nullptr;
+#if FLUX_SQL_HAS_MYSQL
+                return mysql_conn_ != nullptr;
 #else
                 return false;
 #endif
             case Driver::sqlite:
-#if ASYNC_UV_SQL_HAS_SQLITE3
+#if FLUX_SQL_HAS_SQLITE3
                 return sqlite_ != nullptr;
 #else
                 return false;
@@ -565,19 +881,40 @@ public:
     }
 
     void close_sync() noexcept {
-#if ASYNC_UV_SQL_HAS_LIBPQ
+#if FLUX_SQL_HAS_LIBPQ
         if (pg_ != nullptr) {
             PQfinish(pg_);
             pg_ = nullptr;
         }
 #endif
-#if ASYNC_UV_SQL_HAS_MYSQL
-        if (mysql_ != nullptr) {
-            mysql_close(mysql_);
-            mysql_ = nullptr;
+#if FLUX_SQL_HAS_MYSQL
+        if (mysql_conn_ != nullptr) {
+            try {
+                boost::mysql::error_code ec;
+                boost::mysql::diagnostics diag;
+                mysql_conn_->close(ec, diag);
+            } catch (...) {
+            }
+            mysql_conn_.reset();
+        }
+        mysql_ssl_ctx_.reset();
+        if (mysql_work_guard_ != nullptr) {
+            mysql_work_guard_->reset();
+            mysql_work_guard_.reset();
+        }
+        if (mysql_ioc_ != nullptr) {
+            mysql_ioc_->stop();
+            mysql_ioc_.reset();
+        }
+        if (mysql_thread_.joinable()) {
+            if (mysql_thread_.get_id() == std::this_thread::get_id()) {
+                mysql_thread_.detach();
+            } else {
+                mysql_thread_.join();
+            }
         }
 #endif
-#if ASYNC_UV_SQL_HAS_SQLITE3
+#if FLUX_SQL_HAS_SQLITE3
         if (sqlite_ != nullptr) {
             (void)sqlite3_close_v2(sqlite_);
             sqlite_ = nullptr;
@@ -585,7 +922,7 @@ public:
 #endif
     }
 
-#if ASYNC_UV_SQL_HAS_SQLITE3
+#if FLUX_SQL_HAS_SQLITE3
     void open_sqlite_blocking(const ConnectionOptions &options) {
         close_sync();
         const std::string file = default_sqlite_file(options);
@@ -688,80 +1025,164 @@ public:
         out.last_insert_id = static_cast<std::uint64_t>(sqlite3_last_insert_rowid(sqlite_));
         return out;
     }
+
+    auto open_sqlite_sender(const ConnectionOptions &options, Runtime *runtime) {
+        if (runtime == nullptr) {
+            throw SqlError("sql::Connection::open requires current runtime",
+                           SqlErrorKind::runtime_missing);
+        }
+        return runtime->spawn_blocking([this, options] {
+            std::lock_guard<std::mutex> lock(sqlite_mutex_);
+            open_sqlite_blocking(options);
+        });
+    }
+
+    auto close_sqlite_sender(Runtime *runtime) {
+        if (runtime == nullptr) {
+            throw SqlError("sql::Connection::close requires current runtime",
+                           SqlErrorKind::runtime_missing);
+        }
+        return runtime->spawn_blocking([this] {
+            std::lock_guard<std::mutex> lock(sqlite_mutex_);
+            close_sync();
+        });
+    }
+
+    auto query_sqlite_sender(Runtime *runtime, std::string sql, std::vector<SqlParam> params) {
+        if (runtime == nullptr) {
+            throw SqlError("sql::Connection::query requires current runtime",
+                           SqlErrorKind::runtime_missing);
+        }
+        return runtime->spawn_blocking(
+            [this, sql = std::move(sql), params = std::move(params)]() mutable {
+                std::lock_guard<std::mutex> lock(sqlite_mutex_);
+                return query_sqlite_blocking(sql, params);
+            });
+    }
 #endif
 
-#if ASYNC_UV_SQL_HAS_LIBPQ
-    Task<void> open_postgres_async(const ConnectionOptions &options) {
-        close_sync();
+#if FLUX_SQL_HAS_LIBPQ
+    LibpqVoidSender open_postgres_sender(const ConnectionOptions &options, Runtime *runtime) {
+        struct ConnectState {
+            Connection::Impl *self = nullptr;
+            Runtime *runtime = nullptr;
+            ConnectionOptions options;
+        };
 
-        if (options.database.empty()) {
-            throw SqlError("postgres requires database name", SqlErrorKind::invalid_argument);
-        }
+        auto state = std::make_shared<ConnectState>();
+        state->self = this;
+        state->runtime = runtime;
+        state->options = options;
 
-        std::ostringstream conninfo;
-        conninfo << "host='" << pg_quote(options.host) << "' "
-                 << "port='" << default_port(options) << "' "
-                 << "dbname='" << pg_quote(options.database) << "'";
-        if (!options.user.empty()) {
-            conninfo << " user='" << pg_quote(options.user) << "'";
-        }
-        if (!options.password.empty()) {
-            conninfo << " password='" << pg_quote(options.password) << "'";
-        }
-        conninfo << " sslmode='" << postgres_ssl_mode_to_string(options.postgres_ssl_mode) << "'";
-        if (!options.postgres_ssl_root_cert_file.empty()) {
-            conninfo << " sslrootcert='" << pg_quote(options.postgres_ssl_root_cert_file) << "'";
-        }
-        if (!options.postgres_ssl_cert_file.empty()) {
-            conninfo << " sslcert='" << pg_quote(options.postgres_ssl_cert_file) << "'";
-        }
-        if (!options.postgres_ssl_key_file.empty()) {
-            conninfo << " sslkey='" << pg_quote(options.postgres_ssl_key_file) << "'";
-        }
-        if (!options.postgres_ssl_crl_file.empty()) {
-            conninfo << " sslcrl='" << pg_quote(options.postgres_ssl_crl_file) << "'";
-        }
-        if (!options.postgres_ssl_min_protocol.empty()) {
-            conninfo << " ssl_min_protocol_version='" << pg_quote(options.postgres_ssl_min_protocol)
-                     << "'";
-        }
-        if (options.connect_timeout_ms > 0) {
-            const int sec = std::max(1, options.connect_timeout_ms / 1000);
-            conninfo << " connect_timeout='" << sec << "'";
-        }
+        return stdexec::just()
+             | stdexec::then([state]() {
+                   state->self->close_sync();
 
-        pg_ = PQconnectStart(conninfo.str().c_str());
-        if (pg_ == nullptr) {
-            throw SqlError("postgres connection start failed", SqlErrorKind::connect_failed);
-        }
+                   if (state->runtime == nullptr) {
+                       throw SqlError("sql::Connection::open requires current runtime",
+                                      SqlErrorKind::runtime_missing);
+                   }
+                   if (state->options.database.empty()) {
+                       throw SqlError(
+                           "postgres requires database name", SqlErrorKind::invalid_argument);
+                   }
 
-        if (PQsetnonblocking(pg_, 1) != 0) {
-            const std::string message = PQerrorMessage(pg_);
-            close_sync();
-            throw SqlError(message, SqlErrorKind::connect_failed);
-        }
+                   std::ostringstream conninfo;
+                   conninfo << "host='" << pg_quote(state->options.host) << "' "
+                            << "port='" << default_port(state->options) << "' "
+                            << "dbname='" << pg_quote(state->options.database) << "'";
+                   if (!state->options.user.empty()) {
+                       conninfo << " user='" << pg_quote(state->options.user) << "'";
+                   }
+                   if (!state->options.password.empty()) {
+                       conninfo << " password='" << pg_quote(state->options.password) << "'";
+                   }
+                   conninfo << " sslmode='"
+                            << postgres_ssl_mode_to_string(state->options.postgres_ssl_mode)
+                            << "'";
+                   if (!state->options.postgres_ssl_root_cert_file.empty()) {
+                       conninfo << " sslrootcert='"
+                                << pg_quote(state->options.postgres_ssl_root_cert_file) << "'";
+                   }
+                   if (!state->options.postgres_ssl_cert_file.empty()) {
+                       conninfo << " sslcert='"
+                                << pg_quote(state->options.postgres_ssl_cert_file) << "'";
+                   }
+                   if (!state->options.postgres_ssl_key_file.empty()) {
+                       conninfo << " sslkey='"
+                                << pg_quote(state->options.postgres_ssl_key_file) << "'";
+                   }
+                   if (!state->options.postgres_ssl_crl_file.empty()) {
+                       conninfo << " sslcrl='"
+                                << pg_quote(state->options.postgres_ssl_crl_file) << "'";
+                   }
+                   if (!state->options.postgres_ssl_min_protocol.empty()) {
+                       conninfo << " ssl_min_protocol_version='"
+                                << pg_quote(state->options.postgres_ssl_min_protocol) << "'";
+                   }
+                   if (state->options.connect_timeout_ms > 0) {
+                       const int sec = std::max(1, state->options.connect_timeout_ms / 1000);
+                       conninfo << " connect_timeout='" << sec << "'";
+                   }
 
-        while (true) {
-            const PostgresPollingStatusType poll = PQconnectPoll(pg_);
-            if (poll == PGRES_POLLING_OK) {
-                break;
-            }
-            if (poll == PGRES_POLLING_FAILED) {
-                const std::string message = PQerrorMessage(pg_);
-                close_sync();
-                throw SqlError(message, SqlErrorKind::connect_failed);
-            }
-            if (poll == PGRES_POLLING_READING) {
-                co_await wait_fd_ready(PQsocket(pg_), true, false, std::nullopt);
-                continue;
-            }
-            if (poll == PGRES_POLLING_WRITING) {
-                co_await wait_fd_ready(PQsocket(pg_), false, true, std::nullopt);
-                continue;
-            }
+                   state->self->pg_ = PQconnectStart(conninfo.str().c_str());
+                   if (state->self->pg_ == nullptr) {
+                       throw SqlError(
+                           "postgres connection start failed", SqlErrorKind::connect_failed);
+                   }
 
-            co_await async_uv::sleep_for(std::chrono::milliseconds(1));
-        }
+                   if (PQsetnonblocking(state->self->pg_, 1) != 0) {
+                       const std::string message =
+                           PQerrorMessage(state->self->pg_) == nullptr
+                               ? std::string("postgres connection failed")
+                               : std::string(PQerrorMessage(state->self->pg_));
+                       state->self->close_sync();
+                       throw SqlError(message, SqlErrorKind::connect_failed);
+                   }
+               })
+             | stdexec::let_value([state]() {
+                   auto loop = std::make_shared<std::function<LibpqVoidSender()>>();
+                   *loop = [state, loop]() -> LibpqVoidSender {
+                       const PostgresPollingStatusType poll = PQconnectPoll(state->self->pg_);
+                       if (poll == PGRES_POLLING_OK) {
+                           return stdexec::just();
+                       }
+                       if (poll == PGRES_POLLING_FAILED) {
+                           const std::string message =
+                               PQerrorMessage(state->self->pg_) == nullptr
+                                   ? std::string("postgres connect failed")
+                                   : std::string(PQerrorMessage(state->self->pg_));
+                           return throw_sql_error_sender(message, SqlErrorKind::connect_failed);
+                       }
+                       if (poll == PGRES_POLLING_READING) {
+                           return wait_fd_ready_sender(
+                                      state->runtime,
+                                      PQsocket(state->self->pg_),
+                                      true,
+                                      false,
+                                      std::nullopt)
+                                | stdexec::let_value([loop] { return (*loop)(); });
+                       }
+                       if (poll == PGRES_POLLING_WRITING) {
+                           return wait_fd_ready_sender(
+                                      state->runtime,
+                                      PQsocket(state->self->pg_),
+                                      false,
+                                      true,
+                                      std::nullopt)
+                                | stdexec::let_value([loop] { return (*loop)(); });
+                       }
+                       return throw_sql_error_sender(
+                           "postgres connect returned unexpected polling status",
+                           SqlErrorKind::connect_failed);
+                   };
+                   return (*loop)();
+               })
+             | stdexec::let_error([state](std::exception_ptr error) -> LibpqVoidSender {
+                   state->self->close_sync();
+                   return stdexec::just()
+                        | stdexec::then([error] { std::rethrow_exception(error); });
+               });
     }
 
     QueryResult parse_postgres_result(PGresult *result, QueryResult out) {
@@ -809,440 +1230,364 @@ public:
         return out;
     }
 
-    Task<QueryResult> query_postgres_async(std::string sql, std::vector<SqlParam> params) {
-        if (pg_ == nullptr) {
-            throw SqlError("postgres connection is not open", SqlErrorKind::not_connected);
-        }
+    LibpqQuerySender query_postgres_sender(Runtime *runtime,
+                                           std::string sql,
+                                           std::vector<SqlParam> params) {
+        struct QueryState {
+            Connection::Impl *self = nullptr;
+            Runtime *runtime = nullptr;
+            std::string sql;
+            std::vector<SqlParam> params;
+            std::string rewritten;
+            std::vector<std::string> text_values;
+            std::vector<const char *> values;
+            QueryResult out;
+        };
 
-        std::string rewritten = sql;
-        if (!params.empty() && sql.find('?') != std::string::npos) {
-            rewritten = rewrite_qmark_to_dollar(sql);
-        }
+        auto state = std::make_shared<QueryState>();
+        state->self = this;
+        state->runtime = runtime;
+        state->sql = std::move(sql);
+        state->params = std::move(params);
 
-        if (count_placeholders(sql) != params.size()) {
-            throw SqlError("postgres parameter count does not match placeholders",
+        return stdexec::just()
+             | stdexec::then([state]() {
+                   if (state->runtime == nullptr) {
+                       throw SqlError("sql::Connection::query requires current runtime",
+                                      SqlErrorKind::runtime_missing);
+                   }
+                   if (state->self->pg_ == nullptr) {
+                       throw SqlError("postgres connection is not open", SqlErrorKind::not_connected);
+                   }
+
+                   state->rewritten = state->sql;
+                   if (!state->params.empty() && state->sql.find('?') != std::string::npos) {
+                       state->rewritten = rewrite_qmark_to_dollar(state->sql);
+                   }
+
+                   if (count_placeholders(state->sql) != state->params.size()) {
+                       throw SqlError(
+                           "postgres parameter count does not match placeholders",
                            SqlErrorKind::invalid_argument);
-        }
+                   }
 
-        std::vector<std::string> text_values;
-        text_values.reserve(params.size());
-        std::vector<const char *> values(params.size(), nullptr);
-        for (std::size_t i = 0; i < params.size(); ++i) {
-            if (!params[i].is_null()) {
-                text_values.push_back(params[i].as_text());
-                values[i] = text_values.back().c_str();
-            }
-        }
+                   state->text_values.reserve(state->params.size());
+                   state->values.assign(state->params.size(), nullptr);
+                   for (std::size_t i = 0; i < state->params.size(); ++i) {
+                       if (!state->params[i].is_null()) {
+                           state->text_values.push_back(state->params[i].as_text());
+                           state->values[i] = state->text_values.back().c_str();
+                       }
+                   }
 
-        int send_ok = 0;
-        if (params.empty()) {
-            send_ok = PQsendQuery(pg_, rewritten.c_str());
-        } else {
-            send_ok = PQsendQueryParams(pg_,
-                                        rewritten.c_str(),
-                                        static_cast<int>(params.size()),
-                                        nullptr,
-                                        values.data(),
-                                        nullptr,
-                                        nullptr,
-                                        0);
-        }
+                   int send_ok = 0;
+                   if (state->params.empty()) {
+                       send_ok = PQsendQuery(state->self->pg_, state->rewritten.c_str());
+                   } else {
+                       send_ok = PQsendQueryParams(state->self->pg_,
+                                                   state->rewritten.c_str(),
+                                                   static_cast<int>(state->params.size()),
+                                                   nullptr,
+                                                   state->values.data(),
+                                                   nullptr,
+                                                   nullptr,
+                                                   0);
+                   }
+                   if (send_ok == 0) {
+                       const std::string message = PQerrorMessage(state->self->pg_) == nullptr
+                                                       ? std::string("postgres query failed")
+                                                       : std::string(PQerrorMessage(state->self->pg_));
+                       throw SqlError(message, SqlErrorKind::query_failed);
+                   }
+               })
+             | stdexec::let_value([state]() {
+                   auto flush_loop = std::make_shared<std::function<LibpqVoidSender()>>();
+                   *flush_loop = [state, flush_loop]() -> LibpqVoidSender {
+                       const int flush = PQflush(state->self->pg_);
+                       if (flush == 0) {
+                           return stdexec::just();
+                       }
+                       if (flush < 0) {
+                           const std::string message = PQerrorMessage(state->self->pg_) == nullptr
+                                                           ? std::string("postgres flush failed")
+                                                           : std::string(PQerrorMessage(state->self->pg_));
+                           return throw_sql_error_sender(message, SqlErrorKind::query_failed);
+                       }
+                       return wait_fd_ready_sender(state->runtime,
+                                                   PQsocket(state->self->pg_),
+                                                   false,
+                                                   true,
+                                                   std::nullopt)
+                            | stdexec::let_value([flush_loop] { return (*flush_loop)(); });
+                   };
+                   return (*flush_loop)();
+               })
+             | stdexec::let_value([state]() {
+                   auto busy_loop = std::make_shared<std::function<LibpqVoidSender()>>();
+                   *busy_loop = [state, busy_loop]() -> LibpqVoidSender {
+                       if (PQisBusy(state->self->pg_) == 0) {
+                           return stdexec::just();
+                       }
+                       return wait_fd_ready_sender(state->runtime,
+                                                   PQsocket(state->self->pg_),
+                                                   true,
+                                                   false,
+                                                   std::nullopt)
+                            | stdexec::then([state] {
+                                  if (PQconsumeInput(state->self->pg_) == 0) {
+                                      const std::string message =
+                                          PQerrorMessage(state->self->pg_) == nullptr
+                                              ? std::string("postgres consume input failed")
+                                              : std::string(PQerrorMessage(state->self->pg_));
+                                      throw SqlError(message, SqlErrorKind::query_failed);
+                                  }
+                              })
+                            | stdexec::let_value([busy_loop] { return (*busy_loop)(); });
+                   };
 
-        if (send_ok == 0) {
-            throw SqlError(PQerrorMessage(pg_), SqlErrorKind::query_failed);
-        }
-
-        while (true) {
-            const int flush = PQflush(pg_);
-            if (flush == 0) {
-                break;
-            }
-            if (flush < 0) {
-                throw SqlError(PQerrorMessage(pg_), SqlErrorKind::query_failed);
-            }
-            co_await wait_fd_ready(PQsocket(pg_), false, true, std::nullopt);
-        }
-
-        QueryResult out;
-        while (true) {
-            while (PQisBusy(pg_) != 0) {
-                co_await wait_fd_ready(PQsocket(pg_), true, false, std::nullopt);
-                if (PQconsumeInput(pg_) == 0) {
-                    throw SqlError(PQerrorMessage(pg_), SqlErrorKind::query_failed);
-                }
-            }
-
-            PGresult *result = PQgetResult(pg_);
-            if (result == nullptr) {
-                break;
-            }
-
-            try {
-                out = parse_postgres_result(result, std::move(out));
-            } catch (...) {
-                PQclear(result);
-                throw;
-            }
-            PQclear(result);
-        }
-
-        co_return out;
+                   auto drain_loop = std::make_shared<std::function<LibpqQuerySender()>>();
+                   *drain_loop = [state, busy_loop, drain_loop]() -> LibpqQuerySender {
+                       return (*busy_loop)()
+                            | stdexec::let_value([state, drain_loop]() -> LibpqQuerySender {
+                                  std::unique_ptr<PGresult, decltype(&PQclear)> result(
+                                      PQgetResult(state->self->pg_), &PQclear);
+                                  if (result == nullptr) {
+                                      return stdexec::just(std::move(state->out));
+                                  }
+                                  state->out = state->self->parse_postgres_result(
+                                      result.get(), std::move(state->out));
+                                  return (*drain_loop)();
+                              });
+                   };
+                   return (*drain_loop)();
+               });
     }
 #endif
 
-#if ASYNC_UV_SQL_HAS_MYSQL
-    Task<void> wait_mysql_socket_ready() {
-        if (mysql_ == nullptr) {
-            throw SqlError("mysql connection is not open", SqlErrorKind::not_connected);
+#if FLUX_SQL_HAS_MYSQL
+    auto open_mysql_sender(const ConnectionOptions &options, Runtime *runtime) {
+        if (runtime == nullptr) {
+            throw SqlError("sql::Connection::open requires current runtime",
+                           SqlErrorKind::runtime_missing);
         }
 
-        const int fd = mysql_socket_fd(mysql_);
-        if (fd < 0) {
-            co_await async_uv::sleep_for(std::chrono::milliseconds(1));
-            co_return;
-        }
-
-        co_await wait_fd_ready(static_cast<uv_os_sock_t>(fd), true, true, std::nullopt);
-    }
-
-    Task<void> open_mysql_async(const ConnectionOptions &options) {
         close_sync();
-        ensure_mysql_library_initialized();
 
-        mysql_ = mysql_init(nullptr);
-        if (mysql_ == nullptr) {
-            throw SqlError("mysql_init failed", SqlErrorKind::connect_failed);
-        }
+        mysql_ioc_ = std::make_shared<boost::asio::io_context>(1);
+        mysql_work_guard_ = std::make_shared<
+            boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(
+            boost::asio::make_work_guard(*mysql_ioc_));
+        mysql_thread_ = std::thread([ioc = mysql_ioc_]() {
+            ioc->run();
+        });
 
-        const char *host = options.host.empty() ? nullptr : options.host.c_str();
-        const char *user = options.user.empty() ? nullptr : options.user.c_str();
-        const char *password = options.password.empty() ? nullptr : options.password.c_str();
-        const char *database = options.database.empty() ? nullptr : options.database.c_str();
+        mysql_ssl_ctx_ =
+            std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_client);
 
-        enum net_async_status status =
-            mysql_real_connect_nonblocking(mysql_,
-                                           host,
-                                           user,
-                                           password,
-                                           database,
-                                           static_cast<unsigned int>(default_port(options)),
-                                           nullptr,
-                                           0);
-        while (status == NET_ASYNC_NOT_READY) {
-            co_await wait_mysql_socket_ready();
-            status =
-                mysql_real_connect_nonblocking(mysql_,
-                                               host,
-                                               user,
-                                               password,
-                                               database,
-                                               static_cast<unsigned int>(default_port(options)),
-                                               nullptr,
-                                               0);
-        }
+        boost::mysql::any_connection_params conn_params;
+        conn_params.ssl_context = mysql_ssl_ctx_.get();
+        mysql_conn_ =
+            std::make_shared<boost::mysql::any_connection>(mysql_ioc_->get_executor(), conn_params);
 
-        if (status == NET_ASYNC_ERROR) {
-            std::string message = mysql_error(mysql_);
-            if (message.empty()) {
-                message = "mysql connect failed";
-            }
-            close_sync();
-            throw SqlError(message, SqlErrorKind::connect_failed);
-        }
-        co_return;
+        boost::mysql::connect_params params;
+        params.server_address.emplace_host_and_port(
+            options.host.empty() ? "127.0.0.1" : options.host,
+            static_cast<unsigned short>(default_port(options)));
+        params.username = options.user.empty() ? "root" : options.user;
+        params.password = options.password;
+        params.database = options.database;
+        params.ssl = boost::mysql::ssl_mode::enable;
+
+        auto diagnostics = std::make_shared<boost::mysql::diagnostics>();
+        return make_mysql_error_sender(
+                   [conn = mysql_conn_, params = std::move(params), diagnostics](auto handler) mutable {
+                       conn->async_connect(params, *diagnostics, std::move(handler));
+                   })
+             | stdexec::then([this, diagnostics](boost::system::error_code ec) {
+                   if (ec) {
+                       close_sync();
+                       throw SqlError(
+                           mysql_error_message(ec, *diagnostics), SqlErrorKind::connect_failed);
+                   }
+               });
     }
 
-    QueryResult query_mysql_stmt_blocking(const std::string &sql,
-                                          const std::vector<SqlParam> &params) {
-        if (mysql_ == nullptr) {
+    auto close_mysql_sender() {
+        auto conn = std::move(mysql_conn_);
+        auto ssl_ctx = std::move(mysql_ssl_ctx_);
+        auto work_guard = std::move(mysql_work_guard_);
+        auto ioc = std::move(mysql_ioc_);
+        auto worker = std::move(mysql_thread_);
+        auto diagnostics = std::make_shared<boost::mysql::diagnostics>();
+
+        return make_mysql_error_sender(
+                   [conn, diagnostics](auto handler) mutable {
+                       if (conn == nullptr) {
+                           handler(boost::system::error_code{});
+                           return;
+                       }
+                       conn->async_close(*diagnostics, std::move(handler));
+                   })
+             | stdexec::then(
+                   [ssl_ctx = std::move(ssl_ctx),
+                    work_guard = std::move(work_guard),
+                    ioc = std::move(ioc),
+                    worker = std::move(worker)](boost::system::error_code) mutable {
+                       if (work_guard != nullptr) {
+                           work_guard->reset();
+                       }
+                       if (ioc != nullptr) {
+                           ioc->stop();
+                       }
+                       if (worker.joinable()) {
+                           if (worker.get_id() == std::this_thread::get_id()) {
+                               worker.detach();
+                           } else {
+                               worker.join();
+                           }
+                       }
+                       (void)ssl_ctx;
+                   });
+    }
+
+    auto open_mysql_checked_sender(const ConnectionOptions &options, Runtime *runtime) {
+        return open_mysql_sender(options, runtime)
+             | stdexec::let_error([this](std::exception_ptr error) {
+                   return close_mysql_sender()
+                        | stdexec::then([error]() -> void {
+                              std::rethrow_exception(error);
+                          })
+                        | stdexec::upon_error([error](std::exception_ptr) -> void {
+                              std::rethrow_exception(error);
+                          });
+               });
+    }
+
+    auto close_mysql_safe_sender() {
+        return close_mysql_sender()
+             | stdexec::then([]() -> void {})
+             | stdexec::upon_error([](std::exception_ptr) -> void {});
+    }
+
+    auto query_mysql_sender(std::string sql, std::vector<SqlParam> params)
+        -> exec::any_receiver_ref<
+            stdexec::completion_signatures<stdexec::set_value_t(QueryResult),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>>::any_sender<> {
+        auto conn = mysql_conn_;
+        if (conn == nullptr) {
             throw SqlError("mysql connection is not open", SqlErrorKind::not_connected);
         }
 
-        if (count_placeholders(sql) != params.size()) {
-            throw SqlError("mysql parameter count does not match placeholders",
-                           SqlErrorKind::invalid_argument);
+        auto results = std::make_shared<boost::mysql::results>();
+        auto diagnostics = std::make_shared<boost::mysql::diagnostics>();
+
+        if (params.empty()) {
+            return make_mysql_error_sender(
+                       [conn, sql = std::move(sql), results, diagnostics](auto handler) mutable {
+                           conn->async_execute(sql, *results, *diagnostics, std::move(handler));
+                       })
+                 | stdexec::then([results, diagnostics](boost::system::error_code ec) {
+                       if (ec) {
+                           throw SqlError(mysql_error_message(ec, *diagnostics),
+                                          SqlErrorKind::query_failed);
+                       }
+                       return mysql_results_to_query_result(*results);
+                   });
         }
 
-        MYSQL_STMT *stmt = mysql_stmt_init(mysql_);
-        if (stmt == nullptr) {
-            throw SqlError(mysql_error(mysql_), SqlErrorKind::query_failed);
+        auto param_storage = std::make_shared<std::vector<boost::mysql::field>>();
+        param_storage->reserve(params.size());
+        for (const auto &param : params) {
+            param_storage->push_back(mysql_param_to_field(param));
+        }
+        auto param_views = std::make_shared<std::vector<boost::mysql::field_view>>();
+        param_views->reserve(param_storage->size());
+        for (const auto &value : *param_storage) {
+            param_views->emplace_back(value);
         }
 
-        auto close_stmt = [&]() {
-            if (stmt != nullptr) {
-                mysql_stmt_close(stmt);
-                stmt = nullptr;
-            }
-        };
+        return make_mysql_value_sender<boost::mysql::statement>(
+                   [conn, sql = std::move(sql), diagnostics](auto handler) mutable {
+                       conn->async_prepare_statement(sql, *diagnostics, std::move(handler));
+                   })
+             | stdexec::let_value(
+                   [conn, diagnostics, results, param_storage, param_views](auto prepared) mutable {
+                       if (prepared.ec) {
+                           throw SqlError(mysql_error_message(prepared.ec, *diagnostics),
+                                          SqlErrorKind::query_failed);
+                       }
+                       if (!prepared.value.has_value()) {
+                           throw SqlError("mysql prepare statement returned no result",
+                                          SqlErrorKind::internal_error);
+                       }
 
-        if (mysql_stmt_prepare(stmt, sql.c_str(), static_cast<unsigned long>(sql.size())) != 0) {
-            const std::string message = mysql_stmt_error(stmt);
-            close_stmt();
-            throw SqlError(message, SqlErrorKind::query_failed);
-        }
+                       auto statement = std::move(*prepared.value);
+                       if (statement.num_params() != param_storage->size()) {
+                           throw SqlError("mysql parameter count does not match placeholders",
+                                          SqlErrorKind::invalid_argument);
+                       }
 
-        const unsigned long expected = mysql_stmt_param_count(stmt);
-        if (expected != params.size()) {
-            close_stmt();
-            throw SqlError("mysql parameter count does not match placeholders",
-                           SqlErrorKind::invalid_argument);
-        }
+                       auto bound = statement.bind(param_views->begin(), param_views->end());
+                       auto statement_holder =
+                           std::make_shared<boost::mysql::statement>(std::move(statement));
+                       auto close_diagnostics = std::make_shared<boost::mysql::diagnostics>();
 
-        std::vector<MYSQL_BIND> binds(params.size());
-        std::vector<std::string> text_values(params.size());
-        std::vector<std::int64_t> int_values(params.size(), 0);
-        std::vector<double> double_values(params.size(), 0.0);
-        std::vector<signed char> bool_values(params.size(), 0);
-        std::vector<unsigned long> lengths(params.size(), 0);
-        std::vector<char> nulls(params.size(), 0);
-        std::vector<char> errors(params.size(), 0);
+                       return make_mysql_error_sender(
+                                  [conn,
+                                   bound,
+                                   results,
+                                   diagnostics,
+                                   param_storage,
+                                   param_views](auto handler) mutable {
+                                      conn->async_execute(
+                                          bound, *results, *diagnostics, std::move(handler));
+                                  })
+                            | stdexec::let_value(
+                                  [conn, results, diagnostics, statement_holder, close_diagnostics](
+                                      boost::system::error_code execute_ec) mutable {
+                                      if (execute_ec) {
+                                          throw SqlError(
+                                              mysql_error_message(execute_ec, *diagnostics),
+                                              SqlErrorKind::query_failed);
+                                      }
 
-        for (std::size_t i = 0; i < params.size(); ++i) {
-            MYSQL_BIND bind{};
-            bind.length = &lengths[i];
-            bind.is_null = reinterpret_cast<bool *>(&nulls[i]);
-            bind.error = reinterpret_cast<bool *>(&errors[i]);
-
-            const SqlParam &param = params[i];
-            switch (param.type()) {
-                case SqlParam::Type::null:
-                    bind.buffer_type = MYSQL_TYPE_NULL;
-                    nulls[i] = 1;
-                    break;
-                case SqlParam::Type::text:
-                    text_values[i] = param.as_text();
-                    bind.buffer_type = MYSQL_TYPE_STRING;
-                    bind.buffer = text_values[i].data();
-                    lengths[i] = static_cast<unsigned long>(text_values[i].size());
-                    bind.buffer_length = lengths[i];
-                    break;
-                case SqlParam::Type::int64:
-                    int_values[i] = std::stoll(param.as_text());
-                    bind.buffer_type = MYSQL_TYPE_LONGLONG;
-                    bind.buffer = &int_values[i];
-                    bind.is_unsigned = false;
-                    break;
-                case SqlParam::Type::float64:
-                    double_values[i] = std::stod(param.as_text());
-                    bind.buffer_type = MYSQL_TYPE_DOUBLE;
-                    bind.buffer = &double_values[i];
-                    break;
-                case SqlParam::Type::boolean:
-                    bool_values[i] = param.as_text() == "1" ? 1 : 0;
-                    bind.buffer_type = MYSQL_TYPE_TINY;
-                    bind.buffer = &bool_values[i];
-                    bind.buffer_length = sizeof(signed char);
-                    break;
-            }
-
-            binds[i] = bind;
-        }
-
-        if (!binds.empty() && mysql_stmt_bind_param(stmt, binds.data()) != 0) {
-            const std::string message = mysql_stmt_error(stmt);
-            close_stmt();
-            throw SqlError(message, SqlErrorKind::query_failed);
-        }
-
-        bool update_max_length = true;
-        (void)mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &update_max_length);
-
-        if (mysql_stmt_execute(stmt) != 0) {
-            const std::string message = mysql_stmt_error(stmt);
-            close_stmt();
-            throw SqlError(message, SqlErrorKind::query_failed);
-        }
-
-        QueryResult out;
-        const unsigned int column_count = mysql_stmt_field_count(stmt);
-        if (column_count == 0) {
-            out.affected_rows = static_cast<std::uint64_t>(mysql_stmt_affected_rows(stmt));
-            out.last_insert_id = static_cast<std::uint64_t>(mysql_insert_id(mysql_));
-            close_stmt();
-            return out;
-        }
-
-        if (mysql_stmt_store_result(stmt) != 0) {
-            const std::string message = mysql_stmt_error(stmt);
-            close_stmt();
-            throw SqlError(message, SqlErrorKind::query_failed);
-        }
-
-        MYSQL_RES *meta = mysql_stmt_result_metadata(stmt);
-        if (meta == nullptr) {
-            const std::string message = mysql_stmt_error(stmt);
-            close_stmt();
-            throw SqlError(message.empty() ? "mysql metadata fetch failed" : message,
-                           SqlErrorKind::query_failed);
-        }
-
-        MYSQL_FIELD *fields = mysql_fetch_fields(meta);
-        out.columns.reserve(column_count);
-        for (unsigned int col = 0; col < column_count; ++col) {
-            out.columns.push_back(fields[col].name == nullptr ? "" : fields[col].name);
-        }
-
-        std::vector<MYSQL_BIND> result_binds(column_count);
-        std::vector<std::vector<char>> result_buffers(column_count);
-        std::vector<unsigned long> result_lengths(column_count, 0);
-        std::vector<char> result_nulls(column_count, 0);
-        std::vector<char> result_errors(column_count, 0);
-
-        for (unsigned int col = 0; col < column_count; ++col) {
-            const auto capacity = static_cast<std::size_t>(std::max<std::uint64_t>(
-                64, static_cast<std::uint64_t>(fields[col].max_length + 1)));
-            result_buffers[col].assign(capacity, '\0');
-
-            MYSQL_BIND bind{};
-            bind.buffer_type = MYSQL_TYPE_STRING;
-            bind.buffer = result_buffers[col].data();
-            bind.buffer_length = static_cast<unsigned long>(result_buffers[col].size());
-            bind.length = &result_lengths[col];
-            bind.is_null = reinterpret_cast<bool *>(&result_nulls[col]);
-            bind.error = reinterpret_cast<bool *>(&result_errors[col]);
-            result_binds[col] = bind;
-        }
-
-        if (mysql_stmt_bind_result(stmt, result_binds.data()) != 0) {
-            const std::string message = mysql_stmt_error(stmt);
-            mysql_free_result(meta);
-            close_stmt();
-            throw SqlError(message, SqlErrorKind::query_failed);
-        }
-
-        while (true) {
-            const int rc = mysql_stmt_fetch(stmt);
-            if (rc == MYSQL_NO_DATA) {
-                break;
-            }
-            if (rc == 1) {
-                const std::string message = mysql_stmt_error(stmt);
-                mysql_free_result(meta);
-                close_stmt();
-                throw SqlError(message, SqlErrorKind::query_failed);
-            }
-
-            Row row;
-            row.values.reserve(column_count);
-            for (unsigned int col = 0; col < column_count; ++col) {
-                if (result_nulls[col] != 0) {
-                    row.values.push_back(std::nullopt);
-                } else {
-                    row.values.push_back(
-                        std::string(result_buffers[col].data(), result_lengths[col]));
-                }
-            }
-            out.rows.push_back(std::move(row));
-        }
-
-        out.affected_rows = static_cast<std::uint64_t>(mysql_stmt_affected_rows(stmt));
-        out.last_insert_id = static_cast<std::uint64_t>(mysql_insert_id(mysql_));
-        mysql_free_result(meta);
-        close_stmt();
-        return out;
-    }
-
-    Task<QueryResult> query_mysql_async(std::string sql, std::vector<SqlParam> params) {
-        if (mysql_ == nullptr) {
-            throw SqlError("mysql connection is not open", SqlErrorKind::not_connected);
-        }
-        if (!params.empty()) {
-            throw SqlError("mysql async query only supports empty params",
-                           SqlErrorKind::invalid_argument);
-        }
-
-        enum net_async_status status = mysql_real_query_nonblocking(
-            mysql_, sql.c_str(), static_cast<unsigned long>(sql.size()));
-        while (status == NET_ASYNC_NOT_READY) {
-            co_await wait_mysql_socket_ready();
-            status = mysql_real_query_nonblocking(
-                mysql_, sql.c_str(), static_cast<unsigned long>(sql.size()));
-        }
-
-        if (status == NET_ASYNC_ERROR) {
-            throw SqlError(mysql_error(mysql_), SqlErrorKind::query_failed);
-        }
-
-        QueryResult out;
-        MYSQL_RES *result = nullptr;
-        status = mysql_store_result_nonblocking(mysql_, &result);
-        while (status == NET_ASYNC_NOT_READY) {
-            co_await wait_mysql_socket_ready();
-            status = mysql_store_result_nonblocking(mysql_, &result);
-        }
-
-        if (status == NET_ASYNC_ERROR) {
-            throw SqlError(mysql_error(mysql_), SqlErrorKind::query_failed);
-        }
-
-        if (result == nullptr) {
-            if (mysql_field_count(mysql_) != 0) {
-                throw SqlError(mysql_error(mysql_), SqlErrorKind::query_failed);
-            }
-
-            out.affected_rows = static_cast<std::uint64_t>(mysql_affected_rows(mysql_));
-            out.last_insert_id = static_cast<std::uint64_t>(mysql_insert_id(mysql_));
-            co_return out;
-        }
-
-        const unsigned int columns = mysql_num_fields(result);
-        MYSQL_FIELD *fields = mysql_fetch_fields(result);
-        out.columns.reserve(columns);
-        for (unsigned int col = 0; col < columns; ++col) {
-            out.columns.push_back(fields[col].name == nullptr ? "" : fields[col].name);
-        }
-
-        MYSQL_ROW row = nullptr;
-        status = mysql_fetch_row_nonblocking(result, &row);
-        while (status == NET_ASYNC_NOT_READY) {
-            co_await wait_mysql_socket_ready();
-            status = mysql_fetch_row_nonblocking(result, &row);
-        }
-
-        while (status == NET_ASYNC_COMPLETE && row != nullptr) {
-            unsigned long *lengths = mysql_fetch_lengths(result);
-            Row item;
-            item.values.reserve(columns);
-            for (unsigned int col = 0; col < columns; ++col) {
-                if (row[col] == nullptr) {
-                    item.values.push_back(std::nullopt);
-                } else {
-                    item.values.push_back(std::string(row[col], lengths[col]));
-                }
-            }
-            out.rows.push_back(std::move(item));
-
-            status = mysql_fetch_row_nonblocking(result, &row);
-            while (status == NET_ASYNC_NOT_READY) {
-                co_await wait_mysql_socket_ready();
-                status = mysql_fetch_row_nonblocking(result, &row);
-            }
-        }
-
-        if (status == NET_ASYNC_ERROR) {
-            mysql_free_result(result);
-            throw SqlError(mysql_error(mysql_), SqlErrorKind::query_failed);
-        }
-
-        mysql_free_result(result);
-        out.affected_rows = static_cast<std::uint64_t>(mysql_affected_rows(mysql_));
-        out.last_insert_id = static_cast<std::uint64_t>(mysql_insert_id(mysql_));
-        co_return out;
+                                      return make_mysql_error_sender(
+                                                 [conn, statement_holder, close_diagnostics](
+                                                     auto handler) mutable {
+                                                     conn->async_close_statement(*statement_holder,
+                                                                                 *close_diagnostics,
+                                                                                 std::move(handler));
+                                                 })
+                                           | stdexec::then(
+                                                 [results](boost::system::error_code) mutable {
+                                                     return mysql_results_to_query_result(*results);
+                                                 })
+                                           | stdexec::upon_error(
+                                                 [results](std::exception_ptr) mutable {
+                                                     return mysql_results_to_query_result(*results);
+                                                 });
+                                  });
+                   });
     }
 #endif
 
     ConnectionOptions options_{};
     std::atomic_bool busy_{false};
     std::mutex sqlite_mutex_;
-    std::mutex mysql_mutex_;
 
-#if ASYNC_UV_SQL_HAS_LIBPQ
+#if FLUX_SQL_HAS_LIBPQ
     PGconn *pg_ = nullptr;
 #endif
-#if ASYNC_UV_SQL_HAS_MYSQL
-    MYSQL *mysql_ = nullptr;
+#if FLUX_SQL_HAS_MYSQL
+    std::shared_ptr<boost::asio::io_context> mysql_ioc_;
+    std::shared_ptr<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
+        mysql_work_guard_;
+    std::thread mysql_thread_;
+    std::shared_ptr<boost::asio::ssl::context> mysql_ssl_ctx_;
+    std::shared_ptr<boost::mysql::any_connection> mysql_conn_;
 #endif
-#if ASYNC_UV_SQL_HAS_SQLITE3
+#if FLUX_SQL_HAS_SQLITE3
     sqlite3 *sqlite_ = nullptr;
 #endif
 };
@@ -1259,467 +1604,455 @@ Connection::Connection(Connection &&) noexcept = default;
 
 Connection &Connection::operator=(Connection &&) noexcept = default;
 
-Task<void> Connection::open(ConnectionOptions options) {
-    auto *runtime = co_await async_uv::get_current_runtime();
-    if (runtime == nullptr) {
-        throw SqlError("sql::Connection::open requires current runtime",
-                       SqlErrorKind::runtime_missing);
-    }
+VoidSender Connection::open_task(ConnectionOptions options) {
+    auto guard = std::make_shared<OperationGuard>(impl_->busy_);
+    auto options_state = std::make_shared<ConnectionOptions>(std::move(options));
 
-    OperationGuard guard(impl_->busy_);
+    return current_runtime_sender("sql::Connection::open requires current runtime")
+         | stdexec::let_value([this, guard, options_state](Runtime *runtime) -> VoidSender {
+               auto with_connect_timeout = [runtime, options_state](VoidSender work_sender)
+                   -> VoidSender {
+                   if (options_state->connect_timeout_ms <= 0) {
+                       return work_sender;
+                   }
+                   auto work_done = std::move(work_sender) | stdexec::then([] { return true; });
+                   auto timer =
+                       std::make_shared<exec::asio::asio_impl::steady_timer>(runtime->executor());
+                   timer->expires_after(
+                       std::chrono::milliseconds(std::max(0, options_state->connect_timeout_ms)));
+                   auto timeout_done =
+                       timer->async_wait(exec::asio::use_sender)
+                     | stdexec::then([timer]() { return false; });
+                   return exec::when_any(std::move(work_done), std::move(timeout_done))
+                        | stdexec::then([](bool completed) {
+                              if (!completed) {
+                                  throw SqlError("sql connect timeout", SqlErrorKind::connect_failed);
+                              }
+                          });
+               };
 
-    switch (options.driver) {
-        case Driver::sqlite:
-#if ASYNC_UV_SQL_HAS_SQLITE3
-        {
-            auto error = std::make_shared<std::exception_ptr>();
-            auto open_task = [runtime, impl = impl_.get(), options, error]() -> Task<void> {
-                co_await runtime->spawn_blocking([impl, options, error] {
-                    try {
-                        std::lock_guard<std::mutex> lock(impl->sqlite_mutex_);
-                        impl->open_sqlite_blocking(options);
-                    } catch (...) {
-                        *error = std::current_exception();
-                    }
-                });
-                co_return;
-            };
-
-            try {
-                if (options.connect_timeout_ms > 0) {
-                    co_await async_uv::with_timeout(
-                        std::chrono::milliseconds(options.connect_timeout_ms), open_task());
-                } else {
-                    co_await open_task();
-                }
-            } catch (const async_uv::Error &e) {
-                if (e.code() == UV_ETIMEDOUT) {
-                    throw SqlError("sql connect timeout", SqlErrorKind::connect_failed);
-                }
-                throw;
-            }
-
-            if (*error) {
-                std::rethrow_exception(*error);
-            }
-        }
-            impl_->options_ = std::move(options);
-            co_return;
+               switch (options_state->driver) {
+                   case Driver::sqlite:
+#if FLUX_SQL_HAS_SQLITE3
+                       return with_connect_timeout(impl_->open_sqlite_sender(*options_state, runtime))
+                            | stdexec::then([this, options_state]() {
+                                  impl_->options_ = *options_state;
+                              });
 #else
-            throw SqlError("sqlite driver is not enabled", SqlErrorKind::invalid_argument);
+                       throw SqlError("sqlite driver is not enabled", SqlErrorKind::invalid_argument);
 #endif
 
-        case Driver::postgres:
-#if ASYNC_UV_SQL_HAS_LIBPQ
-            try {
-                if (options.connect_timeout_ms > 0) {
-                    co_await async_uv::with_timeout(
-                        std::chrono::milliseconds(options.connect_timeout_ms),
-                        impl_->open_postgres_async(options));
-                } else {
-                    co_await impl_->open_postgres_async(options);
-                }
-            } catch (const async_uv::Error &e) {
-                if (e.code() == UV_ETIMEDOUT) {
-                    throw SqlError("sql connect timeout", SqlErrorKind::connect_failed);
-                }
-                throw;
-            }
-            impl_->options_ = std::move(options);
-            co_return;
+                   case Driver::postgres:
+#if FLUX_SQL_HAS_LIBPQ
+                       return with_connect_timeout(impl_->open_postgres_sender(*options_state, runtime))
+                            | stdexec::then([this, options_state]() {
+                                  impl_->options_ = *options_state;
+                              });
 #else
-            throw SqlError("postgres driver is not enabled", SqlErrorKind::invalid_argument);
+                       throw SqlError("postgres driver is not enabled", SqlErrorKind::invalid_argument);
 #endif
 
-        case Driver::mysql:
-#if ASYNC_UV_SQL_HAS_MYSQL
-            try {
-                if (options.connect_timeout_ms > 0) {
-                    co_await async_uv::with_timeout(
-                        std::chrono::milliseconds(options.connect_timeout_ms),
-                        impl_->open_mysql_async(options));
-                } else {
-                    co_await impl_->open_mysql_async(options);
-                }
-            } catch (const async_uv::Error &e) {
-                if (e.code() == UV_ETIMEDOUT) {
-                    throw SqlError("sql connect timeout", SqlErrorKind::connect_failed);
-                }
-                throw;
-            }
-            impl_->options_ = std::move(options);
-            co_return;
+                   case Driver::mysql:
+#if FLUX_SQL_HAS_MYSQL
+                       return with_connect_timeout(
+                                  impl_->open_mysql_checked_sender(*options_state, runtime))
+                            | stdexec::then([this, options_state]() {
+                                  impl_->options_ = *options_state;
+                              });
 #else
-            throw SqlError("mysql driver is not enabled", SqlErrorKind::invalid_argument);
+                       throw SqlError("mysql driver is not enabled", SqlErrorKind::invalid_argument);
 #endif
-    }
+               }
 
-    throw SqlError("unsupported sql driver", SqlErrorKind::internal_error);
+               throw SqlError("unsupported sql driver", SqlErrorKind::internal_error);
+           });
 }
 
-Task<void> Connection::close() {
-    auto *runtime = co_await async_uv::get_current_runtime();
-    if (runtime == nullptr) {
-        throw SqlError("sql::Connection::close requires current runtime",
-                       SqlErrorKind::runtime_missing);
-    }
-
-    OperationGuard guard(impl_->busy_);
-
-    if (impl_->options_.driver == Driver::sqlite) {
-#if ASYNC_UV_SQL_HAS_SQLITE3
-        co_await runtime->spawn_blocking([impl = impl_.get()] {
-            std::lock_guard<std::mutex> lock(impl->sqlite_mutex_);
-            impl->close_sync();
-        });
-        co_return;
+VoidSender Connection::close_task() {
+    auto guard = std::make_shared<OperationGuard>(impl_->busy_);
+    return current_runtime_sender("sql::Connection::close requires current runtime")
+         | stdexec::let_value([this, guard](Runtime *runtime) -> VoidSender {
+               if (impl_->options_.driver == Driver::sqlite) {
+#if FLUX_SQL_HAS_SQLITE3
+                   return impl_->close_sqlite_sender(runtime);
 #endif
-    }
-
-    impl_->close_sync();
-    co_return;
+               }
+               if (impl_->options_.driver == Driver::mysql) {
+#if FLUX_SQL_HAS_MYSQL
+                   return impl_->close_mysql_safe_sender();
+#endif
+               }
+               return stdexec::just() | stdexec::then([this]() { impl_->close_sync(); });
+           });
 }
 
-Task<bool> Connection::is_open() const {
-    co_return impl_->is_open();
+BoolSender Connection::is_open_task() const {
+    return stdexec::just(impl_->is_open());
 }
 
 ConnectionOptions Connection::options() const {
     return impl_->options_;
 }
 
-Task<QueryResult> Connection::query(std::string sql) {
-    co_return co_await query(std::move(sql), {}, QueryOptions{});
+QuerySender Connection::query_task(std::string sql) {
+    return query_task(std::move(sql), {}, QueryOptions{});
 }
 
-Task<QueryResult> Connection::query(std::string sql, std::vector<SqlParam> params) {
-    co_return co_await query(std::move(sql), std::move(params), QueryOptions{});
+QuerySender Connection::query_task(std::string sql, std::vector<SqlParam> params) {
+    return query_task(std::move(sql), std::move(params), QueryOptions{});
 }
 
-Task<QueryResult> Connection::query(std::string sql, QueryOptions options) {
-    co_return co_await query(std::move(sql), {}, std::move(options));
+QuerySender Connection::query_task(std::string sql, QueryOptions options) {
+    return query_task(std::move(sql), {}, std::move(options));
 }
 
-Task<QueryResult>
-Connection::query(std::string sql, std::vector<SqlParam> params, QueryOptions query_options) {
+QuerySender Connection::query_task(std::string sql,
+                                   std::vector<SqlParam> params,
+                                   QueryOptions query_options) {
     const auto started = std::chrono::steady_clock::now();
-    async_uv::emit_trace_event({"layer2_sql", "query_start", 0, params.size()});
-    auto *runtime = co_await async_uv::get_current_runtime();
-    if (runtime == nullptr) {
-        throw SqlError("sql::Connection::query requires current runtime",
-                       SqlErrorKind::runtime_missing);
-    }
+    flux::emit_trace_event({"layer2_sql", "query_start", 0, params.size()});
 
-    OperationGuard guard(impl_->busy_);
-    const Driver driver = impl_->options_.driver;
+    auto guard = std::make_shared<OperationGuard>(impl_->busy_);
+    return current_runtime_sender("sql::Connection::query requires current runtime")
+         | stdexec::let_value(
+               [this, guard, sql = std::move(sql), params = std::move(params), query_options](
+                   Runtime *runtime) mutable -> QuerySender {
+                   const Driver driver = impl_->options_.driver;
+                   const auto timeout_ms = choose_timeout_ms(impl_->options_, query_options);
 
-    switch (driver) {
-        case Driver::sqlite:
-#if ASYNC_UV_SQL_HAS_SQLITE3
-        {
-            auto run = [runtime,
-                        impl = impl_.get(),
-                        sql = std::move(sql),
-                        params = std::move(params)]() mutable -> Task<QueryResult> {
-                auto error = std::make_shared<std::exception_ptr>();
-                auto result = std::make_shared<QueryResult>();
-                co_await runtime->spawn_blocking([impl,
-                                                  sql = std::move(sql),
-                                                  params = std::move(params),
-                                                  error,
-                                                  result]() mutable {
-                    try {
-                        std::lock_guard<std::mutex> lock(impl->sqlite_mutex_);
-                        *result = impl->query_sqlite_blocking(sql, params);
-                    } catch (...) {
-                        *error = std::current_exception();
-                    }
-                });
-                if (*error) {
-                    std::rethrow_exception(*error);
-                }
-                co_return *result;
-            };
-            auto out = co_await run_with_query_timeout(impl_->options_, query_options, run);
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started);
-            async_uv::emit_trace_event(
-                {"layer2_sql", "query_done", 0, static_cast<std::size_t>(elapsed.count())});
-            co_return out;
-        }
+                   auto make_query_sender =
+                       [this, runtime, sql = std::move(sql), params = std::move(params), driver]() mutable
+                       -> QuerySender {
+                       switch (driver) {
+                           case Driver::sqlite:
+#if FLUX_SQL_HAS_SQLITE3
+                               return impl_->query_sqlite_sender(
+                                   runtime, std::move(sql), std::move(params));
 #else
-            throw SqlError("sqlite driver is not enabled", SqlErrorKind::invalid_argument);
+                               throw SqlError("sqlite driver is not enabled",
+                                              SqlErrorKind::invalid_argument);
 #endif
-
-        case Driver::postgres:
-#if ASYNC_UV_SQL_HAS_LIBPQ
-        {
-            auto run =
-                [impl = impl_.get(), sql = std::move(sql), params = std::move(params)]() mutable {
-                    return impl->query_postgres_async(std::move(sql), std::move(params));
-                };
-            auto out = co_await run_with_query_timeout(impl_->options_, query_options, run);
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started);
-            async_uv::emit_trace_event(
-                {"layer2_sql", "query_done", 0, static_cast<std::size_t>(elapsed.count())});
-            co_return out;
-        }
+                           case Driver::postgres:
+#if FLUX_SQL_HAS_LIBPQ
+                               return impl_->query_postgres_sender(
+                                   runtime, std::move(sql), std::move(params));
 #else
-            throw SqlError("postgres driver is not enabled", SqlErrorKind::invalid_argument);
+                               throw SqlError("postgres driver is not enabled",
+                                              SqlErrorKind::invalid_argument);
 #endif
-
-        case Driver::mysql:
-#if ASYNC_UV_SQL_HAS_MYSQL
-        {
-            if (!params.empty()) {
-                auto run = [runtime,
-                            impl = impl_.get(),
-                            sql = std::move(sql),
-                            params = std::move(params)]() mutable -> Task<QueryResult> {
-                    auto error = std::make_shared<std::exception_ptr>();
-                    auto result = std::make_shared<QueryResult>();
-                    co_await runtime->spawn_blocking([impl,
-                                                      sql = std::move(sql),
-                                                      params = std::move(params),
-                                                      error,
-                                                      result]() mutable {
-                        try {
-                            std::lock_guard<std::mutex> lock(impl->mysql_mutex_);
-                            *result = impl->query_mysql_stmt_blocking(sql, params);
-                        } catch (...) {
-                            *error = std::current_exception();
-                        }
-                    });
-                    if (*error) {
-                        std::rethrow_exception(*error);
-                    }
-                    co_return *result;
-                };
-                auto out = co_await run_with_query_timeout(impl_->options_, query_options, run);
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started);
-                async_uv::emit_trace_event(
-                    {"layer2_sql", "query_done", 0, static_cast<std::size_t>(elapsed.count())});
-                co_return out;
-            }
-
-            auto run = [impl = impl_.get(), sql = std::move(sql)]() mutable {
-                return impl->query_mysql_async(std::move(sql), {});
-            };
-            auto out = co_await run_with_query_timeout(impl_->options_, query_options, run);
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started);
-            async_uv::emit_trace_event(
-                {"layer2_sql", "query_done", 0, static_cast<std::size_t>(elapsed.count())});
-            co_return out;
-        }
+                           case Driver::mysql:
+#if FLUX_SQL_HAS_MYSQL
+                               return impl_->query_mysql_sender(std::move(sql), std::move(params));
 #else
-            throw SqlError("mysql driver is not enabled", SqlErrorKind::invalid_argument);
+                               throw SqlError("mysql driver is not enabled",
+                                              SqlErrorKind::invalid_argument);
 #endif
-    }
+                       }
+                       throw SqlError("unsupported sql driver", SqlErrorKind::internal_error);
+                   };
 
-    throw SqlError("unsupported sql driver", SqlErrorKind::internal_error);
+                   auto query_sender = make_query_sender();
+                   if (!timeout_ms.has_value()) {
+                       return query_sender;
+                   }
+
+                   auto timer =
+                       std::make_shared<exec::asio::asio_impl::steady_timer>(runtime->executor());
+                   timer->expires_after(std::chrono::milliseconds(std::max(0, *timeout_ms)));
+
+                   auto query_optional =
+                       std::move(query_sender)
+                     | stdexec::then(
+                           [](QueryResult value) { return std::optional<QueryResult>(std::move(value)); });
+                   auto timeout_optional =
+                       timer->async_wait(exec::asio::use_sender)
+                     | stdexec::then([timer]() { return std::optional<QueryResult>{}; });
+                   return exec::when_any(std::move(query_optional), std::move(timeout_optional))
+                        | stdexec::then([](std::optional<QueryResult> maybe_result) {
+                              if (!maybe_result.has_value()) {
+                                  throw SqlError("sql query timeout", SqlErrorKind::query_failed);
+                              }
+                              return std::move(*maybe_result);
+                          });
+               })
+         | stdexec::then([started, guard](QueryResult out) {
+               const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - started);
+               flux::emit_trace_event(
+                   {"layer2_sql", "query_done", 0, static_cast<std::size_t>(elapsed.count())});
+               return out;
+           })
+         | stdexec::upon_error([started, guard](std::exception_ptr error) -> QueryResult {
+               const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - started);
+               flux::emit_trace_event(
+                   {"layer2_sql", "query_done", 0, static_cast<std::size_t>(elapsed.count())});
+               try {
+                   std::rethrow_exception(error);
+               } catch (const flux::Error &e) {
+                   if (e.code() == UV_ETIMEDOUT) {
+                       throw SqlError("sql query timeout", SqlErrorKind::query_failed);
+                   }
+                   throw;
+               }
+           });
 }
 
-Task<QueryResult> Connection::execute(std::string sql) {
-    co_return co_await query(std::move(sql), {}, QueryOptions{});
+VoidSender Connection::begin_task() {
+    return query_task("BEGIN", {}, QueryOptions{}) | stdexec::then([](QueryResult) {});
 }
 
-Task<QueryResult> Connection::execute(std::string sql, std::vector<SqlParam> params) {
-    co_return co_await query(std::move(sql), std::move(params), QueryOptions{});
+VoidSender Connection::commit_task() {
+    return query_task("COMMIT", {}, QueryOptions{}) | stdexec::then([](QueryResult) {});
 }
 
-Task<QueryResult> Connection::execute(std::string sql, QueryOptions options) {
-    co_return co_await query(std::move(sql), {}, std::move(options));
+VoidSender Connection::rollback_task() {
+    return query_task("ROLLBACK", {}, QueryOptions{}) | stdexec::then([](QueryResult) {});
 }
 
-Task<QueryResult>
-Connection::execute(std::string sql, std::vector<SqlParam> params, QueryOptions options) {
-    co_return co_await query(std::move(sql), std::move(params), std::move(options));
-}
-
-Task<void> Connection::begin() {
-    (void)co_await execute("BEGIN");
-    co_return;
-}
-
-Task<void> Connection::commit() {
-    (void)co_await execute("COMMIT");
-    co_return;
-}
-
-Task<void> Connection::rollback() {
-    (void)co_await execute("ROLLBACK");
-    co_return;
-}
-
-Task<void> Connection::cancel() {
-    switch (impl_->options_.driver) {
-        case Driver::sqlite:
-#if ASYNC_UV_SQL_HAS_SQLITE3
-            if (impl_->sqlite_ != nullptr) {
-                sqlite3_interrupt(impl_->sqlite_);
-            }
+VoidSender Connection::cancel_task() {
+    return stdexec::just() | stdexec::let_value([this]() -> VoidSender {
+               switch (impl_->options_.driver) {
+                   case Driver::sqlite:
+#if FLUX_SQL_HAS_SQLITE3
+                       return stdexec::just() | stdexec::then([this]() {
+                                  if (impl_->sqlite_ != nullptr) {
+                                      sqlite3_interrupt(impl_->sqlite_);
+                                  }
+                              });
+#else
+                       return stdexec::just();
 #endif
-            co_return;
-        case Driver::postgres:
-#if ASYNC_UV_SQL_HAS_LIBPQ
-            if (impl_->pg_ != nullptr) {
-                PGcancel *cancel = PQgetCancel(impl_->pg_);
-                if (cancel != nullptr) {
-                    char errbuf[256] = {0};
-                    if (PQcancel(cancel, errbuf, sizeof(errbuf)) == 0) {
-                        PQfreeCancel(cancel);
-                        throw SqlError(errbuf[0] == '\0' ? "postgres cancel failed" : errbuf,
-                                       SqlErrorKind::query_failed);
-                    }
-                    PQfreeCancel(cancel);
-                }
-            }
+                   case Driver::postgres:
+#if FLUX_SQL_HAS_LIBPQ
+                       return stdexec::just() | stdexec::then([this]() {
+                                  if (impl_->pg_ == nullptr) {
+                                      return;
+                                  }
+                                  PGcancel *cancel = PQgetCancel(impl_->pg_);
+                                  if (cancel == nullptr) {
+                                      return;
+                                  }
+                                  char errbuf[256] = {0};
+                                  if (PQcancel(cancel, errbuf, sizeof(errbuf)) == 0) {
+                                      PQfreeCancel(cancel);
+                                      throw SqlError(
+                                          errbuf[0] == '\0' ? "postgres cancel failed" : errbuf,
+                                          SqlErrorKind::query_failed);
+                                  }
+                                  PQfreeCancel(cancel);
+                              });
+#else
+                       return stdexec::just();
 #endif
-            co_return;
-        case Driver::mysql:
-#if ASYNC_UV_SQL_HAS_MYSQL
-            if (impl_->mysql_ != nullptr) {
-                mysql_close(impl_->mysql_);
-                impl_->mysql_ = nullptr;
-            }
+                   case Driver::mysql:
+#if FLUX_SQL_HAS_MYSQL
+                       if (impl_->busy_.load(std::memory_order_acquire)) {
+                           return stdexec::just();
+                       }
+                       return impl_->close_mysql_safe_sender();
+#else
+                       return stdexec::just();
 #endif
-            co_return;
-    }
-    co_return;
+               }
+               return stdexec::just();
+           });
 }
 
-Task<QueryResult> query(ConnectionOptions options, std::string sql) {
-    co_return co_await query(std::move(options), std::move(sql), {}, QueryOptions{});
+QuerySender detail::query_task(ConnectionOptions options, std::string sql) {
+    return detail::query_task(std::move(options), std::move(sql), {}, QueryOptions{});
 }
 
-Task<QueryResult> query(ConnectionOptions options, std::string sql, std::vector<SqlParam> params) {
-    co_return co_await query(std::move(options), std::move(sql), std::move(params), QueryOptions{});
+QuerySender detail::query_task(ConnectionOptions options,
+                               std::string sql,
+                               std::vector<SqlParam> params) {
+    return detail::query_task(
+        std::move(options), std::move(sql), std::move(params), QueryOptions{});
 }
 
-Task<QueryResult> query(ConnectionOptions options,
-                        std::string sql,
-                        std::vector<SqlParam> params,
-                        QueryOptions query_options) {
-    Connection conn;
-    co_await conn.open(std::move(options));
-
-    std::exception_ptr error;
-    QueryResult result;
-    try {
-        result = co_await conn.query(std::move(sql), std::move(params), std::move(query_options));
-    } catch (...) {
-        error = std::current_exception();
-    }
-
-    try {
-        co_await conn.close();
-    } catch (...) {
-    }
-
-    if (error) {
-        std::rethrow_exception(error);
-    }
-    co_return result;
+QuerySender detail::query_task(ConnectionOptions options,
+                               std::string sql,
+                               std::vector<SqlParam> params,
+                               QueryOptions query_options) {
+    auto conn = std::make_shared<Connection>();
+    return conn->open(std::move(options))
+         | stdexec::let_value([conn,
+                               sql = std::move(sql),
+                               params = std::move(params),
+                               query_options = std::move(query_options)]() mutable -> QuerySender {
+               return conn->query(std::move(sql), std::move(params), std::move(query_options))
+                    | stdexec::let_value([conn](QueryResult result) -> QuerySender {
+                          auto result_holder = std::make_shared<QueryResult>(std::move(result));
+                          return conn->close()
+                               | stdexec::then([result_holder]() mutable {
+                                     return std::move(*result_holder);
+                                 })
+                               | stdexec::upon_error([result_holder](std::exception_ptr) mutable {
+                                     return std::move(*result_holder);
+                                 });
+                      })
+                    | stdexec::let_error([conn](std::exception_ptr error) -> QuerySender {
+                          return conn->close()
+                               | stdexec::then([error]() -> QueryResult {
+                                     std::rethrow_exception(error);
+                                 })
+                               | stdexec::upon_error([error](std::exception_ptr) -> QueryResult {
+                                     std::rethrow_exception(error);
+                                 });
+                      });
+           });
 }
 
 class ConnectionPool::Impl {
 public:
     explicit Impl(ConnectionPoolOptions options) : options_(std::move(options)) {}
 
-    Task<void> init() {
-        if (options_.max_connections == 0) {
-            throw SqlError("connection pool max_connections must be > 0",
-                           SqlErrorKind::invalid_argument);
-        }
+    VoidSender init() {
+        return stdexec::just()
+             | stdexec::then([this]() {
+                   if (options_.max_connections == 0) {
+                       throw SqlError("connection pool max_connections must be > 0",
+                                      SqlErrorKind::invalid_argument);
+                   }
+                   connections_.resize(options_.max_connections);
+                   born_at_.resize(options_.max_connections, std::chrono::steady_clock::now());
+                   available_.clear();
+               })
+             | stdexec::let_value([this]() -> VoidSender {
+                   if (!options_.preconnect) {
+                       for (std::size_t i = 0; i < options_.max_connections; ++i) {
+                           available_.push_back(i);
+                       }
+                       available_signal_.release(
+                           static_cast<std::ptrdiff_t>(options_.max_connections));
+                       return stdexec::just();
+                   }
 
-        connections_.resize(options_.max_connections);
-        born_at_.resize(options_.max_connections, std::chrono::steady_clock::now());
-        if (!options_.preconnect) {
-            for (std::size_t i = 0; i < options_.max_connections; ++i) {
-                available_.push_back(i);
-            }
-            co_return;
-        }
-
-        for (std::size_t i = 0; i < options_.max_connections; ++i) {
-            co_await connections_[i].open(options_.connection);
-            born_at_[i] = std::chrono::steady_clock::now();
-            available_.push_back(i);
-        }
+                   auto loop = std::make_shared<std::function<VoidSender(std::size_t)>>();
+                   *loop = [this, loop](std::size_t index) -> VoidSender {
+                       if (index >= options_.max_connections) {
+                           available_signal_.release(
+                               static_cast<std::ptrdiff_t>(options_.max_connections));
+                           return stdexec::just();
+                       }
+                       return connections_[index].open(options_.connection)
+                            | stdexec::then([this, index]() {
+                                  born_at_[index] = std::chrono::steady_clock::now();
+                                  available_.push_back(index);
+                              })
+                            | stdexec::let_value([loop, index]() {
+                                  return (*loop)(index + 1);
+                              });
+                   };
+                   return (*loop)(0);
+               });
     }
 
-    Task<std::size_t> acquire_index() {
-        const auto started = std::chrono::steady_clock::now();
-        while (true) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (closed_) {
-                    throw SqlError("connection pool is closed", SqlErrorKind::not_connected);
-                }
-                if (!available_.empty()) {
-                    const std::size_t index = available_.front();
-                    available_.pop_front();
-                    co_return index;
-                }
+    IndexSender acquire_index() {
+        auto take_index = [this](bool acquired) -> std::size_t {
+            if (!acquired) {
+                throw SqlError("connection pool is closed", SqlErrorKind::not_connected);
             }
-            if (options_.acquire_timeout_ms > 0) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started);
-                if (elapsed.count() >= options_.acquire_timeout_ms) {
-                    throw SqlError("connection pool acquire timeout", SqlErrorKind::query_failed);
-                }
+
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                throw SqlError("connection pool is closed", SqlErrorKind::not_connected);
             }
-            co_await async_uv::sleep_for(std::chrono::milliseconds(1));
+            if (available_.empty()) {
+                throw SqlError(
+                    "connection pool internal state invalid", SqlErrorKind::internal_error);
+            }
+            const std::size_t index = available_.front();
+            available_.pop_front();
+            return index;
+        };
+
+        if (options_.acquire_timeout_ms > 0) {
+            return current_runtime_sender(
+                       "connection pool acquire requires current runtime")
+                 | stdexec::let_value([this](Runtime *runtime) {
+                       auto wait_optional =
+                           available_signal_.acquire_sender()
+                         | stdexec::then([](bool ok) { return std::optional<bool>(ok); });
+
+                       auto timer = std::make_shared<exec::asio::asio_impl::steady_timer>(
+                           runtime->executor());
+                       timer->expires_after(
+                           std::chrono::milliseconds(std::max(0, options_.acquire_timeout_ms)));
+                       auto timeout_optional =
+                           timer->async_wait(exec::asio::use_sender)
+                         | stdexec::then([timer]() { return std::optional<bool>{}; });
+
+                       return exec::when_any(std::move(wait_optional), std::move(timeout_optional))
+                            | stdexec::then([](std::optional<bool> maybe_acquired) {
+                                  if (!maybe_acquired.has_value()) {
+                                      throw SqlError("connection pool acquire timeout",
+                                                     SqlErrorKind::query_failed);
+                                  }
+                                  return *maybe_acquired;
+                              });
+                   })
+                 | stdexec::then(std::move(take_index));
         }
+
+        return available_signal_.acquire_sender() | stdexec::then(std::move(take_index));
     }
 
-    Task<void> ensure_healthy(std::size_t index) {
-        auto &conn = connections_[index];
-        bool reopen = !(co_await conn.is_open());
+    VoidSender ensure_healthy(std::size_t index) {
+        auto reopen_connection = [this, index]() -> VoidSender {
+            return connections_[index].close()
+                 | stdexec::then([] {})
+                 | stdexec::upon_error([](std::exception_ptr) {})
+                 | stdexec::let_value([this, index]() {
+                       return connections_[index].open(options_.connection)
+                            | stdexec::then([this, index]() {
+                                  born_at_[index] = std::chrono::steady_clock::now();
+                              });
+                   });
+        };
 
-        if (!reopen && options_.max_lifetime_ms > 0) {
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - born_at_[index]);
-            if (age.count() >= options_.max_lifetime_ms) {
-                reopen = true;
-            }
-        }
+        return connections_[index].is_open()
+             | stdexec::let_value([this, index, reopen_connection](bool open) mutable -> VoidSender {
+                   bool reopen = !open;
+                   if (!reopen && options_.max_lifetime_ms > 0) {
+                       const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - born_at_[index]);
+                       if (age.count() >= options_.max_lifetime_ms) {
+                           reopen = true;
+                       }
+                   }
 
-        if (reopen) {
-            try {
-                co_await conn.close();
-            } catch (...) {
-            }
-            co_await conn.open(options_.connection);
-            born_at_[index] = std::chrono::steady_clock::now();
-            co_return;
-        }
+                   if (reopen) {
+                       return reopen_connection();
+                   }
 
-        if (!options_.health_check_sql.empty()) {
-            bool healthy = true;
-            try {
-                (void)co_await conn.query(options_.health_check_sql);
-            } catch (...) {
-                healthy = false;
-            }
-            if (!healthy) {
-                try {
-                    co_await conn.close();
-                } catch (...) {
-                }
-                co_await conn.open(options_.connection);
-                born_at_[index] = std::chrono::steady_clock::now();
-            }
-        }
+                   if (options_.health_check_sql.empty()) {
+                       return stdexec::just();
+                   }
+
+                   return connections_[index].query(options_.health_check_sql)
+                        | stdexec::then([](QueryResult) { return true; })
+                        | stdexec::upon_error([](std::exception_ptr) { return false; })
+                        | stdexec::let_value([reopen_connection](bool healthy) mutable -> VoidSender {
+                              if (healthy) {
+                                  return stdexec::just();
+                              }
+                              return reopen_connection();
+                          });
+               });
     }
 
     void release_index(std::size_t index) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!closed_) {
-            available_.push_back(index);
+        bool should_notify = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!closed_) {
+                available_.push_back(index);
+                should_notify = true;
+            }
+        }
+        if (should_notify) {
+            available_signal_.release(1);
         }
     }
 
@@ -1727,6 +2060,7 @@ public:
     std::vector<Connection> connections_;
     std::vector<std::chrono::steady_clock::time_point> born_at_;
     std::deque<std::size_t> available_;
+    flux::AsyncSemaphore available_signal_{0};
     std::mutex mutex_;
     bool closed_ = false;
 };
@@ -1739,81 +2073,208 @@ ConnectionPool::ConnectionPool(ConnectionPool &&) noexcept = default;
 
 ConnectionPool &ConnectionPool::operator=(ConnectionPool &&) noexcept = default;
 
-Task<ConnectionPool> ConnectionPool::create(ConnectionPoolOptions options) {
-    ConnectionPool pool;
-    pool.impl_ = std::make_shared<Impl>(std::move(options));
-    co_await pool.impl_->init();
-    co_return pool;
+ConnectionPool::CreateSender ConnectionPool::create_task(ConnectionPoolOptions options) {
+    auto impl = std::make_shared<Impl>(std::move(options));
+    auto init_sender = impl->init();
+    return std::move(init_sender) | stdexec::then([impl]() mutable {
+               ConnectionPool pool;
+               pool.impl_ = impl;
+               return pool;
+           });
 }
 
-Task<QueryResult> ConnectionPool::query(std::string sql) {
-    co_return co_await query(std::move(sql), {}, QueryOptions{});
-}
-
-Task<QueryResult> ConnectionPool::query(std::string sql, std::vector<SqlParam> params) {
-    co_return co_await query(std::move(sql), std::move(params), QueryOptions{});
-}
-
-Task<QueryResult>
-ConnectionPool::query(std::string sql, std::vector<SqlParam> params, QueryOptions options) {
+ConnectionPool::PooledConnectionSender ConnectionPool::acquire_task() {
     if (impl_ == nullptr) {
         throw SqlError("connection pool is not initialized", SqlErrorKind::not_connected);
     }
 
-    const std::size_t index = co_await impl_->acquire_index();
-    std::exception_ptr error;
-    QueryResult result;
-    try {
-        co_await impl_->ensure_healthy(index);
-        auto &conn = impl_->connections_[index];
-        result = co_await conn.query(std::move(sql), std::move(params), std::move(options));
-    } catch (...) {
-        error = std::current_exception();
-    }
-
-    impl_->release_index(index);
-    if (error) {
-        std::rethrow_exception(error);
-    }
-    co_return result;
+    auto impl = impl_;
+    return impl->acquire_index()
+         | stdexec::let_value([impl](std::size_t index) -> PooledConnectionSender {
+               return impl->ensure_healthy(index)
+                    | stdexec::then([impl, index]() { return PooledConnection(impl, index); })
+                    | stdexec::upon_error([impl, index](std::exception_ptr error)
+                                              -> ConnectionPool::PooledConnection {
+                          impl->release_index(index);
+                          std::rethrow_exception(error);
+                      });
+           });
 }
 
-Task<QueryResult> ConnectionPool::execute(std::string sql) {
-    co_return co_await execute(std::move(sql), {}, QueryOptions{});
+QuerySender ConnectionPool::query_task(std::string sql) {
+    return query_task(std::move(sql), {}, QueryOptions{});
 }
 
-Task<QueryResult> ConnectionPool::execute(std::string sql, std::vector<SqlParam> params) {
-    co_return co_await execute(std::move(sql), std::move(params), QueryOptions{});
+QuerySender ConnectionPool::query_task(std::string sql, std::vector<SqlParam> params) {
+    return query_task(std::move(sql), std::move(params), QueryOptions{});
 }
 
-Task<QueryResult>
-ConnectionPool::execute(std::string sql, std::vector<SqlParam> params, QueryOptions options) {
-    co_return co_await query(std::move(sql), std::move(params), std::move(options));
+QuerySender ConnectionPool::query_task(std::string sql,
+                                       std::vector<SqlParam> params,
+                                       QueryOptions options) {
+    return acquire_task()
+         | stdexec::let_value([sql = std::move(sql),
+                               params = std::move(params),
+                               options = std::move(options)](auto &&lease) mutable
+                                   -> QuerySender {
+               auto lease_holder =
+                   std::make_shared<PooledConnection>(std::move(lease));
+               return lease_holder->query(std::move(sql), std::move(params), std::move(options))
+                    | stdexec::then([lease_holder](QueryResult result) mutable { return result; })
+                    | stdexec::upon_error(
+                          [lease_holder](std::exception_ptr error) -> QueryResult {
+                              std::rethrow_exception(error);
+                          });
+           });
 }
 
-Task<void> ConnectionPool::close() {
-    if (impl_ == nullptr) {
-        co_return;
+VoidSender ConnectionPool::close_task() {
+    auto impl = impl_;
+    if (impl == nullptr) {
+        return stdexec::just();
     }
 
-    std::vector<std::size_t> indices;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex_);
-        impl_->closed_ = true;
-        indices.resize(impl_->connections_.size());
-        for (std::size_t i = 0; i < indices.size(); ++i) {
-            indices[i] = i;
-        }
-        impl_->available_.clear();
-    }
+    return stdexec::just() | stdexec::let_value([impl]() -> VoidSender {
+               auto indices = std::make_shared<std::vector<std::size_t>>();
+               {
+                   std::lock_guard<std::mutex> lock(impl->mutex_);
+                   impl->closed_ = true;
+                   indices->resize(impl->connections_.size());
+                   for (std::size_t i = 0; i < indices->size(); ++i) {
+                       (*indices)[i] = i;
+                   }
+                   impl->available_.clear();
+               }
+               impl->available_signal_.close();
 
-    for (const auto index : indices) {
-        try {
-            co_await impl_->connections_[index].close();
-        } catch (...) {
-        }
-    }
-    co_return;
+               auto loop = std::make_shared<std::function<VoidSender(std::size_t)>>();
+               *loop = [impl, indices, loop](std::size_t pos) -> VoidSender {
+                   if (pos >= indices->size()) {
+                       return stdexec::just();
+                   }
+                   const std::size_t index = (*indices)[pos];
+                   return impl->connections_[index].close()
+                        | stdexec::then([] {})
+                        | stdexec::upon_error([](std::exception_ptr) {})
+                        | stdexec::let_value([loop, pos]() { return (*loop)(pos + 1); });
+               };
+               return (*loop)(0);
+           });
 }
 
-} // namespace async_uv::sql
+ConnectionPool::PooledConnection::PooledConnection(std::shared_ptr<ConnectionPool::Impl> impl,
+                                                   std::size_t index) noexcept
+    : impl_(std::move(impl)),
+      index_(index),
+      held_(impl_ != nullptr) {}
+
+ConnectionPool::PooledConnection::~PooledConnection() {
+    release();
+}
+
+ConnectionPool::PooledConnection::PooledConnection(PooledConnection &&other) noexcept
+    : impl_(std::move(other.impl_)),
+      index_(other.index_),
+      held_(other.held_) {
+    other.index_ = 0;
+    other.held_ = false;
+}
+
+ConnectionPool::PooledConnection &
+ConnectionPool::PooledConnection::operator=(PooledConnection &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    release();
+    impl_ = std::move(other.impl_);
+    index_ = other.index_;
+    held_ = other.held_;
+    other.index_ = 0;
+    other.held_ = false;
+    return *this;
+}
+
+bool ConnectionPool::PooledConnection::valid() const noexcept {
+    return held_ && impl_ != nullptr;
+}
+
+void ConnectionPool::PooledConnection::release() noexcept {
+    if (!held_ || impl_ == nullptr) {
+        return;
+    }
+    impl_->release_index(index_);
+    held_ = false;
+}
+
+QuerySender ConnectionPool::PooledConnection::query_task(std::string sql) {
+    return query_task(std::move(sql), {}, QueryOptions{});
+}
+
+QuerySender ConnectionPool::PooledConnection::query_task(std::string sql,
+                                                         std::vector<SqlParam> params) {
+    return query_task(std::move(sql), std::move(params), QueryOptions{});
+}
+
+QuerySender ConnectionPool::PooledConnection::query_task(std::string sql, QueryOptions options) {
+    return query_task(std::move(sql), {}, std::move(options));
+}
+
+QuerySender ConnectionPool::PooledConnection::query_task(std::string sql,
+                                                         std::vector<SqlParam> params,
+                                                         QueryOptions options) {
+    if (!valid()) {
+        throw SqlError("pooled connection is not valid", SqlErrorKind::not_connected);
+    }
+
+    auto impl = impl_;
+    const auto index = index_;
+    return impl->connections_[index].query(std::move(sql), std::move(params), std::move(options))
+         | stdexec::then([impl](QueryResult result) { return result; })
+         | stdexec::upon_error([impl](std::exception_ptr error) -> QueryResult {
+               std::rethrow_exception(error);
+           });
+}
+
+VoidSender ConnectionPool::PooledConnection::begin_task() {
+    if (!valid()) {
+        throw SqlError("pooled connection is not valid", SqlErrorKind::not_connected);
+    }
+
+    auto impl = impl_;
+    const auto index = index_;
+    return impl->connections_[index].begin()
+         | stdexec::then([impl] {})
+         | stdexec::upon_error([impl](std::exception_ptr error) -> void {
+               std::rethrow_exception(error);
+           });
+}
+
+VoidSender ConnectionPool::PooledConnection::commit_task() {
+    if (!valid()) {
+        throw SqlError("pooled connection is not valid", SqlErrorKind::not_connected);
+    }
+
+    auto impl = impl_;
+    const auto index = index_;
+    return impl->connections_[index].commit()
+         | stdexec::then([impl] {})
+         | stdexec::upon_error([impl](std::exception_ptr error) -> void {
+               std::rethrow_exception(error);
+           });
+}
+
+VoidSender ConnectionPool::PooledConnection::rollback_task() {
+    if (!valid()) {
+        throw SqlError("pooled connection is not valid", SqlErrorKind::not_connected);
+    }
+
+    auto impl = impl_;
+    const auto index = index_;
+    return impl->connections_[index].rollback()
+         | stdexec::then([impl] {})
+         | stdexec::upon_error([impl](std::exception_ptr error) -> void {
+               std::rethrow_exception(error);
+           });
+}
+
+} // namespace flux::sql

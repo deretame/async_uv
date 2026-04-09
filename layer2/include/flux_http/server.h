@@ -11,13 +11,19 @@
 #include <utility>
 #include <vector>
 
-#include "async_uv/task.h"
-#include "async_uv/tcp.h"
-#include "async_uv/tls.h"
-#include "async_uv_http/http.h"
-#include "async_uv_http/parser.h"
+#include "flux/task.h"
+#include "flux/tcp.h"
+#include "flux_http/http.h"
+#include "flux_http/parser.h"
 
-namespace async_uv::http {
+namespace flux {
+class TlsBio {
+public:
+    virtual ~TlsBio() = default;
+};
+}
+
+namespace flux::http {
 
 struct RequestTarget {
     std::string path;
@@ -205,4 +211,4 @@ std::string serialize_response(const ServerResponse &response);
 std::string serialize_chunk(std::string_view chunk);
 std::string serialize_chunk_end();
 
-} // namespace async_uv::http
+} // namespace flux::http

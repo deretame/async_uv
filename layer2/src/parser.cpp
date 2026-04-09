@@ -1,27 +1,32 @@
-#include "async_uv_http/parser.h"
+#include "flux_http/parser.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <sstream>
 #include <system_error>
 #include <thread>
 #include <utility>
 
-#include <llhttp.h>
+#include <boost/asio/buffer.hpp>
+#include <boost/beast/http.hpp>
 
-#include "async_uv/fs.h"
-#include "async_uv/runtime.h"
+#include "flux/fs.h"
+#include "flux/runtime.h"
 
-namespace async_uv::http {
+namespace flux::http {
 namespace {
+
+namespace beast_http = boost::beast::http;
+namespace beast_net = boost::asio;
 
 Task<void> cleanup_file_task(std::string path_str) {
     try {
-        if (co_await async_uv::Fs::exists(path_str)) {
-            co_await async_uv::Fs::remove(path_str);
+        if (co_await flux::Fs::exists(path_str)) {
+            co_await flux::Fs::remove(path_str);
         }
     } catch (...) {
     }
@@ -29,7 +34,7 @@ Task<void> cleanup_file_task(std::string path_str) {
 }
 
 void fire_and_forget_cleanup(const std::filesystem::path &path) {
-    if (auto *runtime = async_uv::Runtime::current(); runtime != nullptr) {
+    if (auto *runtime = flux::Runtime::current(); runtime != nullptr) {
         (void)runtime->spawn(cleanup_file_task(path.string()));
         return;
     }
@@ -47,30 +52,29 @@ std::string to_upper(std::string value) {
     return value;
 }
 
-bool exceeds_limit(std::size_t limit, std::size_t value) {
-    return limit > 0 && value > limit;
+std::string to_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
 }
 
-ParseErrorKind classify_llhttp_error(llhttp_errno_t code, const char *reason) {
-    if (code != HPE_USER) {
-        return ParseErrorKind::protocol;
+std::string trim_copy(std::string_view value) {
+    std::size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
     }
 
-    if (reason == nullptr) {
-        return ParseErrorKind::unknown;
+    std::size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
     }
 
-    const std::string text(reason);
-    if (text.find("max_header_count") != std::string::npos) {
-        return ParseErrorKind::header_count_exceeded;
-    }
-    if (text.find("max_header_line_size") != std::string::npos) {
-        return ParseErrorKind::header_line_too_long;
-    }
-    if (text.find("max_start_line_size") != std::string::npos) {
-        return ParseErrorKind::start_line_too_long;
-    }
-    return ParseErrorKind::unknown;
+    return std::string(value.substr(begin, end - begin));
+}
+
+bool exceeds_limit(std::size_t limit, std::size_t value) {
+    return limit > 0 && value > limit;
 }
 
 } // namespace
@@ -148,22 +152,22 @@ Task<bool> HttpMessage::move_body_file_to(const std::filesystem::path &target, b
 
     try {
         if (target.has_parent_path()) {
-            co_await async_uv::Fs::create_directories(target.parent_path().string());
+            co_await flux::Fs::create_directories(target.parent_path().string());
         }
 
         const std::string target_path = target.string();
-        if (co_await async_uv::Fs::exists(target_path)) {
+        if (co_await flux::Fs::exists(target_path)) {
             if (!overwrite) {
                 co_return false;
             }
-            co_await async_uv::Fs::remove(target_path);
+            co_await flux::Fs::remove(target_path);
         }
 
         if (!body_file_path_.has_value()) {
             co_return false;
         }
 
-        co_await async_uv::Fs::rename(body_file_path_->string(), target_path);
+        co_await flux::Fs::rename(body_file_path_->string(), target_path);
         body_file_state_->set_path(target);
         body_file_state_->disable_cleanup();
         body_file_path_ = target;
@@ -180,8 +184,8 @@ Task<bool> HttpMessage::dispose_body_file() {
 
     try {
         const std::string path = body_file_path_->string();
-        if (co_await async_uv::Fs::exists(path)) {
-            co_await async_uv::Fs::remove(path);
+        if (co_await flux::Fs::exists(path)) {
+            co_await flux::Fs::remove(path);
         }
         body_file_state_->disable_cleanup();
         body_file_path_.reset();
@@ -194,70 +198,35 @@ Task<bool> HttpMessage::dispose_body_file() {
 
 class HttpParser::Impl {
 public:
-    explicit Impl(ParseMode mode, ParserOptions options) : options_(std::move(options)) {
-        llhttp_settings_init(&settings_);
-        settings_.on_message_begin = &Impl::on_message_begin_cb;
-        settings_.on_url = &Impl::on_url_cb;
-        settings_.on_status = &Impl::on_status_cb;
-        settings_.on_header_field = &Impl::on_header_field_cb;
-        settings_.on_header_value = &Impl::on_header_value_cb;
-        settings_.on_headers_complete = &Impl::on_headers_complete_cb;
-        settings_.on_body = &Impl::on_body_cb;
-        settings_.on_message_complete = &Impl::on_message_complete_cb;
-
-        llhttp_type_t type = HTTP_RESPONSE;
-        if (mode == ParseMode::request) {
-            type = HTTP_REQUEST;
-        } else if (mode == ParseMode::both) {
-            type = HTTP_BOTH;
-        }
-
-        llhttp_init(&parser_, type, &settings_);
-        parser_.data = this;
-    }
+    explicit Impl(ParseMode mode, ParserOptions options)
+        : mode_(mode), options_(std::move(options)) {}
 
     Task<void> feed(std::string_view chunk) {
-        auto *runtime = co_await async_uv::get_current_runtime();
+        Runtime *runtime = nullptr;
+        try {
+            runtime = co_await flux::get_current_runtime();
+        } catch (...) {
+            throw ParseError("http parser feed requires current runtime",
+                             -10,
+                             ParseErrorKind::runtime_missing);
+        }
         if (runtime == nullptr) {
             throw ParseError(
                 "http parser feed requires current runtime", -10, ParseErrorKind::runtime_missing);
         }
 
         co_await ensure_temp_dir_ready();
-        last_error_kind_ = ParseErrorKind::unknown;
+        pending_.append(chunk.data(), chunk.size());
 
-        const std::size_t configured_chunk =
-            options_.max_feed_chunk_size == 0 ? chunk.size() : options_.max_feed_chunk_size;
-        const std::size_t step = std::max<std::size_t>(1, configured_chunk);
-        const std::size_t yield_every = std::max<std::size_t>(1, options_.yield_every_chunks);
-
-        std::size_t offset = 0;
-        std::size_t chunks_since_yield = 0;
-        while (offset < chunk.size()) {
-            const std::size_t len = std::min(step, chunk.size() - offset);
-            const llhttp_errno_t rc = llhttp_execute(&parser_, chunk.data() + offset, len);
-            if (rc != HPE_OK) {
-                std::ostringstream oss;
-                oss << "llhttp parse failed: " << llhttp_errno_name(rc);
-                const char *reason = llhttp_get_error_reason(&parser_);
-                if (reason != nullptr) {
-                    oss << " (" << reason << ")";
-                }
-                const ParseErrorKind kind = last_error_kind_ != ParseErrorKind::unknown
-                                                ? last_error_kind_
-                                                : classify_llhttp_error(rc, reason);
-                throw ParseError(oss.str(), static_cast<int>(rc), kind);
+        while (true) {
+            auto parsed = co_await try_parse_message();
+            if (!parsed.has_value()) {
+                break;
             }
-
-            offset += len;
-            ++chunks_since_yield;
-            if (chunks_since_yield >= yield_every && offset < chunk.size()) {
-                chunks_since_yield = 0;
-                co_await async_uv::sleep_for(std::chrono::milliseconds(0));
-            }
+            ready_.push_back(std::move(*parsed));
         }
 
-        co_await flush_pending_file_writes();
+        co_return;
     }
 
     bool has_message() const noexcept {
@@ -275,214 +244,255 @@ public:
 
     void reset() {
         ready_.clear();
-        pending_file_writes_.clear();
-        current_file_chunks_.clear();
-        current_ = HttpMessage{};
-        field_buffer_.clear();
-        value_buffer_.clear();
-        header_state_ = HeaderState::none;
-        header_count_ = 0;
-        headers_complete_ = false;
-        parsing_trailers_ = false;
-        llhttp_reset(&parser_);
-        parser_.data = this;
+        pending_.clear();
+        temp_dir_ready_ = false;
+        resolved_temp_dir_ = ".";
     }
 
 private:
-    struct PendingFileWrite {
-        std::filesystem::path path;
-        std::vector<std::string> chunks;
-    };
-
-    enum class HeaderState {
-        none,
-        field,
-        value,
-    };
-
-    static Impl &self(llhttp_t *parser) {
-        return *static_cast<Impl *>(parser->data);
+    ParseError protocol_error(std::string message,
+                              ParseErrorKind kind = ParseErrorKind::protocol,
+                              int code = -1) const {
+        return ParseError(std::move(message), code, kind);
     }
 
-    static int on_message_begin_cb(llhttp_t *parser) {
-        auto &s = self(parser);
-        s.current_ = HttpMessage{};
-        s.field_buffer_.clear();
-        s.value_buffer_.clear();
-        s.current_file_chunks_.clear();
-        s.header_state_ = HeaderState::none;
-        s.header_count_ = 0;
-        s.headers_complete_ = false;
-        s.parsing_trailers_ = false;
-        return 0;
-    }
-
-    static int on_url_cb(llhttp_t *parser, const char *at, size_t length) {
-        auto &s = self(parser);
-        s.current_.url_.append(at, length);
-        if (exceeds_limit(s.options_.max_start_line_size, s.current_.url_.size())) {
-            return s.fail(parser,
-                          "url exceeds parser max_start_line_size",
-                          ParseErrorKind::start_line_too_long);
+    std::pair<std::string, std::string> parse_header_line(std::string_view line,
+                                                          ParseErrorKind kind) const {
+        if (exceeds_limit(options_.max_header_line_size, line.size())) {
+            throw protocol_error("header line exceeds parser max_header_line_size",
+                                 kind);
         }
-        return 0;
-    }
 
-    static int on_status_cb(llhttp_t *parser, const char *at, size_t length) {
-        auto &s = self(parser);
-        s.current_.reason_.append(at, length);
-        if (exceeds_limit(s.options_.max_start_line_size, s.current_.reason_.size())) {
-            return s.fail(parser,
-                          "status reason exceeds parser max_start_line_size",
-                          ParseErrorKind::start_line_too_long);
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos || colon == 0) {
+            throw protocol_error("invalid header line");
         }
-        return 0;
+
+        auto name = trim_copy(line.substr(0, colon));
+        auto value = trim_copy(line.substr(colon + 1));
+        if (name.empty()) {
+            throw protocol_error("invalid header name");
+        }
+        return {std::move(name), std::move(value)};
     }
 
-    static int on_header_field_cb(llhttp_t *parser, const char *at, size_t length) {
-        auto &s = self(parser);
-        if (s.header_state_ == HeaderState::value) {
-            const int rc = s.flush_header(parser);
-            if (rc != 0) {
-                return rc;
+    void validate_start_line(std::string_view line, bool is_response) const {
+        if (exceeds_limit(options_.max_start_line_size, line.size())) {
+            throw protocol_error("start line exceeds parser max_start_line_size",
+                                 ParseErrorKind::start_line_too_long);
+        }
+
+        if (mode_ == ParseMode::request && is_response) {
+            throw protocol_error("response message is not allowed in request mode");
+        }
+        if (mode_ == ParseMode::response && !is_response) {
+            throw protocol_error("request message is not allowed in response mode");
+        }
+    }
+
+    std::vector<Header> parse_initial_headers(std::string_view block,
+                                              std::size_t &header_count) const {
+        std::vector<Header> output;
+        std::size_t begin = 0;
+        while (begin < block.size()) {
+            const auto end = block.find("\r\n", begin);
+            const auto line = end == std::string_view::npos
+                                  ? block.substr(begin)
+                                  : block.substr(begin, end - begin);
+            if (!line.empty()) {
+                if (exceeds_limit(options_.max_header_count, header_count + 1)) {
+                    throw protocol_error("header count exceeds parser max_header_count",
+                                         ParseErrorKind::header_count_exceeded);
+                }
+
+                auto [name, value] = parse_header_line(line, ParseErrorKind::header_line_too_long);
+                output.push_back(Header{name, value});
+                ++header_count;
+            }
+
+            if (end == std::string_view::npos) {
+                break;
+            }
+            begin = end + 2;
+        }
+        return output;
+    }
+
+    bool headers_indicate_chunked(const std::vector<Header> &headers) const {
+        for (const auto &header : headers) {
+            if (to_lower(header.name) != "transfer-encoding") {
+                continue;
+            }
+            if (to_lower(header.value).find("chunked") != std::string::npos) {
+                return true;
             }
         }
-        s.parsing_trailers_ = s.headers_complete_;
-        s.header_state_ = HeaderState::field;
-        s.field_buffer_.append(at, length);
-        const std::size_t line_size = s.field_buffer_.size() + s.value_buffer_.size() + 2;
-        if (exceeds_limit(s.options_.max_header_line_size, line_size)) {
-            return s.fail(parser,
-                          "header line exceeds parser max_header_line_size",
-                          ParseErrorKind::header_line_too_long);
-        }
-        return 0;
+        return false;
     }
 
-    static int on_header_value_cb(llhttp_t *parser, const char *at, size_t length) {
-        auto &s = self(parser);
-        s.parsing_trailers_ = s.headers_complete_;
-        s.header_state_ = HeaderState::value;
-        s.value_buffer_.append(at, length);
-        const std::size_t line_size = s.field_buffer_.size() + s.value_buffer_.size() + 2;
-        if (exceeds_limit(s.options_.max_header_line_size, line_size)) {
-            return s.fail(parser,
-                          "header line exceeds parser max_header_line_size",
-                          ParseErrorKind::header_line_too_long);
-        }
-        return 0;
-    }
+    void parse_chunked_trailers(std::string_view raw_message,
+                                std::size_t body_offset,
+                                std::size_t &header_count,
+                                std::vector<Header> &trailers) const {
+        std::size_t pos = body_offset;
+        while (true) {
+            const auto line_end = raw_message.find("\r\n", pos);
+            if (line_end == std::string_view::npos) {
+                throw protocol_error("invalid chunk size line");
+            }
 
-    static int on_headers_complete_cb(llhttp_t *parser) {
-        auto &s = self(parser);
-        const int flush_rc = s.flush_header(parser);
-        if (flush_rc != 0) {
-            return flush_rc;
-        }
+            const auto size_line = raw_message.substr(pos, line_end - pos);
+            if (exceeds_limit(options_.max_header_line_size, size_line.size())) {
+                throw protocol_error("header line exceeds parser max_header_line_size",
+                                     ParseErrorKind::header_line_too_long);
+            }
 
-        if (!s.headers_complete_) {
-            s.current_.http_major_ = parser->http_major;
-            s.current_.http_minor_ = parser->http_minor;
-            s.current_.status_code_ = parser->status_code;
+            const auto semicolon = size_line.find(';');
+            const auto hex_text = trim_copy(size_line.substr(0, semicolon));
+            if (hex_text.empty()) {
+                throw protocol_error("invalid chunk size line");
+            }
 
-            const llhttp_type_t type = static_cast<llhttp_type_t>(llhttp_get_type(parser));
-            if (type == HTTP_REQUEST) {
-                s.current_.is_request_ = true;
-                if (const char *name =
-                        llhttp_method_name(static_cast<llhttp_method_t>(parser->method));
-                    name != nullptr) {
-                    s.current_.method_ = name;
+            std::size_t chunk_size = 0;
+            try {
+                chunk_size = static_cast<std::size_t>(std::stoull(hex_text, nullptr, 16));
+            } catch (...) {
+                throw protocol_error("invalid chunk size");
+            }
+
+            pos = line_end + 2;
+            if (chunk_size == 0) {
+                while (true) {
+                    const auto trailer_end = raw_message.find("\r\n", pos);
+                    if (trailer_end == std::string_view::npos) {
+                        throw protocol_error("invalid trailer line");
+                    }
+                    if (trailer_end == pos) {
+                        return;
+                    }
+                    if (exceeds_limit(options_.max_header_count, header_count + 1)) {
+                        throw protocol_error("header count exceeds parser max_header_count",
+                                             ParseErrorKind::header_count_exceeded);
+                    }
+                    auto [name, value] = parse_header_line(
+                        raw_message.substr(pos, trailer_end - pos),
+                        ParseErrorKind::header_line_too_long);
+                    trailers.push_back(Header{std::move(name), std::move(value)});
+                    ++header_count;
+                    pos = trailer_end + 2;
                 }
             }
 
-            if (exceeds_limit(s.options_.max_start_line_size, s.current_start_line_size())) {
-                return s.fail(parser,
-                              "start line exceeds parser max_start_line_size",
-                              ParseErrorKind::start_line_too_long);
+            if (raw_message.size() < pos + chunk_size + 2) {
+                throw protocol_error("incomplete chunk data");
             }
+            pos += chunk_size;
+            if (raw_message.substr(pos, 2) != "\r\n") {
+                throw protocol_error("invalid chunk delimiter");
+            }
+            pos += 2;
+        }
+    }
 
-            s.headers_complete_ = true;
+    Task<void> attach_body(HttpMessage &message, std::string body) {
+        message.body_size_ = static_cast<std::uintmax_t>(body.size());
+        if (!exceeds_limit(options_.max_body_in_memory, body.size())) {
+            message.body_ = std::move(body);
+            co_return;
+        }
+
+        const auto path = create_temp_file_path();
+        if (path.has_parent_path()) {
+            co_await flux::Fs::create_directories(path.parent_path().string());
+        }
+
+        co_await flux::Fs::write_file(path, body);
+        message.body_.clear();
+        message.body_file_state_ = std::make_shared<HttpMessage::BodyFileState>(path);
+        message.body_file_path_ = path;
+    }
+
+    template <bool IsRequest>
+    Task<std::optional<HttpMessage>>
+    parse_with_beast(std::size_t header_count,
+                     std::vector<Header> initial_headers,
+                     std::size_t body_offset) {
+        boost::system::error_code ec;
+        beast_http::parser<IsRequest, beast_http::string_body> parser;
+        parser.eager(true);
+        parser.body_limit(std::numeric_limits<std::uint64_t>::max());
+
+        const auto consumed = parser.put(beast_net::buffer(pending_.data(), pending_.size()), ec);
+        if (ec == beast_http::error::need_more || !parser.is_done()) {
+            co_return std::nullopt;
+        }
+
+        if (ec) {
+            throw protocol_error("invalid HTTP message", ParseErrorKind::protocol, ec.value());
+        }
+
+        auto message = parser.release();
+        HttpMessage out;
+        out.is_request_ = IsRequest;
+        out.http_major_ = message.version() / 10;
+        out.http_minor_ = message.version() % 10;
+
+        if constexpr (IsRequest) {
+            out.method_ = std::string(message.method_string());
+            out.url_ = std::string(message.target());
+            out.status_code_ = 0;
+            out.reason_.clear();
         } else {
-            s.parsing_trailers_ = false;
+            out.status_code_ = static_cast<int>(message.result_int());
+            out.reason_ = std::string(message.reason());
         }
-        return 0;
+
+        const bool chunked = headers_indicate_chunked(initial_headers);
+        out.headers_ = std::move(initial_headers);
+        if (chunked) {
+            parse_chunked_trailers(std::string_view(pending_.data(), consumed),
+                                   body_offset,
+                                   header_count,
+                                   out.trailers_);
+        }
+
+        co_await attach_body(out, std::move(message.body()));
+        pending_.erase(0, consumed);
+        co_return std::optional<HttpMessage>(std::move(out));
     }
 
-    static int on_body_cb(llhttp_t *parser, const char *at, size_t length) {
-        auto &s = self(parser);
-        s.append_body(at, length);
-        return 0;
-    }
-
-    static int on_message_complete_cb(llhttp_t *parser) {
-        auto &s = self(parser);
-        const int flush_rc = s.flush_header(parser);
-        if (flush_rc != 0) {
-            return flush_rc;
-        }
-        if (s.current_.body_file_path_.has_value()) {
-            PendingFileWrite write;
-            write.path = *s.current_.body_file_path_;
-            write.chunks = std::move(s.current_file_chunks_);
-            s.pending_file_writes_.push_back(std::move(write));
-            s.current_file_chunks_.clear();
-        }
-        s.ready_.push_back(std::move(s.current_));
-        s.current_ = HttpMessage{};
-        return 0;
-    }
-
-    int flush_header(llhttp_t *parser) {
-        if (field_buffer_.empty()) {
-            return 0;
+    Task<std::optional<HttpMessage>> try_parse_message() {
+        const auto header_end = pending_.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            if (mode_ == ParseMode::response && pending_.size() >= 5 &&
+                pending_.compare(0, 5, "HTTP/") != 0) {
+                throw protocol_error("invalid response start line");
+            }
+            co_return std::nullopt;
         }
 
-        if (exceeds_limit(options_.max_header_count, header_count_ + 1)) {
-            return fail(parser,
-                        "header count exceeds parser max_header_count",
-                        ParseErrorKind::header_count_exceeded);
+        const auto head = std::string_view(pending_.data(), header_end);
+        const auto first_line_end = head.find("\r\n");
+        const auto start_line = first_line_end == std::string_view::npos
+                                    ? head
+                                    : head.substr(0, first_line_end);
+        const bool is_response = start_line.starts_with("HTTP/");
+        validate_start_line(start_line, is_response);
+
+        std::vector<Header> initial_headers;
+        std::size_t header_count = 0;
+        if (first_line_end != std::string_view::npos) {
+            const auto header_block = head.substr(first_line_end + 2);
+            initial_headers = parse_initial_headers(header_block, header_count);
         }
 
-        const std::size_t line_size = field_buffer_.size() + value_buffer_.size() + 2;
-        if (exceeds_limit(options_.max_header_line_size, line_size)) {
-            return fail(parser,
-                        "header line exceeds parser max_header_line_size",
-                        ParseErrorKind::header_line_too_long);
+        const std::size_t body_offset = header_end + 4;
+        if (is_response) {
+            co_return co_await parse_with_beast<false>(
+                header_count, std::move(initial_headers), body_offset);
         }
-
-        if (parsing_trailers_) {
-            current_.trailers_.push_back(
-                Header{std::move(field_buffer_), std::move(value_buffer_)});
-        } else {
-            current_.headers_.push_back(Header{std::move(field_buffer_), std::move(value_buffer_)});
-        }
-        ++header_count_;
-        field_buffer_.clear();
-        value_buffer_.clear();
-        header_state_ = HeaderState::none;
-        return 0;
-    }
-
-    int fail(llhttp_t *parser, const char *reason, ParseErrorKind kind) {
-        last_error_kind_ = kind;
-        llhttp_set_error_reason(parser, reason);
-        return -1;
-    }
-
-    std::size_t current_start_line_size() const {
-        const std::string version = "HTTP/" + std::to_string(current_.http_major_) + "." +
-                                    std::to_string(current_.http_minor_);
-        if (current_.is_request_) {
-            const std::size_t method_len = current_.method_.empty() ? 0 : current_.method_.size();
-            return method_len + 1 + current_.url_.size() + 1 + version.size();
-        }
-
-        const std::string status = std::to_string(current_.status_code_);
-        std::size_t size = version.size() + 1 + status.size();
-        if (!current_.reason_.empty()) {
-            size += 1 + current_.reason_.size();
-        }
-        return size;
+        co_return co_await parse_with_beast<true>(
+            header_count, std::move(initial_headers), body_offset);
     }
 
     Task<void> ensure_temp_dir_ready() {
@@ -498,7 +508,7 @@ private:
 
         bool ready = false;
         try {
-            resolved_temp_dir_ = std::filesystem::path(co_await async_uv::Fs::temp_directory());
+            resolved_temp_dir_ = std::filesystem::path(co_await flux::Fs::temp_directory());
             ready = true;
         } catch (...) {
         }
@@ -506,7 +516,7 @@ private:
         if (!ready) {
             try {
                 resolved_temp_dir_ =
-                    std::filesystem::path(co_await async_uv::Fs::current_directory());
+                    std::filesystem::path(co_await flux::Fs::current_directory());
                 ready = true;
             } catch (...) {
             }
@@ -519,82 +529,19 @@ private:
         temp_dir_ready_ = true;
     }
 
-    std::filesystem::path create_temp_file_path() {
+    std::filesystem::path create_temp_file_path() const {
         static std::atomic_uint64_t seq{0};
         const auto id = seq.fetch_add(1, std::memory_order_relaxed);
-        const auto &dir = resolved_temp_dir_;
-        const auto file_name = "async_uv_http_parser_" + std::to_string(id) + ".tmp";
-        return std::filesystem::path(async_uv::path::join(dir.string(), file_name));
+        const auto file_name = "flux_http_parser_" + std::to_string(id) + ".tmp";
+        return std::filesystem::path(flux::path::join(resolved_temp_dir_.string(), file_name));
     }
 
-    void ensure_body_file() {
-        if (current_.body_file_path_.has_value()) {
-            return;
-        }
-        const auto path = create_temp_file_path();
-        current_.body_file_state_ = std::make_shared<HttpMessage::BodyFileState>(path);
-        current_.body_file_path_ = path;
-    }
-
-    void append_body(const char *at, size_t length) {
-        const std::uintmax_t next_size = current_.body_size_ + static_cast<std::uintmax_t>(length);
-
-        if (!current_.body_file_path_.has_value() &&
-            next_size > static_cast<std::uintmax_t>(options_.max_body_in_memory)) {
-            ensure_body_file();
-            if (!current_.body_.empty()) {
-                current_file_chunks_.push_back(std::move(current_.body_));
-                current_.body_.clear();
-            }
-        }
-
-        if (current_.body_file_path_.has_value()) {
-            current_file_chunks_.emplace_back(at, length);
-        } else {
-            current_.body_.append(at, length);
-        }
-
-        current_.body_size_ = next_size;
-    }
-
-    Task<void> flush_pending_file_writes() {
-        while (!pending_file_writes_.empty()) {
-            auto pending = std::move(pending_file_writes_.front());
-            pending_file_writes_.pop_front();
-
-            if (pending.path.has_parent_path()) {
-                co_await async_uv::Fs::create_directories(pending.path.parent_path().string());
-            }
-            const auto path = pending.path.string();
-            auto file = co_await async_uv::File::open(path,
-                                                      async_uv::OpenFlags::create |
-                                                          async_uv::OpenFlags::write_only |
-                                                          async_uv::OpenFlags::append,
-                                                      0644);
-
-            for (const auto &chunk : pending.chunks) {
-                co_await file.write_all(chunk);
-            }
-            co_await file.close();
-        }
-    }
-
-    llhttp_t parser_{};
-    llhttp_settings_t settings_{};
+    ParseMode mode_ = ParseMode::response;
     ParserOptions options_{};
     std::deque<HttpMessage> ready_;
-    std::deque<PendingFileWrite> pending_file_writes_;
-    std::vector<std::string> current_file_chunks_;
-    HttpMessage current_;
-    std::string field_buffer_;
-    std::string value_buffer_;
-    HeaderState header_state_ = HeaderState::none;
-    std::size_t header_count_ = 0;
-    bool headers_complete_ = false;
-    bool parsing_trailers_ = false;
+    std::string pending_;
     std::filesystem::path resolved_temp_dir_ = ".";
     bool temp_dir_ready_ = false;
-    ParseErrorKind last_error_kind_ = ParseErrorKind::unknown;
 };
 
 HttpParser::HttpParser(ParseMode mode, ParserOptions options)
@@ -640,4 +587,4 @@ Task<std::vector<HttpMessage>> parse_all_messages(std::string_view raw, ParseMod
     co_return out;
 }
 
-} // namespace async_uv::http
+} // namespace flux::http

@@ -1,15 +1,30 @@
 #include "flux/runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <thread>
 
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
+
 namespace flux {
+
+struct Runtime::BoostIoState {
+    explicit BoostIoState(std::size_t thread_count)
+        : io_context(static_cast<int>(thread_count)),
+          work_guard(boost::asio::make_work_guard(io_context)) {}
+
+    boost::asio::io_context io_context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_guard;
+    std::vector<std::thread> workers;
+};
 
 namespace {
 
 std::mutex g_trace_hook_mutex;
 TraceHook g_trace_hook;
+std::atomic<Runtime *> g_current_runtime{nullptr};
 
 std::size_t fallback_threads() {
     const auto hc = std::thread::hardware_concurrency();
@@ -79,10 +94,26 @@ void emit_trace_event(TraceEvent event) noexcept {
 Runtime::Runtime(RuntimeOptions options)
     : options_(std::move(options)),
       io_pool_(static_cast<std::uint32_t>(resolve_io_threads(options_))),
-      blocking_pool_(static_cast<std::uint32_t>(resolve_blocking_threads(options_))) {}
+      blocking_pool_(static_cast<std::uint32_t>(resolve_blocking_threads(options_))),
+      boost_io_state_(std::make_unique<BoostIoState>(resolve_io_threads(options_))) {
+    boost_io_state_->workers.reserve(resolve_io_threads(options_));
+    for (std::size_t i = 0; i < resolve_io_threads(options_); ++i) {
+        boost_io_state_->workers.emplace_back([state = boost_io_state_.get()] {
+            state->io_context.run();
+        });
+    }
+    g_current_runtime.store(this, std::memory_order_release);
+}
+
+Runtime *Runtime::current() noexcept {
+    return g_current_runtime.load(std::memory_order_acquire);
+}
 
 Runtime::~Runtime() noexcept {
     shutdown();
+    Runtime *expected = this;
+    (void)g_current_runtime.compare_exchange_strong(
+        expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void Runtime::shutdown() noexcept {
@@ -97,6 +128,24 @@ void Runtime::shutdown() noexcept {
         auto drained = stdexec::sync_wait(spawn_scope_.on_empty());
         (void)drained;
     } catch (...) {
+    }
+
+    if (boost_io_state_) {
+        try {
+            boost_io_state_->work_guard.reset();
+            boost_io_state_->io_context.stop();
+        } catch (...) {
+        }
+        for (auto &worker : boost_io_state_->workers) {
+            if (!worker.joinable()) {
+                continue;
+            }
+            if (worker.get_id() == std::this_thread::get_id()) {
+                worker.detach();
+            } else {
+                worker.join();
+            }
+        }
     }
 
     stop_and_join_io_pool(io_pool_);
@@ -121,6 +170,14 @@ exec::asio::asio_impl::any_io_executor Runtime::blocking_executor() noexcept {
 
 exec::asio::asio_impl::any_io_executor Runtime::blocking_executor() const noexcept {
     return const_cast<exec::asio::asio_thread_pool &>(blocking_pool_).get_executor();
+}
+
+boost::asio::io_context &Runtime::io_context() noexcept {
+    return boost_io_state_->io_context;
+}
+
+const boost::asio::io_context &Runtime::io_context() const noexcept {
+    return boost_io_state_->io_context;
 }
 
 execution::AnyScheduler Runtime::io_scheduler() {
@@ -198,7 +255,7 @@ void Runtime::reset_gpu_scheduler() {
 
 void Runtime::register_scheduler(std::string name, execution::AnyScheduler scheduler) {
     std::lock_guard<std::mutex> lock(scheduler_mutex_);
-    named_schedulers_[std::move(name)] = std::move(scheduler);
+    named_schedulers_.insert_or_assign(std::move(name), std::move(scheduler));
 }
 
 void Runtime::unregister_scheduler(std::string_view name) {

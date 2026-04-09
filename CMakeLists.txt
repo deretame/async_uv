@@ -23,13 +23,15 @@ option(FLUX_ENABLE_LAYER3 "Build layer3 components (requires layer2)" OFF)
 if(FLUX_ENABLE_LAYER3)
     set(FLUX_ENABLE_LAYER2 ON CACHE BOOL "Build layer2 HTTP wrapper on top of flux" FORCE)
 endif()
-
-if(FLUX_ENABLE_LAYER2 OR FLUX_ENABLE_LAYER3)
-    message(FATAL_ERROR
-        "layer2/layer3 are intentionally disabled during the layer1 stdexec+asio rewrite")
+if(FLUX_ENABLE_LAYER3)
+    message(FATAL_ERROR "layer3 migration to flux is not implemented yet")
 endif()
 
 add_subdirectory(src)
+
+if(FLUX_ENABLE_LAYER2)
+    add_subdirectory(layer2)
+endif()
 
 if(FLUX_BUILD_EXAMPLES)
     message(FATAL_ERROR "examples are disabled during the layer1 stdexec+asio rewrite")

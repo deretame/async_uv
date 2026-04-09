@@ -10,9 +10,11 @@
 #include <string_view>
 #include <vector>
 
-#include "async_uv/task.h"
+#include <stdexec/execution.hpp>
 
-namespace async_uv::redis {
+#include "flux/task.h"
+
+namespace flux::redis {
 
 class RedisParam {
 public:
@@ -173,6 +175,23 @@ struct Reply {
     std::vector<Reply> elements;
 };
 
+using VoidSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using BoolSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using ReplySender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(Reply),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+using IndexSender = exec::any_receiver_ref<
+    stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>>::any_sender<>;
+
 class Client {
 public:
     Client();
@@ -184,34 +203,97 @@ public:
     Client(const Client &) = delete;
     Client &operator=(const Client &) = delete;
 
-    Task<void> open(ConnectionOptions options);
-    Task<void> close();
-    Task<bool> is_open() const;
+    [[nodiscard]] auto open(ConnectionOptions options) {
+        return stdexec::just(std::move(options))
+             | stdexec::let_value(
+                   [this](ConnectionOptions opts) { return this->open_task(std::move(opts)); });
+    }
+    [[nodiscard]] auto close() {
+        return stdexec::just() | stdexec::let_value([this] { return this->close_task(); });
+    }
+    [[nodiscard]] auto is_open() const {
+        return stdexec::just() | stdexec::let_value([this] { return this->is_open_task(); });
+    }
 
-    Task<Reply> command(std::string command);
-    Task<Reply> command(std::string command, std::vector<RedisParam> params);
-    Task<Reply>
-    command(std::string command, std::vector<RedisParam> params, CommandOptions options);
-
-    Task<Reply> execute(std::string command);
-    Task<Reply> execute(std::string command, std::vector<RedisParam> params);
-    Task<Reply>
-    execute(std::string command, std::vector<RedisParam> params, CommandOptions options);
+    [[nodiscard]] auto command(std::string command_text) {
+        return stdexec::just(std::move(command_text))
+             | stdexec::let_value([this](std::string c) { return this->command_task(std::move(c)); });
+    }
+    [[nodiscard]] auto command(std::string command_text, std::vector<RedisParam> params) {
+        return stdexec::just(std::move(command_text), std::move(params))
+             | stdexec::let_value([this](std::string c, std::vector<RedisParam> p) {
+                   return this->command_task(std::move(c), std::move(p));
+               });
+    }
+    [[nodiscard]] auto command(std::string command_text,
+                               std::vector<RedisParam> params,
+                               CommandOptions options) {
+        return stdexec::just(std::move(command_text), std::move(params), std::move(options))
+             | stdexec::let_value(
+                   [this](std::string c, std::vector<RedisParam> p, CommandOptions o) {
+                       return this->command_task(std::move(c), std::move(p), std::move(o));
+                   });
+    }
 
 private:
+    VoidSender open_task(ConnectionOptions options);
+    VoidSender close_task();
+    BoolSender is_open_task() const;
+    ReplySender command_task(std::string command_text);
+    ReplySender command_task(std::string command_text, std::vector<RedisParam> params);
+    ReplySender command_task(std::string command_text,
+                             std::vector<RedisParam> params,
+                             CommandOptions options);
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-Task<Reply> command(ConnectionOptions options, std::string command);
-Task<Reply> command(ConnectionOptions options, std::string command, std::vector<RedisParam> params);
-Task<Reply> command(ConnectionOptions options,
-                    std::string command,
-                    std::vector<RedisParam> params,
-                    CommandOptions command_options);
+namespace detail {
+ReplySender command_task(ConnectionOptions options, std::string command_text);
+ReplySender command_task(ConnectionOptions options,
+                         std::string command_text,
+                         std::vector<RedisParam> params);
+ReplySender command_task(ConnectionOptions options,
+                         std::string command_text,
+                         std::vector<RedisParam> params,
+                         CommandOptions command_options);
+} // namespace detail
+
+[[nodiscard]] inline auto command(ConnectionOptions options, std::string command_text) {
+    return stdexec::just(std::move(options), std::move(command_text))
+         | stdexec::let_value(
+               [](ConnectionOptions o, std::string c) { return detail::command_task(std::move(o), std::move(c)); });
+}
+
+[[nodiscard]] inline auto command(ConnectionOptions options,
+                                  std::string command_text,
+                                  std::vector<RedisParam> params) {
+    return stdexec::just(std::move(options), std::move(command_text), std::move(params))
+         | stdexec::let_value([](ConnectionOptions o, std::string c, std::vector<RedisParam> p) {
+               return detail::command_task(std::move(o), std::move(c), std::move(p));
+           });
+}
+
+[[nodiscard]] inline auto command(ConnectionOptions options,
+                                  std::string command_text,
+                                  std::vector<RedisParam> params,
+                                  CommandOptions command_options) {
+    return stdexec::just(
+               std::move(options), std::move(command_text), std::move(params), std::move(command_options))
+         | stdexec::let_value(
+               [](ConnectionOptions o, std::string c, std::vector<RedisParam> p, CommandOptions co) {
+                   return detail::command_task(std::move(o), std::move(c), std::move(p), std::move(co));
+               });
+}
 
 class ConnectionPool {
 public:
+    using CreateSender = exec::any_receiver_ref<
+        stdexec::completion_signatures<stdexec::set_value_t(ConnectionPool),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>>::any_sender<>;
+
     ConnectionPool();
     ~ConnectionPool();
 
@@ -221,23 +303,47 @@ public:
     ConnectionPool(const ConnectionPool &) = delete;
     ConnectionPool &operator=(const ConnectionPool &) = delete;
 
-    static Task<ConnectionPool> create(ConnectionPoolOptions options);
+    [[nodiscard]] static auto create(ConnectionPoolOptions options) {
+        return stdexec::just(std::move(options))
+             | stdexec::let_value(
+                   [](ConnectionPoolOptions o) { return create_task(std::move(o)); });
+    }
 
-    Task<Reply> command(std::string command);
-    Task<Reply> command(std::string command, std::vector<RedisParam> params);
-    Task<Reply>
-    command(std::string command, std::vector<RedisParam> params, CommandOptions options);
+    [[nodiscard]] auto command(std::string command_text) {
+        return stdexec::just(std::move(command_text))
+             | stdexec::let_value([this](std::string c) { return this->command_task(std::move(c)); });
+    }
+    [[nodiscard]] auto command(std::string command_text, std::vector<RedisParam> params) {
+        return stdexec::just(std::move(command_text), std::move(params))
+             | stdexec::let_value([this](std::string c, std::vector<RedisParam> p) {
+                   return this->command_task(std::move(c), std::move(p));
+               });
+    }
+    [[nodiscard]] auto command(std::string command_text,
+                               std::vector<RedisParam> params,
+                               CommandOptions options) {
+        return stdexec::just(std::move(command_text), std::move(params), std::move(options))
+             | stdexec::let_value(
+                   [this](std::string c, std::vector<RedisParam> p, CommandOptions o) {
+                       return this->command_task(std::move(c), std::move(p), std::move(o));
+                   });
+    }
 
-    Task<Reply> execute(std::string command);
-    Task<Reply> execute(std::string command, std::vector<RedisParam> params);
-    Task<Reply>
-    execute(std::string command, std::vector<RedisParam> params, CommandOptions options);
-
-    Task<void> close();
+    [[nodiscard]] auto close() {
+        return stdexec::just() | stdexec::let_value([this] { return this->close_task(); });
+    }
 
 private:
+    static CreateSender create_task(ConnectionPoolOptions options);
+    ReplySender command_task(std::string command_text);
+    ReplySender command_task(std::string command_text, std::vector<RedisParam> params);
+    ReplySender command_task(std::string command_text,
+                             std::vector<RedisParam> params,
+                             CommandOptions options);
+    VoidSender close_task();
+
     class Impl;
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace async_uv::redis
+} // namespace flux::redis

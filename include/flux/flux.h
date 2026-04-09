@@ -1,10 +1,12 @@
 #pragma once
 
+#include "flux/async_semaphore.h"
 #include "flux/cancel.h"
 #include "flux/error.h"
 #include "flux/fd.h"
 #include "flux/fs.h"
 #include "flux/message.h"
+#include "flux/once_cell.h"
 #include "flux/runtime.h"
 #include "flux/scope.h"
 #include "flux/task.h"

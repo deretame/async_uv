@@ -9,12 +9,12 @@
 #include <string>
 #include <string_view>
 
-#include "async_uv/cancel.h"
-#include "async_uv/runtime.h"
-#include "async_uv/stream.h"
-#include "async_uv/task.h"
+#include "flux/cancel.h"
+#include "flux/runtime.h"
+#include "flux/stream.h"
+#include "flux/task.h"
 
-namespace async_uv::ws {
+namespace flux::ws {
 
 enum class MessageType {
     text,
@@ -111,12 +111,12 @@ public:
 
     template <typename Rep, typename Period>
     task_type next_for(std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await async_uv::with_timeout(timeout, next());
+        co_return co_await flux::with_timeout(timeout, next());
     }
 
     template <typename Clock, typename Duration>
     task_type next_until(std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await async_uv::with_deadline(deadline, next());
+        co_return co_await flux::with_deadline(deadline, next());
     }
 
     stream_type events();
@@ -191,12 +191,12 @@ public:
 
     template <typename Rep, typename Period>
     task_type next_for(std::chrono::duration<Rep, Period> timeout) {
-        co_return co_await async_uv::with_timeout(timeout, next());
+        co_return co_await flux::with_timeout(timeout, next());
     }
 
     template <typename Clock, typename Duration>
     task_type next_until(std::chrono::time_point<Clock, Duration> deadline) {
-        co_return co_await async_uv::with_deadline(deadline, next());
+        co_return co_await flux::with_deadline(deadline, next());
     }
 
     stream_type events();
@@ -212,4 +212,4 @@ private:
     std::shared_ptr<State> state_;
 };
 
-} // namespace async_uv::ws
+} // namespace flux::ws

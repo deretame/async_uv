@@ -39,3 +39,6 @@ inline void throw_if_uv_error(int code, std::string_view where) {
 
 } // namespace flux
 
+#ifndef UV_ETIMEDOUT
+inline constexpr int UV_ETIMEDOUT = ETIMEDOUT;
+#endif

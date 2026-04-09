@@ -2,16 +2,16 @@
 #include <filesystem>
 #include <string>
 
-#include "async_uv/async_uv.h"
-#include "async_uv_http/parser.h"
+#include "flux/flux.h"
+#include "flux_http/parser.h"
 
 namespace {
 
-async_uv::Task<void> run_parser_checks() {
-    using async_uv::http::HttpParser;
-    using async_uv::http::ParseError;
-    using async_uv::http::ParseErrorKind;
-    using async_uv::http::ParseMode;
+flux::Task<void> run_parser_checks() {
+    using flux::http::HttpParser;
+    using flux::http::ParseError;
+    using flux::http::ParseErrorKind;
+    using flux::http::ParseMode;
 
     {
         HttpParser parser(ParseMode::response);
@@ -36,7 +36,7 @@ async_uv::Task<void> run_parser_checks() {
     }
 
     {
-        async_uv::http::ParserOptions options;
+        flux::http::ParserOptions options;
         options.max_feed_chunk_size = 7;
         options.yield_every_chunks = 1;
         HttpParser parser(ParseMode::response, options);
@@ -73,7 +73,7 @@ async_uv::Task<void> run_parser_checks() {
     }
 
     {
-        auto message = co_await async_uv::http::parse_first_message(
+        auto message = co_await flux::http::parse_first_message(
             "GET /demo?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n", ParseMode::request);
         assert(message.has_value());
         assert(message->is_request());
@@ -83,7 +83,7 @@ async_uv::Task<void> run_parser_checks() {
     }
 
     {
-        auto messages = co_await async_uv::http::parse_all_messages(
+        auto messages = co_await flux::http::parse_all_messages(
             "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
             ParseMode::response);
@@ -94,11 +94,11 @@ async_uv::Task<void> run_parser_checks() {
     }
 
     {
-        const auto temp_dir = std::filesystem::path(async_uv::path::join(
-            std::filesystem::temp_directory_path().string(), "async_uv_parser_tmp"));
+        const auto temp_dir = std::filesystem::path(flux::path::join(
+            std::filesystem::temp_directory_path().string(), "flux_parser_tmp"));
         std::filesystem::create_directories(temp_dir);
 
-        async_uv::http::ParserOptions options;
+        flux::http::ParserOptions options;
         options.max_body_in_memory = 16;
         options.temp_directory = temp_dir;
 
@@ -116,7 +116,7 @@ async_uv::Task<void> run_parser_checks() {
         assert(std::filesystem::exists(*message->body_file_path()));
 
         const auto moved =
-            std::filesystem::path(async_uv::path::join(temp_dir.string(), "moved_body.bin"));
+            std::filesystem::path(flux::path::join(temp_dir.string(), "moved_body.bin"));
         assert(co_await message->move_body_file_to(moved, true));
         assert(message->body_file_path().has_value());
         assert(*message->body_file_path() == moved);
@@ -127,11 +127,11 @@ async_uv::Task<void> run_parser_checks() {
     }
 
     {
-        const auto temp_dir = std::filesystem::path(async_uv::path::join(
-            std::filesystem::temp_directory_path().string(), "async_uv_parser_tmp_dispose"));
+        const auto temp_dir = std::filesystem::path(flux::path::join(
+            std::filesystem::temp_directory_path().string(), "flux_parser_tmp_dispose"));
         std::filesystem::create_directories(temp_dir);
 
-        async_uv::http::ParserOptions options;
+        flux::http::ParserOptions options;
         options.max_body_in_memory = 16;
         options.temp_directory = temp_dir;
 
@@ -168,7 +168,7 @@ async_uv::Task<void> run_parser_checks() {
     {
         bool threw = false;
         try {
-            async_uv::http::ParserOptions options;
+            flux::http::ParserOptions options;
             options.max_header_count = 1;
             HttpParser parser(ParseMode::response, options);
             co_await parser.feed("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\n\r\n");
@@ -182,7 +182,7 @@ async_uv::Task<void> run_parser_checks() {
     {
         bool threw = false;
         try {
-            async_uv::http::ParserOptions options;
+            flux::http::ParserOptions options;
             options.max_header_line_size = 8;
             HttpParser parser(ParseMode::response, options);
             co_await parser.feed("HTTP/1.1 200 OK\r\nLong: 123456\r\n\r\n");
@@ -196,7 +196,7 @@ async_uv::Task<void> run_parser_checks() {
     {
         bool threw = false;
         try {
-            async_uv::http::ParserOptions options;
+            flux::http::ParserOptions options;
             options.max_start_line_size = 12;
             HttpParser parser(ParseMode::request, options);
             co_await parser.feed("GET /very-long-path HTTP/1.1\r\nHost: example.com\r\n\r\n");
@@ -211,7 +211,7 @@ async_uv::Task<void> run_parser_checks() {
 } // namespace
 
 int main() {
-    async_uv::Runtime runtime(async_uv::Runtime::build().name("async_uv_http_parser_test"));
+    flux::Runtime runtime(flux::Runtime::build().name("flux_http_parser_test"));
     runtime.block_on(run_parser_checks());
     return 0;
 }

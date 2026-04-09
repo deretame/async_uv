@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <exception>
@@ -914,6 +915,130 @@ public:
 private:
     std::shared_ptr<State> state_;
     MutableBuffer output_{};
+};
+
+using uv_os_sock_t = int;
+
+enum class FdEventFlags : int {
+    none = 0,
+    readable = 1 << 0,
+    writable = 1 << 1,
+};
+
+constexpr FdEventFlags operator|(FdEventFlags lhs, FdEventFlags rhs) noexcept {
+    return static_cast<FdEventFlags>(static_cast<int>(lhs) | static_cast<int>(rhs));
+}
+
+constexpr FdEventFlags operator&(FdEventFlags lhs, FdEventFlags rhs) noexcept {
+    return static_cast<FdEventFlags>(static_cast<int>(lhs) & static_cast<int>(rhs));
+}
+
+constexpr FdEventFlags &operator|=(FdEventFlags &lhs, FdEventFlags rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+class FdEvent {
+public:
+    FdEvent() = default;
+
+    [[nodiscard]] bool ok() const noexcept {
+        return ok_;
+    }
+
+    [[nodiscard]] bool readable() const noexcept {
+        return readable_;
+    }
+
+    [[nodiscard]] bool writable() const noexcept {
+        return writable_;
+    }
+
+    [[nodiscard]] const std::error_code &error() const noexcept {
+        return error_;
+    }
+
+private:
+    friend class FdWatcher;
+    bool ok_ = false;
+    bool readable_ = false;
+    bool writable_ = false;
+    std::error_code error_{};
+};
+
+class FdWatcher {
+public:
+    using WatchCompletionSignatures = stdexec::completion_signatures<
+        stdexec::set_value_t(FdWatcher),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+    using EventCompletionSignatures = stdexec::completion_signatures<
+        stdexec::set_value_t(std::optional<FdEvent>),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+    using StopCompletionSignatures = stdexec::completion_signatures<
+        stdexec::set_value_t(),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+    using WatchSender = exec::any_receiver_ref<WatchCompletionSignatures>::any_sender<>;
+    using EventSender = exec::any_receiver_ref<EventCompletionSignatures>::any_sender<>;
+    using StopSender = exec::any_receiver_ref<StopCompletionSignatures>::any_sender<>;
+
+    FdWatcher() = default;
+    ~FdWatcher() = default;
+
+    FdWatcher(const FdWatcher &) = default;
+    FdWatcher &operator=(const FdWatcher &) = default;
+    FdWatcher(FdWatcher &&other) noexcept : state_(std::move(other.state_)) {}
+    FdWatcher &operator=(FdWatcher &&other) noexcept = default;
+
+    // Sender-first API.
+    static WatchSender watch_sender(uv_os_sock_t fd, int events);
+    static WatchSender watch_sender(uv_os_sock_t fd, int events, Runtime *runtime);
+    [[nodiscard]] EventSender next_sender(std::optional<int> timeout_ms = std::nullopt) const;
+    template <typename Rep, typename Period>
+    [[nodiscard]] EventSender next_for_sender(std::chrono::duration<Rep, Period> timeout) const {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+        const auto clamped = std::max<std::int64_t>(0, ms.count());
+        return next_sender(static_cast<int>(clamped));
+    }
+    [[nodiscard]] StopSender stop_sender() const;
+
+    static Task<FdWatcher> watch(uv_os_sock_t fd, int events);
+
+    Task<std::optional<FdEvent>> next();
+
+    template <typename Rep, typename Period>
+    Task<std::optional<FdEvent>> next_for(std::chrono::duration<Rep, Period> timeout) {
+        co_return co_await next_for_sender(timeout);
+    }
+
+    Task<void> stop();
+
+private:
+    struct State {
+        Runtime *runtime = nullptr;
+        int events = 0;
+        exec::asio::asio_impl::posix::stream_descriptor descriptor;
+        std::atomic<bool> stopped{false};
+
+        explicit State(Runtime *rt, int requested_events)
+            : runtime(rt),
+              events(requested_events),
+              descriptor(rt->executor()) {}
+
+        ~State() {
+            // FdWatcher does not own the original fd lifecycle.
+            // Ensure descriptor destruction never closes user-owned fd.
+            if (descriptor.is_open()) {
+                (void)descriptor.release();
+            }
+        }
+    };
+
+    explicit FdWatcher(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
+
+    std::shared_ptr<State> state_;
 };
 
 } // namespace flux

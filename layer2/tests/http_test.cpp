@@ -14,12 +14,11 @@
 #include <tuple>
 #include <unordered_map>
 
-#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <tinyxml2.h>
 
-#include "async_uv/async_uv.h"
-#include "async_uv_http/http.h"
+#include "flux/flux.h"
+#include "flux_http/http.h"
 
 namespace {
 
@@ -50,21 +49,21 @@ struct QueryToStringCamelValue {
     }
 };
 
-class CountingInterceptor : public async_uv::http::Interceptor {
+class CountingInterceptor : public flux::http::Interceptor {
 public:
-    void on_request(async_uv::http::Request &request) const override {
+    void on_request(flux::http::Request &request) const override {
         request_count.fetch_add(1, std::memory_order_relaxed);
         request.headers.push_back({"X-Interceptor", "on"});
     }
 
-    void on_response(const async_uv::http::Request &,
-                     async_uv::http::Response &response) const override {
+    void on_response(const flux::http::Request &,
+                     flux::http::Response &response) const override {
         response_count.fetch_add(1, std::memory_order_relaxed);
         response.headers.push_back({"X-Interceptor-Response", "on"});
     }
 
-    void on_error(const async_uv::http::Request &,
-                  const async_uv::http::HttpError &) const override {
+    void on_error(const flux::http::Request &,
+                  const flux::http::HttpError &) const override {
         error_count.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -73,7 +72,7 @@ public:
     mutable std::atomic_int error_count{0};
 };
 
-bool has_header(const async_uv::http::Response &response, const std::string &name) {
+bool has_header(const flux::http::Response &response, const std::string &name) {
     for (const auto &header : response.headers) {
         if (header.name == name) {
             return true;
@@ -131,7 +130,7 @@ namespace {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DemoPayload, hello, lang)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(HttpBinPostJsonEcho, json)
 
-class SimpleMapJsonCodec : public async_uv::http::JsonCodec {
+class SimpleMapJsonCodec : public flux::http::JsonCodec {
 public:
     template <typename T>
     void register_type() {
@@ -169,7 +168,7 @@ private:
     std::unordered_map<std::type_index, DeserializeFn> deserializers_;
 };
 
-class SimpleXmlCodec : public async_uv::http::XmlCodec {
+class SimpleXmlCodec : public flux::http::XmlCodec {
 public:
     std::string serialize(const void *value, const std::type_info &type) const override {
         if (type != typeid(DemoPayload)) {
@@ -226,34 +225,40 @@ public:
     }
 };
 
-bool is_network_error(int transport_code) {
-    const auto curl_code = static_cast<CURLcode>(transport_code);
-    return curl_code == CURLE_COULDNT_RESOLVE_HOST || curl_code == CURLE_COULDNT_CONNECT ||
-           curl_code == CURLE_OPERATION_TIMEDOUT || curl_code == CURLE_SSL_CONNECT_ERROR ||
-           curl_code == CURLE_RECV_ERROR || curl_code == CURLE_SEND_ERROR ||
-           curl_code == CURLE_GOT_NOTHING;
+bool is_network_error(const flux::http::HttpError &error) {
+    if (error.code() != flux::http::HttpErrorCode::curl_failure) {
+        return false;
+    }
+    const auto kind = error.transport_kind();
+    return kind == flux::http::TransportErrorKind::timeout ||
+           kind == flux::http::TransportErrorKind::dns ||
+           kind == flux::http::TransportErrorKind::connect ||
+           kind == flux::http::TransportErrorKind::tls ||
+           kind == flux::http::TransportErrorKind::recv ||
+           kind == flux::http::TransportErrorKind::send ||
+           kind == flux::http::TransportErrorKind::reset;
 }
 
-async_uv::Task<void> run_http_checks(std::string ok_url,
+flux::Task<void> run_http_checks(std::string ok_url,
                                      std::string fail_url,
                                      std::string json_url,
                                      std::string json_get_url,
                                      std::string xml_get_url,
                                      std::string query_url,
                                      std::string download_url) {
-    auto *runtime = co_await async_uv::get_current_runtime();
+    auto *runtime = co_await flux::get_current_runtime();
 
     auto codec = std::make_shared<SimpleMapJsonCodec>();
     auto xml_codec = std::make_shared<SimpleXmlCodec>();
     auto interceptor = std::make_shared<CountingInterceptor>();
     std::atomic_size_t streamed_bytes = 0;
 
-    async_uv::http::CookieJarOptions cookie_jar;
+    flux::http::CookieJarOptions cookie_jar;
     cookie_jar.enabled = true;
     cookie_jar.file_path =
-        (std::filesystem::temp_directory_path() / "async_uv_http_cookie.jar").string();
+        (std::filesystem::temp_directory_path() / "flux_http_cookie.jar").string();
 
-    async_uv::http::RetryPolicy retry;
+    flux::http::RetryPolicy retry;
     retry.enabled = true;
     retry.max_attempts = 2;
     retry.base_backoff = std::chrono::milliseconds(20);
@@ -263,7 +268,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
     codec->register_type<DemoPayload>();
     codec->register_type<HttpBinPostJsonEcho>();
 
-    auto client = async_uv::http::Client::build()
+    auto client = flux::http::Client::build()
                       .runtime(*runtime)
                       .json_codec(codec)
                       .xml_codec(xml_codec)
@@ -296,14 +301,14 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                     stream_only_bytes.fetch_add(chunk.size(), std::memory_order_relaxed);
                 },
                 false)
-            .response_format(async_uv::http::ResponseFormat::text)
+            .response_format(flux::http::ResponseFormat::text)
             .send()
             .text();
     assert(stream_only_bytes.load(std::memory_order_relaxed) > 0);
     assert(stream_only_body.empty());
 
     auto ua_response = co_await client.get(response.effective_url)
-                           .user_agent("async_uv_http_test/ua")
+                           .user_agent("flux_http_test/ua")
                            .send()
                            .raw();
     assert(ua_response.ok());
@@ -311,8 +316,8 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
     bool got_http_error = false;
     try {
         (void)co_await client.get(std::move(fail_url)).send().raw();
-    } catch (const async_uv::http::HttpError &error) {
-        if (error.code() == async_uv::http::HttpErrorCode::http_status_failure) {
+    } catch (const flux::http::HttpError &error) {
+        if (error.code() == flux::http::HttpErrorCode::http_status_failure) {
             got_http_error = true;
         } else {
             throw;
@@ -325,7 +330,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         bool saw_transport_error = false;
         try {
             (void)co_await client.get("http://nonexistent.async-uv.invalid/")
-                .retry(async_uv::http::RetryPolicy{
+                .retry(flux::http::RetryPolicy{
                     .enabled = true,
                     .max_attempts = 2,
                     .retry_idempotent_only = true,
@@ -335,10 +340,10 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                 })
                 .send()
                 .raw();
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::curl_failure) {
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::curl_failure) {
                 saw_transport_error =
-                    error.transport_kind() != async_uv::http::TransportErrorKind::none;
+                    error.transport_kind() != flux::http::TransportErrorKind::none;
             } else {
                 throw;
             }
@@ -346,13 +351,13 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         assert(saw_transport_error);
     }
 
-    async_uv::OnceCell<async_uv::http::Client> cell;
+    flux::OnceCell<flux::http::Client> cell;
     std::atomic_int init_count = 0;
 
-    auto fetch_once = [&](std::string url) -> async_uv::Task<long> {
+    auto fetch_once = [&](std::string url) -> flux::Task<long> {
         const auto &shared_client = cell.get_or_init([&]() {
             init_count.fetch_add(1, std::memory_order_relaxed);
-            return async_uv::http::Client::build()
+            return flux::http::Client::build()
                 .runtime(*runtime)
                 .default_header("Accept", "*/*")
                 .timeout(std::chrono::seconds(15))
@@ -367,8 +372,8 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         co_return shared_response.status_code;
     };
 
-    auto [s1, s2, s3] = co_await async_uv::with_task_scope(
-        [&](async_uv::TaskScope &scope) -> async_uv::Task<std::tuple<long, long, long>> {
+    auto [s1, s2, s3] = co_await flux::with_task_scope(
+        [&](flux::TaskScope &scope) -> flux::Task<std::tuple<long, long, long>> {
             co_return co_await scope.all(
                 fetch_once(ok_url), fetch_once(ok_url), fetch_once(ok_url));
         });
@@ -380,7 +385,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 
     bool saw_mixed_status_error = false;
     try {
-        co_await async_uv::with_task_scope([&](async_uv::TaskScope &scope) -> async_uv::Task<void> {
+        co_await flux::with_task_scope([&](flux::TaskScope &scope) -> flux::Task<void> {
             auto [m1, m2, m3] =
                 co_await scope.all(fetch_once(ok_url), fetch_once(fail_url), fetch_once(ok_url));
             (void)m1;
@@ -388,8 +393,8 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
             (void)m3;
             co_return;
         });
-    } catch (const async_uv::http::HttpError &error) {
-        if (error.code() == async_uv::http::HttpErrorCode::http_status_failure) {
+    } catch (const flux::http::HttpError &error) {
+        if (error.code() == flux::http::HttpErrorCode::http_status_failure) {
             saw_mixed_status_error = true;
         } else {
             throw;
@@ -406,11 +411,11 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         bool saw_invalid_request = false;
         try {
             (void)co_await client.post(ok_url)
-                .request_format(async_uv::http::RequestFormat::multipart)
+                .request_format(flux::http::RequestFormat::multipart)
                 .send()
                 .raw();
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::invalid_request) {
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::invalid_request) {
                 saw_invalid_request = true;
             } else {
                 throw;
@@ -423,12 +428,12 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         bool saw_invalid_request = false;
         try {
             (void)co_await client.post(ok_url)
-                .multipart({async_uv::http::field("k", "v")})
-                .request_format(async_uv::http::RequestFormat::json)
+                .multipart({flux::http::field("k", "v")})
+                .request_format(flux::http::RequestFormat::json)
                 .send()
                 .raw();
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::invalid_request) {
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::invalid_request) {
                 saw_invalid_request = true;
             } else {
                 throw;
@@ -442,7 +447,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         auto post_echo = co_await client.post(std::move(json_url))
                              .json(request_data)
                              .request_format("json")
-                             .response_format(async_uv::http::ResponseFormat::json)
+                             .response_format(flux::http::ResponseFormat::json)
                              .send()
                              .json<HttpBinPostJsonEcho>();
         assert(post_echo.json.hello == "world");
@@ -468,10 +473,10 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                                    .json<nlohmann::json>();
             assert(direct_json.is_object());
             assert(!direct_json.empty());
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
-                is_network_error(error.transport_code())) {
-                std::cerr << "[async_uv_http_test] skip: json GET demo unavailable, transport_code="
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::curl_failure &&
+                is_network_error(error)) {
+                std::cerr << "[flux_http_test] skip: json GET demo unavailable, transport_code="
                           << error.transport_code() << " message=" << error.what() << '\n';
             } else {
                 throw;
@@ -480,9 +485,9 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 
         {
             const auto download_output =
-                std::filesystem::temp_directory_path() / "async_uv_http_download.bin";
+                std::filesystem::temp_directory_path() / "flux_http_download.bin";
             const auto download_temp =
-                std::filesystem::temp_directory_path() / "async_uv_http_download.bin.part";
+                std::filesystem::temp_directory_path() / "flux_http_download.bin.part";
 
             {
                 std::ofstream pre(download_temp, std::ios::binary | std::ios::trunc);
@@ -494,14 +499,14 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                                 pre.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
                             },
                             false)
-                        .response_format(async_uv::http::ResponseFormat::text)
+                        .response_format(flux::http::ResponseFormat::text)
                         .send()
                         .raw();
                 (void)pre_resp;
                 pre.flush();
             }
 
-            async_uv::http::DownloadOptions download_options;
+            flux::http::DownloadOptions download_options;
             download_options.resume = true;
             download_options.use_temp_file = true;
             download_options.overwrite = true;
@@ -520,25 +525,25 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         }
 
         try {
-            auto cookie_set = co_await client.get("http://httpbin.org/cookies/set?session=async_uv")
+            auto cookie_set = co_await client.get("http://httpbin.org/cookies/set?session=flux")
                                   .follow_redirects(true)
-                                  .response_format(async_uv::http::ResponseFormat::json)
+                                  .response_format(flux::http::ResponseFormat::json)
                                   .send()
                                   .json<nlohmann::json>();
             (void)cookie_set;
 
             auto cookie_get = co_await client.get("http://httpbin.org/cookies")
-                                  .response_format(async_uv::http::ResponseFormat::json)
+                                  .response_format(flux::http::ResponseFormat::json)
                                   .send()
                                   .json<nlohmann::json>();
             if (cookie_get.contains("cookies") && cookie_get["cookies"].contains("session")) {
-                assert(cookie_get["cookies"]["session"].get<std::string>() == "async_uv");
+                assert(cookie_get["cookies"]["session"].get<std::string>() == "flux");
             }
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
-                is_network_error(error.transport_code())) {
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::curl_failure &&
+                is_network_error(error)) {
                 std::cerr
-                    << "[async_uv_http_test] skip: cookie jar demo unavailable, transport_code="
+                    << "[flux_http_test] skip: cookie jar demo unavailable, transport_code="
                     << error.transport_code() << " message=" << error.what() << '\n';
             } else {
                 throw;
@@ -546,10 +551,10 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         }
 
         {
-            async_uv::http::RetryPolicy no_retry;
+            flux::http::RetryPolicy no_retry;
             no_retry.enabled = false;
 
-            async_uv::http::ProxyOptions bad_proxy;
+            flux::http::ProxyOptions bad_proxy;
             bad_proxy.url = "http://127.0.0.1:1";
 
             try {
@@ -560,9 +565,9 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                     .timeout(std::chrono::milliseconds(1000))
                     .send()
                     .raw();
-            } catch (const async_uv::http::HttpError &error) {
-                if (error.code() == async_uv::http::HttpErrorCode::curl_failure) {
-                    assert(error.transport_kind() != async_uv::http::TransportErrorKind::none);
+            } catch (const flux::http::HttpError &error) {
+                if (error.code() == flux::http::HttpErrorCode::curl_failure) {
+                    assert(error.transport_kind() != flux::http::TransportErrorKind::none);
                 } else {
                     throw;
                 }
@@ -585,7 +590,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
                                   .query(mode_map)
                                   .query(pair_vec)
                                   .query(tuple_entries)
-                                  .response_format(async_uv::http::ResponseFormat::json)
+                                  .response_format(flux::http::ResponseFormat::json)
                                   .send()
                                   .json<nlohmann::json>();
 
@@ -600,10 +605,10 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
             assert(query_json["args"]["v2"].get<std::string>() == "22");
             assert(query_json["args"]["tuple_a"].get<std::string>() == "A");
             assert(query_json["args"]["tuple_b"].get<std::string>() == "B");
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
-                is_network_error(error.transport_code())) {
-                std::cerr << "[async_uv_http_test] skip: query demo unavailable, transport_code="
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::curl_failure &&
+                is_network_error(error)) {
+                std::cerr << "[flux_http_test] skip: query demo unavailable, transport_code="
                           << error.transport_code() << " message=" << error.what() << '\n';
             } else {
                 throw;
@@ -611,7 +616,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         }
 
         const auto tmp_file =
-            std::filesystem::temp_directory_path() / "async_uv_http_form_upload.txt";
+            std::filesystem::temp_directory_path() / "flux_http_form_upload.txt";
         {
             std::ofstream out(tmp_file, std::ios::binary);
             out << "hello-form-data";
@@ -619,15 +624,15 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 
         auto form_data_json = co_await client.post(json_url)
                                   .multipart({
-                                      async_uv::http::field("kind", "demo"),
-                                      async_uv::http::field("lang", QueryToStringCamelValue{"cpp"}),
-                                      async_uv::http::field("seq", 9),
-                                      async_uv::http::file("file", tmp_file.string())
+                                      flux::http::field("kind", "demo"),
+                                      flux::http::field("lang", QueryToStringCamelValue{"cpp"}),
+                                      flux::http::field("seq", 9),
+                                      flux::http::file("file", tmp_file.string())
                                           .filename("demo.txt")
                                           .content_type("text/plain"),
                                   })
-                                  .request_format(async_uv::http::RequestFormat::multipart)
-                                  .response_format(async_uv::http::ResponseFormat::json)
+                                  .request_format(flux::http::RequestFormat::multipart)
+                                  .response_format(flux::http::ResponseFormat::json)
                                   .send()
                                   .json<nlohmann::json>();
 
@@ -640,7 +645,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         std::string png_bytes("\x89PNG\r\n\x1A\n", 8);
         auto binary_json = co_await client.post(json_url)
                                .form_binary("image", png_bytes, "demo.png", "image/png")
-                               .response_format(async_uv::http::ResponseFormat::json)
+                               .response_format(flux::http::ResponseFormat::json)
                                .send()
                                .json<nlohmann::json>();
         assert(binary_json.contains("files"));
@@ -649,8 +654,8 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
         std::unordered_map<std::string, int> post_form{{"x", 10}, {"y", 20}};
         auto urlencoded_json = co_await client.post(json_url)
                                    .urlencoded(post_form)
-                                   .request_format(async_uv::http::RequestFormat::form)
-                                   .response_format(async_uv::http::ResponseFormat::json)
+                                   .request_format(flux::http::RequestFormat::form)
+                                   .response_format(flux::http::ResponseFormat::json)
                                    .send()
                                    .json<nlohmann::json>();
         assert(urlencoded_json.contains("form"));
@@ -662,7 +667,7 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 
         auto xml_post_json = co_await client.post(json_url)
                                  .xml(DemoPayload{"x", "y"})
-                                 .response_format(async_uv::http::ResponseFormat::json)
+                                 .response_format(flux::http::ResponseFormat::json)
                                  .send()
                                  .json<nlohmann::json>();
         assert(xml_post_json.contains("data"));
@@ -674,14 +679,14 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 
         try {
             auto xml_root = co_await client.get(std::move(xml_get_url))
-                                .response_format(async_uv::http::ResponseFormat::xml)
+                                .response_format(flux::http::ResponseFormat::xml)
                                 .send()
                                 .xml<XmlRootInfo>();
             assert(!xml_root.root_name.empty());
-        } catch (const async_uv::http::HttpError &error) {
-            if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
-                is_network_error(error.transport_code())) {
-                std::cerr << "[async_uv_http_test] skip: xml GET demo unavailable, transport_code="
+        } catch (const flux::http::HttpError &error) {
+            if (error.code() == flux::http::HttpErrorCode::curl_failure &&
+                is_network_error(error)) {
+                std::cerr << "[flux_http_test] skip: xml GET demo unavailable, transport_code="
                           << error.transport_code() << " message=" << error.what() << '\n';
             } else {
                 throw;
@@ -693,48 +698,48 @@ async_uv::Task<void> run_http_checks(std::string ok_url,
 } // namespace
 
 int main() {
-    const char *ok_env = std::getenv("ASYNC_UV_HTTP_TEST_URL");
+    const char *ok_env = std::getenv("FLUX_HTTP_TEST_URL");
     const std::string ok_url =
         (ok_env != nullptr && *ok_env != '\0') ? std::string(ok_env) : "http://example.com/";
 
-    const char *fail_env = std::getenv("ASYNC_UV_HTTP_TEST_FAIL_URL");
+    const char *fail_env = std::getenv("FLUX_HTTP_TEST_FAIL_URL");
     const std::string fail_url = (fail_env != nullptr && *fail_env != '\0')
                                      ? std::string(fail_env)
                                      : "http://httpstat.us/404";
 
-    const char *json_env = std::getenv("ASYNC_UV_HTTP_TEST_JSON_URL");
+    const char *json_env = std::getenv("FLUX_HTTP_TEST_JSON_URL");
     const std::string json_url = (json_env != nullptr && *json_env != '\0')
                                      ? std::string(json_env)
                                      : "http://httpbin.org/post";
 
-    const char *json_get_env = std::getenv("ASYNC_UV_HTTP_TEST_JSON_GET_URL");
+    const char *json_get_env = std::getenv("FLUX_HTTP_TEST_JSON_GET_URL");
     const std::string json_get_url = (json_get_env != nullptr && *json_get_env != '\0')
                                          ? std::string(json_get_env)
                                          : "http://httpbin.org/json";
 
-    const char *xml_get_env = std::getenv("ASYNC_UV_HTTP_TEST_XML_GET_URL");
+    const char *xml_get_env = std::getenv("FLUX_HTTP_TEST_XML_GET_URL");
     const std::string xml_get_url = (xml_get_env != nullptr && *xml_get_env != '\0')
                                         ? std::string(xml_get_env)
                                         : "http://httpbin.org/xml";
 
-    const char *query_env = std::getenv("ASYNC_UV_HTTP_TEST_QUERY_URL");
+    const char *query_env = std::getenv("FLUX_HTTP_TEST_QUERY_URL");
     const std::string query_url = (query_env != nullptr && *query_env != '\0')
                                       ? std::string(query_env)
                                       : "http://httpbin.org/get";
 
-    const char *download_env = std::getenv("ASYNC_UV_HTTP_TEST_DOWNLOAD_URL");
+    const char *download_env = std::getenv("FLUX_HTTP_TEST_DOWNLOAD_URL");
     const std::string download_url = (download_env != nullptr && *download_env != '\0')
                                          ? std::string(download_env)
                                          : "http://httpbin.org/range/4096";
 
-    async_uv::Runtime runtime(async_uv::Runtime::build().name("async_uv_http_test"));
+    flux::Runtime runtime(flux::Runtime::build().name("flux_http_test"));
     try {
         runtime.block_on(run_http_checks(
             ok_url, fail_url, json_url, json_get_url, xml_get_url, query_url, download_url));
-    } catch (const async_uv::http::HttpError &error) {
-        if (error.code() == async_uv::http::HttpErrorCode::curl_failure &&
-            is_network_error(error.transport_code())) {
-            std::cerr << "[async_uv_http_test] skip: network unavailable, transport_code="
+    } catch (const flux::http::HttpError &error) {
+        if (error.code() == flux::http::HttpErrorCode::curl_failure &&
+            is_network_error(error)) {
+            std::cerr << "[flux_http_test] skip: network unavailable, transport_code="
                       << error.transport_code() << " message=" << error.what() << '\n';
             return 0;
         }

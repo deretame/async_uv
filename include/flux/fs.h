@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -133,10 +134,66 @@ public:
     static Task<std::uint64_t> remove_all(std::filesystem::path path);
 
     static Task<std::string> current_path();
+    static Task<std::string> current_directory() {
+        co_return co_await current_path();
+    }
     static Task<void> set_current_path(std::filesystem::path path);
     static Task<std::string> temp_directory_path();
+    static Task<std::string> temp_directory() {
+        co_return co_await temp_directory_path();
+    }
     static Task<std::string> create_temporary_directory(std::string pattern);
     static Task<std::string> create_temporary_file(std::string pattern);
+};
+
+enum class OpenFlags : std::uint32_t {
+    none = 0,
+    read_only = 1u << 0,
+    write_only = 1u << 1,
+    read_write = 1u << 2,
+    create = 1u << 3,
+    append = 1u << 4,
+    truncate = 1u << 5,
+};
+
+constexpr OpenFlags operator|(OpenFlags lhs, OpenFlags rhs) noexcept {
+    return static_cast<OpenFlags>(
+        static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
+}
+
+constexpr OpenFlags operator&(OpenFlags lhs, OpenFlags rhs) noexcept {
+    return static_cast<OpenFlags>(
+        static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
+}
+
+constexpr OpenFlags &operator|=(OpenFlags &lhs, OpenFlags rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+class File {
+public:
+    File() = default;
+    ~File();
+
+    File(File &&other) noexcept;
+    File &operator=(File &&other) noexcept;
+
+    File(const File &) = delete;
+    File &operator=(const File &) = delete;
+
+    static Task<File> open(std::filesystem::path path, OpenFlags flags, int mode = 0644);
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] int native_handle() const noexcept;
+
+    Task<std::size_t> write_some(std::string_view data);
+    Task<std::size_t> write_all(std::string_view data);
+    Task<void> close();
+
+private:
+    explicit File(int fd) noexcept : fd_(fd) {}
+    int fd_ = -1;
 };
 
 Task<std::string> read_file(std::filesystem::path path);

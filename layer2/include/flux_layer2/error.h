@@ -1,11 +1,11 @@
 #pragma once
 
-#include "async_uv_http/http.h"
-#include "async_uv_redis/redis.h"
-#include "async_uv_sql/sql.h"
-#include "async_uv_ws/ws.h"
+#include "flux_http/http.h"
+#include "flux_redis/redis.h"
+#include "flux_sql/sql.h"
+#include "flux_ws/ws.h"
 
-namespace async_uv::layer2 {
+namespace flux::layer2 {
 
 enum class ErrorKind {
     invalid_argument,
@@ -77,4 +77,4 @@ inline ErrorKind to_error_kind(const ws::WebSocketError &) {
     return ErrorKind::operation_failed;
 }
 
-} // namespace async_uv::layer2
+} // namespace flux::layer2

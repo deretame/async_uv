@@ -11,7 +11,7 @@ endif()
 FetchContent_Declare(
     stdexec_src
     GIT_REPOSITORY https://github.com/NVIDIA/stdexec.git
-    GIT_TAG bd0d43fbbb8c3fc072f1fba5efea5994dcba7d15
+    GIT_TAG gtc-2026
     GIT_SHALLOW TRUE
     UPDATE_DISCONNECTED TRUE
 )
@@ -85,6 +85,34 @@ if(NOT TARGET flux_asio_headers)
     target_compile_definitions(flux_asio_headers
         INTERFACE
             ASIO_STANDALONE=1)
+endif()
+
+if(NOT TARGET Boost::headers)
+    find_package(Boost QUIET)
+endif()
+
+if(NOT TARGET Boost::headers)
+    if(Boost_FOUND AND Boost_INCLUDE_DIRS)
+        add_library(flux_boost_headers_core INTERFACE)
+        target_include_directories(flux_boost_headers_core INTERFACE ${Boost_INCLUDE_DIRS})
+        target_compile_definitions(
+            flux_boost_headers_core INTERFACE BOOST_ERROR_CODE_HEADER_ONLY=1)
+        add_library(Boost::headers ALIAS flux_boost_headers_core)
+    else()
+        FetchContent_Declare(
+            flux_boost_headers_core_src
+            URL https://archives.boost.io/release/1.87.0/source/boost_1_87_0.tar.gz
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        )
+        FetchContent_MakeAvailable(flux_boost_headers_core_src)
+
+        add_library(flux_boost_headers_core INTERFACE)
+        target_include_directories(
+            flux_boost_headers_core INTERFACE ${flux_boost_headers_core_src_SOURCE_DIR})
+        target_compile_definitions(
+            flux_boost_headers_core INTERFACE BOOST_ERROR_CODE_HEADER_ONLY=1)
+        add_library(Boost::headers ALIAS flux_boost_headers_core)
+    endif()
 endif()
 
 if(FLUX_USE_MIMALLOC)

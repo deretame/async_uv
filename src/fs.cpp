@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <fstream>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -69,6 +70,33 @@ std::string ensure_tmp_pattern(const std::string &pattern, const char *fallback)
 std::string make_tmp_template_path(const std::string &pattern, const char *fallback) {
     const auto tmp_dir = std::filesystem::temp_directory_path();
     return (tmp_dir / ensure_tmp_pattern(pattern, fallback)).string();
+}
+
+bool has_flag(OpenFlags value, OpenFlags flag) {
+    return (value & flag) == flag;
+}
+
+int to_posix_open_flags(OpenFlags flags) {
+    int native = 0;
+
+    if (has_flag(flags, OpenFlags::read_write)) {
+        native |= O_RDWR;
+    } else if (has_flag(flags, OpenFlags::write_only)) {
+        native |= O_WRONLY;
+    } else {
+        native |= O_RDONLY;
+    }
+
+    if (has_flag(flags, OpenFlags::create)) {
+        native |= O_CREAT;
+    }
+    if (has_flag(flags, OpenFlags::append)) {
+        native |= O_APPEND;
+    }
+    if (has_flag(flags, OpenFlags::truncate)) {
+        native |= O_TRUNC;
+    }
+    return native;
 }
 
 } // namespace
@@ -325,6 +353,109 @@ Task<std::string> Fs::create_temporary_file(std::string pattern) {
         }
         ::close(fd);
         return std::string(buffer.data());
+    });
+}
+
+File::~File() {
+    if (fd_ >= 0) {
+        (void)::close(fd_);
+        fd_ = -1;
+    }
+}
+
+File::File(File &&other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+
+File &File::operator=(File &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    if (fd_ >= 0) {
+        (void)::close(fd_);
+    }
+    fd_ = std::exchange(other.fd_, -1);
+    return *this;
+}
+
+Task<File> File::open(std::filesystem::path path, OpenFlags flags, int mode) {
+    const int native_flags = to_posix_open_flags(flags);
+    const int fd = co_await run_blocking([path = std::move(path), native_flags, mode]() {
+        const int value = ::open(path.c_str(), native_flags, mode);
+        if (value < 0) {
+            throw std::system_error(errno, std::generic_category(), "open");
+        }
+        return value;
+    });
+    co_return File(fd);
+}
+
+bool File::valid() const noexcept {
+    return fd_ >= 0;
+}
+
+int File::native_handle() const noexcept {
+    return fd_;
+}
+
+Task<std::size_t> File::write_some(std::string_view data) {
+    if (!valid()) {
+        throw std::runtime_error("flux::File is not open");
+    }
+    if (data.empty()) {
+        co_return 0;
+    }
+
+    const int fd = fd_;
+    const std::size_t written = co_await run_blocking([fd, data]() -> std::size_t {
+        const ssize_t rc = ::write(fd, data.data(), data.size());
+        if (rc < 0) {
+            throw std::system_error(errno, std::generic_category(), "write");
+        }
+        return static_cast<std::size_t>(rc);
+    });
+
+    co_return written;
+}
+
+Task<std::size_t> File::write_all(std::string_view data) {
+    if (!valid()) {
+        throw std::runtime_error("flux::File is not open");
+    }
+
+    const int fd = fd_;
+    const std::size_t written = co_await run_blocking([fd, data]() -> std::size_t {
+        std::size_t total = 0;
+        while (total < data.size()) {
+            const char *ptr = data.data() + total;
+            const std::size_t remain = data.size() - total;
+            const ssize_t rc = ::write(fd, ptr, remain);
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::system_error(errno, std::generic_category(), "write");
+            }
+            if (rc == 0) {
+                break;
+            }
+            total += static_cast<std::size_t>(rc);
+        }
+        return total;
+    });
+
+    co_return written;
+}
+
+Task<void> File::close() {
+    if (!valid()) {
+        co_return;
+    }
+
+    const int fd = std::exchange(fd_, -1);
+    co_await run_blocking([fd] {
+        if (::close(fd) != 0) {
+            throw std::system_error(errno, std::generic_category(), "close");
+        }
     });
 }
 

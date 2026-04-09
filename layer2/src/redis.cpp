@@ -1,135 +1,50 @@
-#include "async_uv_redis/redis.h"
+#include "flux_redis/redis.h"
 
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cctype>
-#include <cstring>
 #include <cstdint>
-#include <limits>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <sys/socket.h>
-#endif
+#include <boost/asio/ssl.hpp>
+#include <boost/redis.hpp>
+#include <boost/redis/src.hpp>
 
-#if ASYNC_UV_REDIS_HAS_HIREDIS && __has_include(<hiredis/hiredis.h>)
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include <hiredis/hiredis.h>
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-#elif ASYNC_UV_REDIS_HAS_HIREDIS && __has_include(<hiredis.h>)
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include <hiredis.h>
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-#elif ASYNC_UV_REDIS_HAS_HIREDIS
-#error "hiredis header not found"
-#endif
+#include <exec/when_any.hpp>
 
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL && __has_include(<hiredis/hiredis_ssl.h>)
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include <hiredis/hiredis_ssl.h>
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-#elif ASYNC_UV_REDIS_HAS_HIREDIS_SSL && __has_include(<hiredis_ssl.h>)
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include <hiredis_ssl.h>
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-#elif ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-#error "hiredis_ssl header not found"
-#endif
+#include "flux/async_semaphore.h"
+#include "flux/runtime.h"
 
-#include "async_uv/cancel.h"
-#include "async_uv/error.h"
-#include "async_uv/fd.h"
-#include "async_uv/runtime.h"
-
-namespace async_uv::redis {
+namespace flux::redis {
 namespace {
+
+namespace ssl = boost::asio::ssl;
 
 class OperationGuard {
 public:
     explicit OperationGuard(std::atomic_bool &flag) : flag_(flag) {
         bool expected = false;
-        if (!flag_.compare_exchange_strong(expected, true)) {
+        if (!flag_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             throw RedisError("redis client is busy with another operation",
                              RedisErrorKind::internal_error);
         }
     }
 
     ~OperationGuard() {
-        flag_.store(false);
+        flag_.store(false, std::memory_order_release);
     }
 
 private:
     std::atomic_bool &flag_;
 };
-
-Task<void> safe_stop_watcher(FdWatcher &watcher) {
-    try {
-        co_await watcher.stop();
-    } catch (...) {
-    }
-    co_return;
-}
-
-Task<void>
-wait_fd_ready(uv_os_sock_t fd, bool readable, bool writable, std::optional<int> timeout_ms) {
-    if (fd < 0) {
-        throw RedisError("invalid redis socket fd", RedisErrorKind::internal_error);
-    }
-
-    int events = 0;
-    if (readable) {
-        events |= UV_READABLE;
-    }
-    if (writable) {
-        events |= UV_WRITABLE;
-    }
-    if (events == 0) {
-        co_return;
-    }
-
-    auto watcher = co_await FdWatcher::watch(fd, events);
-    std::optional<FdEvent> event;
-
-    if (timeout_ms.has_value()) {
-        event = co_await watcher.next_for(std::chrono::milliseconds(*timeout_ms));
-    } else {
-        event = co_await watcher.next();
-    }
-
-    co_await safe_stop_watcher(watcher);
-
-    if (!event.has_value()) {
-        throw RedisError("redis socket wait timeout", RedisErrorKind::command_failed);
-    }
-    if (!event->ok()) {
-        throw RedisError("redis socket wait returned error", RedisErrorKind::command_failed);
-    }
-}
 
 std::optional<int> choose_timeout_ms(const ConnectionOptions &connection_options,
                                      const CommandOptions &command_options) {
@@ -192,6 +107,7 @@ std::vector<std::string> split_command(std::string_view input) {
     if (out.empty()) {
         throw RedisError("redis command cannot be empty", RedisErrorKind::invalid_argument);
     }
+
     return out;
 }
 
@@ -214,85 +130,252 @@ std::vector<std::string> materialize_args(std::string_view command,
         throw RedisError("redis parameter count does not match placeholders",
                          RedisErrorKind::invalid_argument);
     }
+
     return tokens;
 }
 
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-redisSSLContext *create_ssl_context(const ConnectionOptions &options) {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        (void)redisInitOpenSSL();
-    });
-
-    redisSSLOptions ssl_options{};
-    ssl_options.cacert_filename =
-        options.tls_ca_cert_file.empty() ? nullptr : options.tls_ca_cert_file.c_str();
-    ssl_options.capath =
-        options.tls_ca_cert_dir.empty() ? nullptr : options.tls_ca_cert_dir.c_str();
-    ssl_options.cert_filename =
-        options.tls_cert_file.empty() ? nullptr : options.tls_cert_file.c_str();
-    ssl_options.private_key_filename =
-        options.tls_key_file.empty() ? nullptr : options.tls_key_file.c_str();
-    ssl_options.server_name =
-        options.tls_server_name.empty() ? nullptr : options.tls_server_name.c_str();
-    ssl_options.verify_mode =
-        options.tls_verify_peer ? REDIS_SSL_VERIFY_PEER : REDIS_SSL_VERIFY_NONE;
-
-    redisSSLContextError error = REDIS_SSL_CTX_NONE;
-    redisSSLContext *ctx = redisCreateSSLContextWithOptions(&ssl_options, &error);
-    if (ctx == nullptr) {
-        throw RedisError(std::string("redis tls context create failed: ") +
-                             redisSSLContextGetError(error),
-                         RedisErrorKind::connect_failed);
+std::int64_t parse_i64(std::string_view text) {
+    if (text.empty()) {
+        return 0;
     }
-    return ctx;
-}
-#endif
 
-#if ASYNC_UV_REDIS_HAS_HIREDIS
-Reply from_raw_reply(const redisReply *reply) {
+    bool neg = false;
+    std::size_t i = 0;
+    if (text.front() == '-') {
+        neg = true;
+        i = 1;
+    }
+
+    std::int64_t value = 0;
+    for (; i < text.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (!std::isdigit(ch)) {
+            return 0;
+        }
+        value = value * 10 + static_cast<std::int64_t>(ch - '0');
+    }
+
+    return neg ? -value : value;
+}
+
+Reply parse_resp_node(const std::vector<boost::redis::resp3::node> &nodes, std::size_t &index) {
     Reply out;
-    if (reply == nullptr) {
+    if (index >= nodes.size()) {
         out.type = Reply::Type::null_value;
         return out;
     }
 
-    switch (reply->type) {
-        case REDIS_REPLY_STRING:
-            out.type = Reply::Type::string;
-            out.string =
-                reply->str == nullptr ? std::string() : std::string(reply->str, reply->len);
-            return out;
-        case REDIS_REPLY_STATUS:
-            out.type = Reply::Type::status;
-            out.string =
-                reply->str == nullptr ? std::string() : std::string(reply->str, reply->len);
-            return out;
-        case REDIS_REPLY_ERROR:
-            out.type = Reply::Type::error;
-            out.string =
-                reply->str == nullptr ? std::string() : std::string(reply->str, reply->len);
-            return out;
-        case REDIS_REPLY_INTEGER:
-            out.type = Reply::Type::integer;
-            out.integer = reply->integer;
-            return out;
-        case REDIS_REPLY_NIL:
+    const auto &node = nodes[index++];
+    using Type = boost::redis::resp3::type;
+
+    switch (node.data_type) {
+        case Type::null:
             out.type = Reply::Type::null_value;
             return out;
-        case REDIS_REPLY_ARRAY:
+
+        case Type::simple_string:
+            out.type = Reply::Type::status;
+            out.string = node.value;
+            return out;
+
+        case Type::blob_string:
+        case Type::verbatim_string:
+        case Type::big_number:
+        case Type::streamed_string:
+        case Type::streamed_string_part:
+            out.type = Reply::Type::string;
+            out.string = node.value;
+            return out;
+
+        case Type::simple_error:
+        case Type::blob_error:
+            out.type = Reply::Type::error;
+            out.string = node.value;
+            return out;
+
+        case Type::number:
+            out.type = Reply::Type::integer;
+            out.integer = parse_i64(node.value);
+            return out;
+
+        case Type::boolean:
+            out.type = Reply::Type::integer;
+            out.integer = (node.value == "t" || node.value == "true" || node.value == "1") ? 1
+                                                                                               : 0;
+            return out;
+
+        case Type::doublean:
+            out.type = Reply::Type::string;
+            out.string = node.value;
+            return out;
+
+        case Type::array:
+        case Type::push:
+        case Type::set:
+        case Type::map:
+        case Type::attribute: {
             out.type = Reply::Type::array;
-            out.elements.reserve(reply->elements);
-            for (size_t i = 0; i < reply->elements; ++i) {
-                out.elements.push_back(from_raw_reply(reply->element[i]));
+            const std::size_t multiplier = boost::redis::resp3::element_multiplicity(node.data_type);
+            const std::size_t children = node.aggregate_size * multiplier;
+            out.elements.reserve(children);
+            for (std::size_t i = 0; i < children; ++i) {
+                out.elements.push_back(parse_resp_node(nodes, index));
             }
             return out;
-        default:
+        }
+
+        case Type::invalid:
             out.type = Reply::Type::null_value;
             return out;
     }
+
+    out.type = Reply::Type::null_value;
+    return out;
 }
-#endif
+
+Reply convert_response(const boost::redis::generic_response &response) {
+    if (!response.has_value()) {
+        const auto &err = response.error();
+        throw RedisError(err.diagnostic.empty() ? "redis command failed" : err.diagnostic,
+                         RedisErrorKind::command_failed);
+    }
+
+    const auto &nodes = response.value();
+    if (nodes.empty()) {
+        Reply out;
+        out.type = Reply::Type::null_value;
+        return out;
+    }
+
+    std::size_t index = 0;
+    return parse_resp_node(nodes, index);
+}
+
+boost::redis::config make_redis_config(const ConnectionOptions &options) {
+    boost::redis::config cfg;
+    cfg.use_ssl = options.tls_enabled;
+    cfg.addr.host = options.host.empty() ? "127.0.0.1" : options.host;
+    cfg.addr.port = std::to_string(options.port > 0 ? options.port : 6379);
+    cfg.username = options.user.empty() ? "default" : options.user;
+    cfg.password = options.password;
+    cfg.database_index = options.db;
+    if (options.connect_timeout_ms > 0) {
+        cfg.resolve_timeout = std::chrono::milliseconds(options.connect_timeout_ms);
+        cfg.connect_timeout = std::chrono::milliseconds(options.connect_timeout_ms);
+        cfg.ssl_handshake_timeout = std::chrono::milliseconds(options.connect_timeout_ms);
+    }
+    return cfg;
+}
+
+ssl::context make_tls_context(const ConnectionOptions &options) {
+    ssl::context ctx(ssl::context::tls_client);
+    boost::system::error_code ec;
+
+    if (options.tls_verify_peer) {
+        ctx.set_verify_mode(ssl::verify_peer, ec);
+        if (ec) {
+            throw RedisError("redis tls verify mode failed: " + ec.message(),
+                             RedisErrorKind::connect_failed);
+        }
+
+        if (!options.tls_ca_cert_file.empty()) {
+            ctx.load_verify_file(options.tls_ca_cert_file, ec);
+            if (ec) {
+                throw RedisError("redis tls load ca file failed: " + ec.message(),
+                                 RedisErrorKind::connect_failed);
+            }
+        } else {
+            ctx.set_default_verify_paths(ec);
+            if (ec) {
+                throw RedisError("redis tls default verify paths failed: " + ec.message(),
+                                 RedisErrorKind::connect_failed);
+            }
+        }
+    } else {
+        ctx.set_verify_mode(ssl::verify_none, ec);
+        if (ec) {
+            throw RedisError("redis tls disable verify failed: " + ec.message(),
+                             RedisErrorKind::connect_failed);
+        }
+    }
+
+    if (!options.tls_cert_file.empty() && !options.tls_key_file.empty()) {
+        ctx.use_certificate_chain_file(options.tls_cert_file, ec);
+        if (ec) {
+            throw RedisError("redis tls load cert file failed: " + ec.message(),
+                             RedisErrorKind::connect_failed);
+        }
+
+        ctx.use_private_key_file(options.tls_key_file, ssl::context::pem, ec);
+        if (ec) {
+            throw RedisError("redis tls load key file failed: " + ec.message(),
+                             RedisErrorKind::connect_failed);
+        }
+    }
+
+    return ctx;
+}
+
+template <typename StartFn>
+class RedisExecSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(boost::system::error_code, std::size_t),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+    explicit RedisExecSender(StartFn start) : start_(std::move(start)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const RedisExecSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+private:
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        StartFn start;
+        Receiver receiver;
+
+        void start_impl() noexcept {
+            try {
+                start([this](boost::system::error_code ec, std::size_t transferred) mutable noexcept {
+                    stdexec::set_value(std::move(receiver), ec, transferred);
+                });
+            } catch (...) {
+                stdexec::set_error(std::move(receiver), std::current_exception());
+            }
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start_impl();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, RedisExecSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(self.start_), std::move(receiver)};
+    }
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const RedisExecSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {self.start_, std::move(receiver)};
+    }
+
+    StartFn start_;
+};
+
+template <typename StartFn>
+auto make_redis_exec_sender(StartFn &&start) {
+    return RedisExecSender<std::remove_cvref_t<StartFn>>(std::forward<StartFn>(start));
+}
 
 } // namespace
 
@@ -486,587 +569,453 @@ ConnectionPoolOptions ConnectionPoolOptions::Builder::build() const {
     return out;
 }
 
+class CurrentRuntimeSender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures =
+        stdexec::completion_signatures<stdexec::set_value_t(Runtime *),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+
+    explicit CurrentRuntimeSender(std::string message) : message_(std::move(message)) {}
+
+    template <class Env>
+    friend auto tag_invoke(stdexec::get_completion_signatures_t,
+                           const CurrentRuntimeSender &,
+                           Env &&) noexcept -> completion_signatures {
+        return {};
+    }
+
+private:
+    template <stdexec::receiver Receiver>
+    struct Operation {
+        using operation_state_concept = stdexec::operation_state_t;
+
+        Receiver receiver;
+        std::string message;
+
+        void start() noexcept {
+            try {
+                Runtime *runtime = nullptr;
+                auto env = stdexec::get_env(receiver);
+                if constexpr (requires { flux::execution::get_runtime(env); }) {
+                    runtime = flux::execution::get_runtime(env);
+                }
+                if (runtime == nullptr) {
+                    runtime = Runtime::current();
+                }
+                if (runtime == nullptr) {
+                    throw RedisError(message, RedisErrorKind::runtime_missing);
+                }
+                stdexec::set_value(std::move(receiver), runtime);
+            } catch (...) {
+                stdexec::set_error(std::move(receiver), std::current_exception());
+            }
+        }
+
+        friend void tag_invoke(stdexec::start_t, Operation &self) noexcept {
+            self.start();
+        }
+    };
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, CurrentRuntimeSender &&self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(receiver), std::move(self.message_)};
+    }
+
+    template <stdexec::receiver Receiver>
+    friend auto tag_invoke(stdexec::connect_t, const CurrentRuntimeSender &self, Receiver receiver)
+        -> Operation<std::remove_cvref_t<Receiver>> {
+        return {std::move(receiver), self.message_};
+    }
+
+    std::string message_;
+};
+
+CurrentRuntimeSender current_runtime_sender(std::string message) {
+    return CurrentRuntimeSender(std::move(message));
+}
+
 class Client::Impl {
 public:
-#if ASYNC_UV_REDIS_HAS_HIREDIS
-    Reply command_blocking(const std::vector<std::string> &args) {
-        if (redis_ == nullptr) {
-            throw RedisError("redis connection is not open", RedisErrorKind::not_connected);
+    void close_async_state() noexcept {
+        open_.store(false, std::memory_order_release);
+        if (conn_) {
+            try {
+                conn_->cancel(boost::redis::operation::all);
+            } catch (...) {
+            }
         }
-
-        std::vector<const char *> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(args.size());
-        argvlen.reserve(args.size());
-        for (const auto &arg : args) {
-            argv.push_back(arg.c_str());
-            argvlen.push_back(arg.size());
-        }
-
-        redisReply *reply = reinterpret_cast<redisReply *>(
-            redisCommandArgv(redis_, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
-        if (reply == nullptr) {
-            throw RedisError(redis_->errstr[0] == '\0' ? "redis command failed"
-                                                       : std::string(redis_->errstr),
-                             RedisErrorKind::command_failed);
-        }
-
-        Reply out = from_raw_reply(reply);
-        freeReplyObject(reply);
-        if (out.type == Reply::Type::error) {
-            throw RedisError(out.string.value_or("redis command failed"),
-                             RedisErrorKind::command_failed);
-        }
-        return out;
+        conn_.reset();
+        runtime_ = nullptr;
     }
 
-    Task<void> write_output(std::optional<int> timeout_ms) {
-        if (redis_ == nullptr) {
-            throw RedisError("redis connection is not open", RedisErrorKind::not_connected);
+    void start_run_loop(const ConnectionOptions &options) {
+        if (!conn_) {
+            return;
         }
-
-        int done = 0;
-        while (done == 0) {
-            if (redisBufferWrite(redis_, &done) == REDIS_ERR) {
-                throw RedisError(redis_->errstr[0] == '\0' ? "redis write failed"
-                                                           : std::string(redis_->errstr),
-                                 RedisErrorKind::command_failed);
-            }
-            if (done == 0) {
-                co_await wait_fd_ready(
-                    static_cast<uv_os_sock_t>(redis_->fd), false, true, timeout_ms);
-            }
-        }
-        co_return;
+        const auto cfg = make_redis_config(options);
+        conn_->async_run(cfg, boost::redis::logger{}, [](boost::system::error_code) {});
     }
 
-    Task<redisReply *> read_reply(std::optional<int> timeout_ms) {
-        if (redis_ == nullptr) {
+    ReplySender execute_sender(std::vector<std::string> args,
+                               std::optional<int> timeout_ms,
+                               Runtime *runtime) {
+        auto conn = conn_;
+        if (!open_.load(std::memory_order_acquire) || !conn) {
             throw RedisError("redis connection is not open", RedisErrorKind::not_connected);
         }
-
-        while (true) {
-            void *reply = nullptr;
-            if (redisGetReplyFromReader(redis_, &reply) == REDIS_ERR) {
-                throw RedisError(redis_->errstr[0] == '\0' ? "redis read failed"
-                                                           : std::string(redis_->errstr),
-                                 RedisErrorKind::command_failed);
-            }
-            if (reply != nullptr) {
-                co_return reinterpret_cast<redisReply *>(reply);
-            }
-
-            co_await wait_fd_ready(static_cast<uv_os_sock_t>(redis_->fd), true, false, timeout_ms);
-            if (redisBufferRead(redis_) == REDIS_ERR) {
-                throw RedisError(redis_->errstr[0] == '\0' ? "redis socket read failed"
-                                                           : std::string(redis_->errstr),
-                                 RedisErrorKind::command_failed);
-            }
+        if (args.empty()) {
+            throw RedisError("redis command cannot be empty", RedisErrorKind::invalid_argument);
         }
+
+        auto request = std::make_shared<boost::redis::request>();
+        if (args.size() == 1) {
+            request->push(args.front());
+        } else {
+            std::vector<std::string> rest(args.begin() + 1, args.end());
+            request->push_range(args.front(), rest);
+        }
+
+        auto response = std::make_shared<boost::redis::generic_response>();
+        auto execute = make_redis_exec_sender(
+                           [conn, request, response](auto handler) mutable {
+                               conn->async_exec(*request, *response, std::move(handler));
+                           })
+                     | stdexec::then([response](boost::system::error_code ec, std::size_t) {
+                           if (ec) {
+                               throw RedisError("redis command failed: " + ec.message(),
+                                                RedisErrorKind::command_failed);
+                           }
+                           Reply out = convert_response(*response);
+                           if (out.type == Reply::Type::error) {
+                               throw RedisError(out.string.value_or("redis command failed"),
+                                                RedisErrorKind::command_failed);
+                           }
+                           return out;
+                       });
+
+        if (!timeout_ms.has_value()) {
+            return execute;
+        }
+        if (runtime == nullptr) {
+            throw RedisError("redis::Client::command requires current runtime",
+                             RedisErrorKind::runtime_missing);
+        }
+
+        auto timer = std::make_shared<exec::asio::asio_impl::steady_timer>(runtime->executor());
+        timer->expires_after(std::chrono::milliseconds(std::max(0, *timeout_ms)));
+
+        auto execute_optional =
+            std::move(execute)
+          | stdexec::then([](Reply reply) { return std::optional<Reply>(std::move(reply)); });
+        auto timeout_optional = timer->async_wait(exec::asio::use_sender)
+                              | stdexec::then([timer, conn]() {
+                                    conn->cancel(boost::redis::operation::exec);
+                                    return std::optional<Reply>{};
+                                });
+        return exec::when_any(std::move(execute_optional), std::move(timeout_optional))
+             | stdexec::then([](std::optional<Reply> maybe_reply) {
+                   if (!maybe_reply.has_value()) {
+                       throw RedisError("redis command timeout", RedisErrorKind::command_failed);
+                   }
+                   return std::move(*maybe_reply);
+               });
     }
-
-    Task<Reply> command_async(const std::vector<std::string> &args, std::optional<int> timeout_ms) {
-        if (redis_ == nullptr) {
-            throw RedisError("redis connection is not open", RedisErrorKind::not_connected);
-        }
-
-        std::vector<const char *> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(args.size());
-        argvlen.reserve(args.size());
-        for (const auto &arg : args) {
-            argv.push_back(arg.c_str());
-            argvlen.push_back(arg.size());
-        }
-
-        if (redisAppendCommandArgv(
-                redis_, static_cast<int>(argv.size()), argv.data(), argvlen.data()) != REDIS_OK) {
-            throw RedisError(redis_->errstr[0] == '\0' ? "redis append command failed"
-                                                       : std::string(redis_->errstr),
-                             RedisErrorKind::command_failed);
-        }
-
-        co_await write_output(timeout_ms);
-        redisReply *reply = co_await read_reply(timeout_ms);
-        Reply out = from_raw_reply(reply);
-        freeReplyObject(reply);
-
-        if (out.type == Reply::Type::error) {
-            throw RedisError(out.string.value_or("redis command failed"),
-                             RedisErrorKind::command_failed);
-        }
-        co_return out;
-    }
-#endif
 
     ConnectionOptions options_{};
     std::atomic_bool busy_{false};
-    std::mutex blocking_mutex_;
-#if ASYNC_UV_REDIS_HAS_HIREDIS
-    redisContext *redis_ = nullptr;
-    bool tls_mode_ = false;
-#endif
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-    redisSSLContext *redis_ssl_ctx_ = nullptr;
-#endif
+    std::atomic_bool open_{false};
+    Runtime *runtime_ = nullptr;
+    std::shared_ptr<boost::redis::connection> conn_;
 };
 
 Client::Client() : impl_(std::make_unique<Impl>()) {}
 
 Client::~Client() {
-    if (!impl_) {
-        return;
+    if (impl_) {
+        impl_->close_async_state();
     }
-#if ASYNC_UV_REDIS_HAS_HIREDIS
-    if (impl_->redis_ != nullptr) {
-        redisFree(impl_->redis_);
-        impl_->redis_ = nullptr;
-    }
-#endif
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-    if (impl_->redis_ssl_ctx_ != nullptr) {
-        redisFreeSSLContext(impl_->redis_ssl_ctx_);
-        impl_->redis_ssl_ctx_ = nullptr;
-    }
-#endif
 }
 
 Client::Client(Client &&) noexcept = default;
 
 Client &Client::operator=(Client &&) noexcept = default;
 
-Task<void> Client::open(ConnectionOptions options) {
-#if !ASYNC_UV_REDIS_HAS_HIREDIS
-    (void)options;
-    throw RedisError("redis driver is not enabled", RedisErrorKind::invalid_argument);
-#else
-    auto *runtime = co_await async_uv::get_current_runtime();
-    if (runtime == nullptr) {
-        throw RedisError("redis::Client::open requires current runtime",
-                         RedisErrorKind::runtime_missing);
-    }
-    (void)runtime;
+VoidSender Client::open_task(ConnectionOptions options) {
+    auto guard = std::make_shared<OperationGuard>(impl_->busy_);
+    auto options_state = std::make_shared<ConnectionOptions>(std::move(options));
 
-    OperationGuard guard(impl_->busy_);
+    return current_runtime_sender("redis::Client::open requires current runtime")
+         | stdexec::let_value([this, guard, options_state](Runtime *runtime) -> VoidSender {
+               return stdexec::just()
+                    | stdexec::then([this, runtime, options_state] {
+                          impl_->close_async_state();
+                          impl_->runtime_ = runtime;
 
-    if (impl_->redis_ != nullptr) {
-        redisFree(impl_->redis_);
-        impl_->redis_ = nullptr;
-    }
-
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-    if (impl_->redis_ssl_ctx_ != nullptr) {
-        redisFreeSSLContext(impl_->redis_ssl_ctx_);
-        impl_->redis_ssl_ctx_ = nullptr;
-    }
-#endif
-    impl_->tls_mode_ = false;
-
-    if (options.tls_enabled) {
-        impl_->redis_ = redisConnect(options.host.c_str(), options.port);
-    } else {
-        impl_->redis_ = redisConnectNonBlock(options.host.c_str(), options.port);
-    }
-    if (impl_->redis_ == nullptr) {
-        throw RedisError("redis connect failed", RedisErrorKind::connect_failed);
-    }
-    if (impl_->redis_->err != 0) {
-        const std::string message = impl_->redis_->errstr[0] == '\0'
-                                        ? "redis connect failed"
-                                        : std::string(impl_->redis_->errstr);
-        redisFree(impl_->redis_);
-        impl_->redis_ = nullptr;
-        throw RedisError(message, RedisErrorKind::connect_failed);
-    }
-
-    if (options.tls_enabled) {
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-        impl_->redis_ssl_ctx_ = create_ssl_context(options);
-        if (redisInitiateSSLWithContext(impl_->redis_, impl_->redis_ssl_ctx_) != REDIS_OK) {
-            const std::string message = impl_->redis_->errstr[0] == '\0'
-                                            ? "redis tls handshake init failed"
-                                            : std::string(impl_->redis_->errstr);
-            redisFree(impl_->redis_);
-            impl_->redis_ = nullptr;
-            redisFreeSSLContext(impl_->redis_ssl_ctx_);
-            impl_->redis_ssl_ctx_ = nullptr;
-            throw RedisError(message, RedisErrorKind::connect_failed);
-        }
-#else
-        redisFree(impl_->redis_);
-        impl_->redis_ = nullptr;
-        throw RedisError("redis tls requested but hiredis ssl is not enabled",
-                         RedisErrorKind::invalid_argument);
-#endif
-        impl_->tls_mode_ = true;
-    } else {
-        impl_->tls_mode_ = false;
-    }
-
-    const std::optional<int> timeout_ms = options.connect_timeout_ms > 0
-                                              ? std::optional<int>(options.connect_timeout_ms)
-                                              : std::nullopt;
-
-    auto run = [this, runtime, timeout_ms, options]() -> Task<void> {
-        if (impl_->tls_mode_) {
-            auto error = std::make_shared<std::exception_ptr>();
-            co_await runtime->spawn_blocking([this, options, error]() {
-                try {
-                    std::lock_guard<std::mutex> lock(impl_->blocking_mutex_);
-                    (void)impl_->command_blocking({"PING"});
-                    if (!options.password.empty()) {
-                        if (options.user.empty()) {
-                            (void)impl_->command_blocking({"AUTH", options.password});
-                        } else {
-                            (void)impl_->command_blocking({"AUTH", options.user, options.password});
-                        }
-                    }
-                    if (options.db > 0) {
-                        (void)impl_->command_blocking({"SELECT", std::to_string(options.db)});
-                    }
-                } catch (...) {
-                    *error = std::current_exception();
-                }
-            });
-            if (*error) {
-                std::rethrow_exception(*error);
-            }
-            co_return;
-        }
-
-        (void)co_await impl_->command_async({"PING"}, timeout_ms);
-        if (!options.password.empty()) {
-            if (options.user.empty()) {
-                (void)co_await impl_->command_async({"AUTH", options.password}, timeout_ms);
-            } else {
-                (void)co_await impl_->command_async({"AUTH", options.user, options.password},
-                                                    timeout_ms);
-            }
-        }
-        if (options.db > 0) {
-            (void)co_await impl_->command_async({"SELECT", std::to_string(options.db)}, timeout_ms);
-        }
-        co_return;
-    };
-
-    try {
-        if (timeout_ms.has_value()) {
-            co_await async_uv::with_timeout(std::chrono::milliseconds(*timeout_ms), run());
-        } else {
-            co_await run();
-        }
-    } catch (const async_uv::Error &e) {
-        if (e.code() == UV_ETIMEDOUT) {
-            redisFree(impl_->redis_);
-            impl_->redis_ = nullptr;
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-            if (impl_->redis_ssl_ctx_ != nullptr) {
-                redisFreeSSLContext(impl_->redis_ssl_ctx_);
-                impl_->redis_ssl_ctx_ = nullptr;
-            }
-#endif
-            throw RedisError("redis connect timeout", RedisErrorKind::connect_failed);
-        }
-        throw;
-    } catch (...) {
-        redisFree(impl_->redis_);
-        impl_->redis_ = nullptr;
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-        if (impl_->redis_ssl_ctx_ != nullptr) {
-            redisFreeSSLContext(impl_->redis_ssl_ctx_);
-            impl_->redis_ssl_ctx_ = nullptr;
-        }
-#endif
-        throw;
-    }
-
-    impl_->options_ = std::move(options);
-    co_return;
-#endif
+                          ssl::context tls_ctx = options_state->tls_enabled
+                                                   ? make_tls_context(*options_state)
+                                                   : ssl::context(ssl::context::tls_client);
+                          impl_->conn_ = std::make_shared<boost::redis::connection>(
+                              runtime->io_context().get_executor(), std::move(tls_ctx));
+                          impl_->options_ = *options_state;
+                          impl_->open_.store(true, std::memory_order_release);
+                          impl_->start_run_loop(*options_state);
+                      })
+                    | stdexec::let_value([this, runtime, options_state] -> ReplySender {
+                          std::optional<int> timeout_ms;
+                          if (options_state->connect_timeout_ms > 0) {
+                              timeout_ms = options_state->connect_timeout_ms;
+                          }
+                          return impl_->execute_sender({"PING"}, timeout_ms, runtime);
+                      })
+                    | stdexec::then([](Reply) {})
+                    | stdexec::let_error([this](std::exception_ptr error) -> VoidSender {
+                          impl_->close_async_state();
+                          return stdexec::just() | stdexec::then([error] {
+                                     std::rethrow_exception(error);
+                                 });
+                      });
+           });
 }
 
-Task<void> Client::close() {
-    auto *runtime = co_await async_uv::get_current_runtime();
-    if (runtime == nullptr) {
-        throw RedisError("redis::Client::close requires current runtime",
-                         RedisErrorKind::runtime_missing);
-    }
-    (void)runtime;
-
-    OperationGuard guard(impl_->busy_);
-#if ASYNC_UV_REDIS_HAS_HIREDIS
-    if (impl_->redis_ != nullptr) {
-        redisFree(impl_->redis_);
-        impl_->redis_ = nullptr;
-    }
-    impl_->tls_mode_ = false;
-#endif
-#if ASYNC_UV_REDIS_HAS_HIREDIS_SSL
-    if (impl_->redis_ssl_ctx_ != nullptr) {
-        redisFreeSSLContext(impl_->redis_ssl_ctx_);
-        impl_->redis_ssl_ctx_ = nullptr;
-    }
-#endif
-    co_return;
+VoidSender Client::close_task() {
+    auto guard = std::make_shared<OperationGuard>(impl_->busy_);
+    return stdexec::just() | stdexec::then([this, guard] { impl_->close_async_state(); });
 }
 
-Task<bool> Client::is_open() const {
-#if ASYNC_UV_REDIS_HAS_HIREDIS
-    co_return impl_ != nullptr && impl_->redis_ != nullptr;
-#else
-    co_return false;
-#endif
+BoolSender Client::is_open_task() const {
+    return stdexec::just(impl_ != nullptr && impl_->open_.load(std::memory_order_acquire));
 }
 
-Task<Reply> Client::command(std::string command_text) {
-    co_return co_await command(std::move(command_text), {}, CommandOptions{});
+ReplySender Client::command_task(std::string command_text) {
+    return command_task(std::move(command_text), {}, CommandOptions{});
 }
 
-Task<Reply> Client::command(std::string command_text, std::vector<RedisParam> params) {
-    co_return co_await command(std::move(command_text), std::move(params), CommandOptions{});
+ReplySender Client::command_task(std::string command_text, std::vector<RedisParam> params) {
+    return command_task(std::move(command_text), std::move(params), CommandOptions{});
 }
 
-Task<Reply>
-Client::command(std::string command_text, std::vector<RedisParam> params, CommandOptions options) {
-#if !ASYNC_UV_REDIS_HAS_HIREDIS
-    (void)command_text;
-    (void)params;
-    (void)options;
-    throw RedisError("redis driver is not enabled", RedisErrorKind::invalid_argument);
-#else
-    auto *runtime = co_await async_uv::get_current_runtime();
-    if (runtime == nullptr) {
-        throw RedisError("redis::Client::command requires current runtime",
-                         RedisErrorKind::runtime_missing);
-    }
-    (void)runtime;
-
-    OperationGuard guard(impl_->busy_);
+ReplySender Client::command_task(std::string command_text,
+                                 std::vector<RedisParam> params,
+                                 CommandOptions options) {
+    auto guard = std::make_shared<OperationGuard>(impl_->busy_);
     const auto started = std::chrono::steady_clock::now();
-    async_uv::emit_trace_event({"layer2_redis", "command_start", 0, params.size()});
-    if (impl_->redis_ == nullptr) {
-        throw RedisError("redis connection is not open", RedisErrorKind::not_connected);
-    }
+    flux::emit_trace_event({"layer2_redis", "command_start", 0, params.size()});
 
-    const auto args = materialize_args(command_text, params);
-    const auto timeout_ms = choose_timeout_ms(impl_->options_, options);
-
-    if (impl_->tls_mode_) {
-        auto run_blocking = [this, runtime, args]() -> Task<Reply> {
-            auto error = std::make_shared<std::exception_ptr>();
-            auto result = std::make_shared<Reply>();
-            co_await runtime->spawn_blocking([this, args, error, result]() {
-                try {
-                    std::lock_guard<std::mutex> lock(impl_->blocking_mutex_);
-                    *result = impl_->command_blocking(args);
-                } catch (...) {
-                    *error = std::current_exception();
-                }
-            });
-            if (*error) {
-                std::rethrow_exception(*error);
-            }
-            co_return *result;
-        };
-
-        try {
-            if (timeout_ms.has_value()) {
-                auto out = co_await async_uv::with_timeout(std::chrono::milliseconds(*timeout_ms),
-                                                           run_blocking());
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started);
-                async_uv::emit_trace_event(
-                    {"layer2_redis", "command_done", 0, static_cast<std::size_t>(elapsed.count())});
-                co_return out;
-            }
-            auto out = co_await run_blocking();
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started);
-            async_uv::emit_trace_event(
-                {"layer2_redis", "command_done", 0, static_cast<std::size_t>(elapsed.count())});
-            co_return out;
-        } catch (const async_uv::Error &e) {
-            if (e.code() == UV_ETIMEDOUT) {
-                throw RedisError("redis command timeout", RedisErrorKind::command_failed);
-            }
-            throw;
-        }
-    }
-
-    auto run = [this, args, timeout_ms]() -> Task<Reply> {
-        co_return co_await impl_->command_async(args, timeout_ms);
-    };
-
-    try {
-        if (timeout_ms.has_value()) {
-            auto out =
-                co_await async_uv::with_timeout(std::chrono::milliseconds(*timeout_ms), run());
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started);
-            async_uv::emit_trace_event(
-                {"layer2_redis", "command_done", 0, static_cast<std::size_t>(elapsed.count())});
-            co_return out;
-        }
-        auto out = co_await run();
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started);
-        async_uv::emit_trace_event(
-            {"layer2_redis", "command_done", 0, static_cast<std::size_t>(elapsed.count())});
-        co_return out;
-    } catch (const async_uv::Error &e) {
-        if (e.code() == UV_ETIMEDOUT) {
-            throw RedisError("redis command timeout", RedisErrorKind::command_failed);
-        }
-        throw;
-    }
-#endif
+    return current_runtime_sender("redis::Client::command requires current runtime")
+         | stdexec::let_value([this,
+                               guard,
+                               command_text = std::move(command_text),
+                               params = std::move(params),
+                               options](Runtime *runtime) mutable -> ReplySender {
+               const auto args = materialize_args(command_text, params);
+               const auto timeout_ms = choose_timeout_ms(impl_->options_, options);
+               return impl_->execute_sender(std::move(args), timeout_ms, runtime);
+           })
+         | stdexec::then([started, guard](Reply out) {
+               const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - started);
+               flux::emit_trace_event(
+                   {"layer2_redis", "command_done", 0, static_cast<std::size_t>(elapsed.count())});
+               return out;
+           })
+         | stdexec::upon_error([started, guard](std::exception_ptr error) -> Reply {
+               const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - started);
+               flux::emit_trace_event(
+                   {"layer2_redis", "command_done", 0, static_cast<std::size_t>(elapsed.count())});
+               std::rethrow_exception(error);
+           });
 }
 
-Task<Reply> Client::execute(std::string command_text) {
-    co_return co_await command(std::move(command_text), {}, CommandOptions{});
+ReplySender detail::command_task(ConnectionOptions options, std::string command_text) {
+    return detail::command_task(std::move(options), std::move(command_text), {}, CommandOptions{});
 }
 
-Task<Reply> Client::execute(std::string command_text, std::vector<RedisParam> params) {
-    co_return co_await command(std::move(command_text), std::move(params), CommandOptions{});
-}
-
-Task<Reply>
-Client::execute(std::string command_text, std::vector<RedisParam> params, CommandOptions options) {
-    co_return co_await command(std::move(command_text), std::move(params), std::move(options));
-}
-
-Task<Reply> command(ConnectionOptions options, std::string command_text) {
-    co_return co_await command(std::move(options), std::move(command_text), {}, CommandOptions{});
-}
-
-Task<Reply>
-command(ConnectionOptions options, std::string command_text, std::vector<RedisParam> params) {
-    co_return co_await command(
+ReplySender detail::command_task(ConnectionOptions options,
+                                 std::string command_text,
+                                 std::vector<RedisParam> params) {
+    return detail::command_task(
         std::move(options), std::move(command_text), std::move(params), CommandOptions{});
 }
 
-Task<Reply> command(ConnectionOptions options,
-                    std::string command_text,
-                    std::vector<RedisParam> params,
-                    CommandOptions command_options) {
-    Client client;
-    co_await client.open(std::move(options));
-
-    std::exception_ptr error;
-    Reply result;
-    try {
-        result = co_await client.command(
-            std::move(command_text), std::move(params), std::move(command_options));
-    } catch (...) {
-        error = std::current_exception();
-    }
-
-    try {
-        co_await client.close();
-    } catch (...) {
-    }
-
-    if (error) {
-        std::rethrow_exception(error);
-    }
-    co_return result;
+ReplySender detail::command_task(ConnectionOptions options,
+                                 std::string command_text,
+                                 std::vector<RedisParam> params,
+                                 CommandOptions command_options) {
+    auto client = std::make_shared<Client>();
+    return client->open(std::move(options))
+         | stdexec::let_value([client,
+                               command_text = std::move(command_text),
+                               params = std::move(params),
+                               command_options = std::move(command_options)]() mutable -> ReplySender {
+               return client->command(
+                                std::move(command_text), std::move(params), std::move(command_options))
+                    | stdexec::let_value([client](Reply result) -> ReplySender {
+                          auto result_holder = std::make_shared<Reply>(std::move(result));
+                          return client->close()
+                               | stdexec::then([result_holder]() { return std::move(*result_holder); })
+                               | stdexec::upon_error(
+                                     [result_holder](std::exception_ptr) -> Reply {
+                                         return std::move(*result_holder);
+                                     });
+                      })
+                    | stdexec::let_error([client](std::exception_ptr error) -> ReplySender {
+                          return client->close()
+                               | stdexec::then([error]() -> Reply {
+                                     std::rethrow_exception(error);
+                                 })
+                               | stdexec::upon_error([error](std::exception_ptr) -> Reply {
+                                     std::rethrow_exception(error);
+                                 });
+                      });
+           });
 }
 
 class ConnectionPool::Impl {
 public:
     explicit Impl(ConnectionPoolOptions options) : options_(std::move(options)) {}
 
-    Task<void> init() {
-        if (options_.max_connections == 0) {
-            throw RedisError("redis pool max_connections must be > 0",
-                             RedisErrorKind::invalid_argument);
-        }
+    VoidSender init() {
+        return stdexec::just()
+             | stdexec::then([this] {
+                   if (options_.max_connections == 0) {
+                       throw RedisError("redis pool max_connections must be > 0",
+                                        RedisErrorKind::invalid_argument);
+                   }
+                   clients_.resize(options_.max_connections);
+                   born_at_.resize(options_.max_connections, std::chrono::steady_clock::now());
+                   available_.clear();
+               })
+             | stdexec::let_value([this]() -> VoidSender {
+                   if (!options_.preconnect) {
+                       for (std::size_t i = 0; i < options_.max_connections; ++i) {
+                           available_.push_back(i);
+                       }
+                       available_signal_.release(
+                           static_cast<std::ptrdiff_t>(options_.max_connections));
+                       return stdexec::just();
+                   }
 
-        clients_.resize(options_.max_connections);
-        born_at_.resize(options_.max_connections, std::chrono::steady_clock::now());
-        if (!options_.preconnect) {
-            for (std::size_t i = 0; i < options_.max_connections; ++i) {
-                available_.push_back(i);
-            }
-            co_return;
-        }
-
-        for (std::size_t i = 0; i < options_.max_connections; ++i) {
-            co_await clients_[i].open(options_.connection);
-            born_at_[i] = std::chrono::steady_clock::now();
-            available_.push_back(i);
-        }
+                   auto loop = std::make_shared<std::function<VoidSender(std::size_t)>>();
+                   *loop = [this, loop](std::size_t index) -> VoidSender {
+                       if (index >= options_.max_connections) {
+                           available_signal_.release(
+                               static_cast<std::ptrdiff_t>(options_.max_connections));
+                           return stdexec::just();
+                       }
+                       return clients_[index].open(options_.connection)
+                            | stdexec::then([this, index] {
+                                  born_at_[index] = std::chrono::steady_clock::now();
+                                  available_.push_back(index);
+                              })
+                            | stdexec::let_value([loop, index] { return (*loop)(index + 1); });
+                   };
+                   return (*loop)(0);
+               });
     }
 
-    Task<std::size_t> acquire_index() {
-        const auto started = std::chrono::steady_clock::now();
-        while (true) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (closed_) {
-                    throw RedisError("redis pool is closed", RedisErrorKind::not_connected);
-                }
-                if (!available_.empty()) {
-                    const std::size_t index = available_.front();
-                    available_.pop_front();
-                    co_return index;
-                }
+    IndexSender acquire_index() {
+        auto take_index = [this](bool acquired) -> std::size_t {
+            if (!acquired) {
+                throw RedisError("redis pool is closed", RedisErrorKind::not_connected);
             }
-            if (options_.acquire_timeout_ms > 0) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started);
-                if (elapsed.count() >= options_.acquire_timeout_ms) {
-                    throw RedisError("redis pool acquire timeout", RedisErrorKind::command_failed);
-                }
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                throw RedisError("redis pool is closed", RedisErrorKind::not_connected);
             }
-            co_await async_uv::sleep_for(std::chrono::milliseconds(1));
+            if (available_.empty()) {
+                throw RedisError("redis pool internal state invalid", RedisErrorKind::internal_error);
+            }
+            const std::size_t index = available_.front();
+            available_.pop_front();
+            return index;
+        };
+
+        if (options_.acquire_timeout_ms > 0) {
+            return current_runtime_sender("redis pool acquire requires current runtime")
+                 | stdexec::let_value([this](Runtime *runtime) {
+                       auto wait_optional = available_signal_.acquire_sender()
+                                          | stdexec::then(
+                                                [](bool ok) { return std::optional<bool>(ok); });
+                       auto timer = std::make_shared<exec::asio::asio_impl::steady_timer>(
+                           runtime->executor());
+                       timer->expires_after(
+                           std::chrono::milliseconds(std::max(0, options_.acquire_timeout_ms)));
+                       auto timeout_optional = timer->async_wait(exec::asio::use_sender)
+                                             | stdexec::then(
+                                                   [timer]() { return std::optional<bool>{}; });
+
+                       return exec::when_any(std::move(wait_optional), std::move(timeout_optional))
+                            | stdexec::then([](std::optional<bool> maybe_acquired) {
+                                  if (!maybe_acquired.has_value()) {
+                                      throw RedisError("redis pool acquire timeout",
+                                                       RedisErrorKind::command_failed);
+                                  }
+                                  return *maybe_acquired;
+                              });
+                   })
+                 | stdexec::then(std::move(take_index));
         }
+
+        return available_signal_.acquire_sender() | stdexec::then(std::move(take_index));
     }
 
-    Task<void> ensure_healthy(std::size_t index) {
-        auto &client = clients_[index];
-        bool reopen = !(co_await client.is_open());
+    VoidSender ensure_healthy(std::size_t index) {
+        auto reopen_client = [this, index]() -> VoidSender {
+            return clients_[index].close()
+                 | stdexec::then([] {})
+                 | stdexec::upon_error([](std::exception_ptr) {})
+                 | stdexec::let_value([this, index]() {
+                       return clients_[index].open(options_.connection)
+                            | stdexec::then([this, index] {
+                                  born_at_[index] = std::chrono::steady_clock::now();
+                              });
+                   });
+        };
 
-        if (!reopen && options_.max_lifetime_ms > 0) {
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - born_at_[index]);
-            if (age.count() >= options_.max_lifetime_ms) {
-                reopen = true;
-            }
-        }
+        return clients_[index].is_open()
+             | stdexec::let_value([this, index, reopen_client](bool open) mutable -> VoidSender {
+                   bool reopen = !open;
+                   if (!reopen && options_.max_lifetime_ms > 0) {
+                       const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - born_at_[index]);
+                       if (age.count() >= options_.max_lifetime_ms) {
+                           reopen = true;
+                       }
+                   }
+                   if (reopen) {
+                       return reopen_client();
+                   }
+                   if (options_.health_check_command.empty()) {
+                       return stdexec::just();
+                   }
 
-        if (reopen) {
-            try {
-                co_await client.close();
-            } catch (...) {
-            }
-            co_await client.open(options_.connection);
-            born_at_[index] = std::chrono::steady_clock::now();
-            co_return;
-        }
-
-        if (!options_.health_check_command.empty()) {
-            bool healthy = true;
-            try {
-                (void)co_await client.command(options_.health_check_command);
-            } catch (...) {
-                healthy = false;
-            }
-            if (!healthy) {
-                try {
-                    co_await client.close();
-                } catch (...) {
-                }
-                co_await client.open(options_.connection);
-                born_at_[index] = std::chrono::steady_clock::now();
-            }
-        }
+                   return clients_[index].command(options_.health_check_command)
+                        | stdexec::then([](Reply) { return true; })
+                        | stdexec::upon_error([](std::exception_ptr) { return false; })
+                        | stdexec::let_value([reopen_client](bool healthy) mutable -> VoidSender {
+                              if (healthy) {
+                                  return stdexec::just();
+                              }
+                              return reopen_client();
+                          });
+               });
     }
 
     void release_index(std::size_t index) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!closed_) {
-            available_.push_back(index);
+        bool should_notify = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!closed_) {
+                available_.push_back(index);
+                should_notify = true;
+            }
+        }
+        if (should_notify) {
+            available_signal_.release(1);
         }
     }
 
@@ -1074,6 +1023,7 @@ public:
     std::vector<Client> clients_;
     std::vector<std::chrono::steady_clock::time_point> born_at_;
     std::deque<std::size_t> available_;
+    flux::AsyncSemaphore available_signal_{0};
     std::mutex mutex_;
     bool closed_ = false;
 };
@@ -1086,84 +1036,91 @@ ConnectionPool::ConnectionPool(ConnectionPool &&) noexcept = default;
 
 ConnectionPool &ConnectionPool::operator=(ConnectionPool &&) noexcept = default;
 
-Task<ConnectionPool> ConnectionPool::create(ConnectionPoolOptions options) {
-    ConnectionPool pool;
-    pool.impl_ = std::make_shared<Impl>(std::move(options));
-    co_await pool.impl_->init();
-    co_return pool;
+ConnectionPool::CreateSender ConnectionPool::create_task(ConnectionPoolOptions options) {
+    auto impl = std::make_shared<Impl>(std::move(options));
+    auto init_sender = impl->init();
+    return std::move(init_sender) | stdexec::then([impl] {
+               ConnectionPool pool;
+               pool.impl_ = impl;
+               return pool;
+           });
 }
 
-Task<Reply> ConnectionPool::command(std::string command_text) {
-    co_return co_await command(std::move(command_text), {}, CommandOptions{});
+ReplySender ConnectionPool::command_task(std::string command_text) {
+    return command_task(std::move(command_text), {}, CommandOptions{});
 }
 
-Task<Reply> ConnectionPool::command(std::string command_text, std::vector<RedisParam> params) {
-    co_return co_await command(std::move(command_text), std::move(params), CommandOptions{});
+ReplySender ConnectionPool::command_task(std::string command_text,
+                                         std::vector<RedisParam> params) {
+    return command_task(std::move(command_text), std::move(params), CommandOptions{});
 }
 
-Task<Reply> ConnectionPool::command(std::string command_text,
-                                    std::vector<RedisParam> params,
-                                    CommandOptions options) {
+ReplySender ConnectionPool::command_task(std::string command_text,
+                                         std::vector<RedisParam> params,
+                                         CommandOptions options) {
     if (impl_ == nullptr) {
         throw RedisError("redis pool is not initialized", RedisErrorKind::not_connected);
     }
 
-    const std::size_t index = co_await impl_->acquire_index();
-    std::exception_ptr error;
-    Reply result;
-    try {
-        auto &client = impl_->clients_[index];
-        co_await impl_->ensure_healthy(index);
-        result =
-            co_await client.command(std::move(command_text), std::move(params), std::move(options));
-    } catch (...) {
-        error = std::current_exception();
-    }
+    auto impl = impl_;
+    struct CommandPayload {
+        std::string command_text;
+        std::vector<RedisParam> params;
+        CommandOptions options;
+    };
+    auto payload = std::make_shared<CommandPayload>(
+        CommandPayload{std::move(command_text), std::move(params), std::move(options)});
 
-    impl_->release_index(index);
-    if (error) {
-        std::rethrow_exception(error);
-    }
-    co_return result;
+    return impl->acquire_index()
+         | stdexec::let_value([impl, payload](std::size_t index) -> ReplySender {
+               return impl->ensure_healthy(index)
+                    | stdexec::let_value([impl, payload, index]() -> ReplySender {
+                          return impl->clients_[index].command(
+                              payload->command_text, payload->params, payload->options);
+                      })
+                    | stdexec::then([impl, index](Reply reply) {
+                          impl->release_index(index);
+                          return reply;
+                      })
+                    | stdexec::upon_error([impl, index](std::exception_ptr error) -> Reply {
+                          impl->release_index(index);
+                          std::rethrow_exception(error);
+                      });
+           });
 }
 
-Task<Reply> ConnectionPool::execute(std::string command_text) {
-    co_return co_await execute(std::move(command_text), {}, CommandOptions{});
-}
-
-Task<Reply> ConnectionPool::execute(std::string command_text, std::vector<RedisParam> params) {
-    co_return co_await execute(std::move(command_text), std::move(params), CommandOptions{});
-}
-
-Task<Reply> ConnectionPool::execute(std::string command_text,
-                                    std::vector<RedisParam> params,
-                                    CommandOptions options) {
-    co_return co_await command(std::move(command_text), std::move(params), std::move(options));
-}
-
-Task<void> ConnectionPool::close() {
-    if (impl_ == nullptr) {
-        co_return;
+VoidSender ConnectionPool::close_task() {
+    auto impl = impl_;
+    if (impl == nullptr) {
+        return stdexec::just();
     }
 
-    std::vector<std::size_t> indices;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex_);
-        impl_->closed_ = true;
-        indices.resize(impl_->clients_.size());
-        for (std::size_t i = 0; i < indices.size(); ++i) {
-            indices[i] = i;
-        }
-        impl_->available_.clear();
-    }
+    return stdexec::just() | stdexec::let_value([impl]() -> VoidSender {
+               auto indices = std::make_shared<std::vector<std::size_t>>();
+               {
+                   std::lock_guard<std::mutex> lock(impl->mutex_);
+                   impl->closed_ = true;
+                   indices->resize(impl->clients_.size());
+                   for (std::size_t i = 0; i < indices->size(); ++i) {
+                       (*indices)[i] = i;
+                   }
+                   impl->available_.clear();
+               }
+               impl->available_signal_.close();
 
-    for (const auto index : indices) {
-        try {
-            co_await impl_->clients_[index].close();
-        } catch (...) {
-        }
-    }
-    co_return;
+               auto loop = std::make_shared<std::function<VoidSender(std::size_t)>>();
+               *loop = [impl, indices, loop](std::size_t pos) -> VoidSender {
+                   if (pos >= indices->size()) {
+                       return stdexec::just();
+                   }
+                   const std::size_t index = (*indices)[pos];
+                   return impl->clients_[index].close()
+                        | stdexec::then([] {})
+                        | stdexec::upon_error([](std::exception_ptr) {})
+                        | stdexec::let_value([loop, pos] { return (*loop)(pos + 1); });
+               };
+               return (*loop)(0);
+           });
 }
 
-} // namespace async_uv::redis
+} // namespace flux::redis
